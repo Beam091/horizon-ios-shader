@@ -157,6 +157,13 @@ impl super::CommandEncoder {
         self.raw_cmd_buf.as_deref()
     }
 
+    /// Ends any lazy blit or acceleration-structure encoder so external Metal encoders
+    /// (such as MetalFX scalers) can safely encode directly onto `raw_command_buffer()`.
+    pub fn end_pending_encoders(&mut self) {
+        self.leave_blit();
+        self.leave_acceleration_structure_builder();
+    }
+
     fn enter_blit(&mut self) -> Retained<ProtocolObject<dyn MTLBlitCommandEncoder>> {
         if self.state.blit.is_none() {
             self.leave_acceleration_structure_builder();

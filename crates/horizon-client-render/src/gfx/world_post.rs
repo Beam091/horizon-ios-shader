@@ -60,6 +60,8 @@ pub struct Post {
     format: wgpu::TextureFormat,
     /// World resolution relative to the window (0.5..=2.0).
     pub scale: f32,
+    /// Explicit render size override (used by MetalFX 2x presets: 360p/480p/540p/720p).
+    pub fixed_size: Option<[u32; 2]>,
     pub antialias: bool,
     pub taa: bool,
     /// Output pixels per rendered pixel while TAA is on (1: native): the world renders
@@ -241,6 +243,7 @@ impl Post {
             sampler,
             format,
             scale: 1.0,
+            fixed_size: None,
             antialias: false,
             taa: false,
             upscale: 1.0,
@@ -260,6 +263,10 @@ impl Post {
 
     /// The world's rendered size and the size it is shown at (TAA's history).
     fn sizes(&self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
+        if let Some(fixed) = self.fixed_size {
+            let s = fixed.map(|v| v.clamp(1, 8192));
+            return (s, s);
+        }
         let output = window.map(|v| ((v as f32 * self.scale).round() as u32).clamp(1, 8192));
         let upscale = if self.taa_on { self.upscale } else { 1.0 };
         (
@@ -320,7 +327,7 @@ impl Post {
         window: [u32; 2],
         always: bool,
     ) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
-        if self.scale == 1.0 && !self.antialias && !self.taa_on && !always {
+        if self.fixed_size.is_none() && self.scale == 1.0 && !self.antialias && !self.taa_on && !always {
             self.target = None;
             return None;
         }

@@ -164,6 +164,7 @@ mod end_sky;
 pub mod entity_skin;
 mod flat;
 mod frame_gen;
+mod metalfx;
 mod gpu_culling;
 mod hdr;
 mod hdr_icc;
@@ -858,6 +859,8 @@ pub struct Frame<'a> {
     /// Opt-in reuse of the shader pack's last shadow map when the key still matches
     /// (`horizon-graphics.txt` `shadowCache`; off by default).
     pub shadow_cache: bool,
+    /// Shader pack shadow map update cadence (`EveryFrame`, `Hz20`, `Hz10`, `Hz5`).
+    pub shadow_update_rate: crate::graphics::ShadowUpdateRate,
     /// Render distance in blocks (fog end).
     pub distance: f32,
     /// Full-detail terrain distance in blocks; distant LODs bypass the cave graph.
@@ -1364,6 +1367,8 @@ pub struct Renderer {
     world_post: world_post::Post,
     /// Frame generation (Horizon setting).
     frame_gen: frame_gen::FrameGen,
+    /// Apple MetalFX hardware upscaling (Temporal / Spatial 2x presets).
+    metalfx: metalfx::MetalFx,
     /// The entities' texture atlas (`entity_group`'s), for frame generation's motion.
     entity_atlas: wgpu::TextureView,
     /// HDR output (Horizon setting): `Some` while the swapchain is HDR.
@@ -4502,6 +4507,8 @@ impl Renderer {
             ));
         }
         let world_primitives = world_primitives::WorldPrimitives::new(&device, frame_format);
+        crate::graphics::set_display_height(config.height);
+        let metalfx = metalfx::MetalFx::new(&device, frame_format);
         Ok(Self {
             display: DisplayWatch::default(),
             display_fresh: false,
@@ -4703,6 +4710,7 @@ impl Renderer {
             layout: crate::chunk::ColumnLayout::VANILLA,
             world_post,
             frame_gen: frame_gen::FrameGen::new(),
+            metalfx,
             entity_atlas: atlas_view.clone(),
             hdr: None,
             hdr_lighting_setting: true,
@@ -4981,6 +4989,7 @@ impl Renderer {
         if self.suspended {
             return;
         }
+        crate::graphics::set_display_height(height);
         self.config.width = width;
         self.config.height = height;
         if self.surface.is_some() {
@@ -6364,6 +6373,22 @@ impl Renderer {
         self.world_post.taa = taa;
         self.world_post.upscale = if taa { upscale.clamp(1.0, 4.0) } else { 1.0 };
     }
+    /// Apple MetalFX 2x hardware upscaling (Temporal / Spatial) and target tier.
+    pub fn set_metalfx(
+        &mut self,
+        mode: crate::graphics::MetalFxMode,
+        preset: crate::graphics::MetalFxPreset,
+    ) {
+        self.metalfx.mode = mode;
+        self.metalfx.preset = preset;
+    }
+    /// Downcast 32-bit float shader pack buffers (`RGBA32F`) to 16-bit (`RGBA16F`).
+    /// Reloads the active shader pack immediately when toggled.
+    pub fn set_shader_half_buffers(&mut self, on: bool) {
+        if pack_post::set_shader_half_buffers(on) {
+            self.pack_post = None;
+        }
+    }
     /// Runs `post` over the world from now on (`None`: no pack), for the dimension `dimension`;
     /// `block_ids` gives each block sprite layer's `mc_Entity` (id, fluid) and `at_midBlock.w`
     /// (its block's light), three values a layer.
@@ -7233,16 +7258,30 @@ impl Renderer {
         let pose = frame.bob * frame.spin;
         let view_proj = views.primary().view_proj(pose);
         laps.lap("r_acquire");
-        // TAA runs where the world post pass does, not under a shader pack's own.
-        let taa = !frame.title
-            && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
-            && self.native.as_ref().is_none_or(|n| n.post.is_none());
-        let jitter = self.world_post.jitter(
-            [self.config.width, self.config.height],
-            taa,
+        let window_size = [self.config.width, self.config.height];
+        crate::graphics::set_display_height(self.config.height);
+        let has_pack = self.pack_post.as_ref().is_some_and(|p| p.1.is_some())
+            || self.native.as_ref().is_some_and(|n| n.post.is_some());
+        let mfx_active = !frame.title && self.metalfx.active();
+        self.world_post.fixed_size = mfx_active.then(|| self.metalfx.sizes(window_size).0);
+        let mfx_jitter = self.metalfx.begin_frame(
+            window_size,
+            mfx_active,
+            !has_pack,
             view_proj,
             frame.camera,
         );
+        // TAA runs where the world post pass does, not under a shader pack's own or MetalFX.
+        let taa = !frame.title && !has_pack && !mfx_active;
+        let jitter = if mfx_active {
+            let _ = self
+                .world_post
+                .jitter(window_size, false, view_proj, frame.camera);
+            mfx_jitter
+        } else {
+            self.world_post
+                .jitter(window_size, taa, view_proj, frame.camera)
+        };
         let jittered = jitter * view_proj;
         if frame.title {
             self.panorama.prepare(
@@ -10392,7 +10431,7 @@ impl Renderer {
                 indices: self.indices.clone(),
                 quads: cloud_quads,
             }));
-            post.run(
+            let deferred = post.run_with_deferred_upscale(
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -10405,7 +10444,20 @@ impl Renderer {
                 [self.config.width, self.config.height],
                 &pages,
                 &mut terrain,
+                mfx_active,
             );
+            if let Some((picture, pack_depth)) = deferred {
+                self.metalfx.finish(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    Some(&picture),
+                    &pack_depth,
+                    &view_target,
+                    [self.config.width, self.config.height],
+                    true,
+                );
+            }
             self.pack_post = Some((dimension, Some(post)));
         } else if let Some((color, depth)) = &scaled
             && native_post
@@ -10466,13 +10518,26 @@ impl Renderer {
                 };
                 self.draw_overlay(&mut encoder, frame, &generated_view, generated, &overlay);
             }
-        } else if scaled.is_some() {
-            self.world_post.finish(
-                &self.queue,
-                &mut encoder,
-                &view_target,
-                self.own_timing.as_mut(),
-            );
+        } else if let Some((color, depth)) = &scaled {
+            if mfx_active {
+                self.metalfx.finish(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    Some(color),
+                    depth,
+                    &view_target,
+                    [self.config.width, self.config.height],
+                    false,
+                );
+            } else {
+                self.world_post.finish(
+                    &self.queue,
+                    &mut encoder,
+                    &view_target,
+                    self.own_timing.as_mut(),
+                );
+            }
         }
         if !frame.title {
             let (depth, depth_size) = match &scaled {

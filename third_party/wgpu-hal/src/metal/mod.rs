@@ -25,6 +25,7 @@ mod command;
 mod conv;
 mod device;
 mod library_from_metallib;
+pub mod metalfx;
 mod surface;
 mod time;
 

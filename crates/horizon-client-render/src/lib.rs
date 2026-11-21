@@ -1,6 +1,8 @@
 //! The client's world data, rendering and screens: chunks, meshing, light, streaming, the renderer,
 //! the HUD, menus and settings. Gameplay (horizon-client) builds on it; nothing here reaches gameplay.
-#![forbid(unsafe_code)]
+#![cfg_attr(not(any(target_os = "ios", target_os = "macos")), forbid(unsafe_code))]
+// iOS/macOS: MetalFX hardware upscaling calls wgpu::as_hal in gfx/metalfx.rs.
+#![cfg_attr(any(target_os = "ios", target_os = "macos"), deny(unsafe_code))]
 pub mod assets;
 pub mod atlas_sources;
 pub mod audio;

@@ -301,6 +301,7 @@ fn frame(hud: &HudBatch) -> Frame<'_> {
         first_person: true,
         shadow_scene_revision: (0, 0),
         shadow_cache: false,
+        shadow_update_rate: crate::graphics::ShadowUpdateRate::EveryFrame,
         water_plane: None,
         weather: &[],
         weather_time: crate::weather::Time::new(0, 0.0),

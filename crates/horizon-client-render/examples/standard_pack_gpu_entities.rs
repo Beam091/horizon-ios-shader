@@ -337,6 +337,7 @@ fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         sky: client::environment::Sky::default(),
         shadow_scene_revision: (0, 0),
         shadow_cache: false,
+        shadow_update_rate: client::graphics::ShadowUpdateRate::EveryFrame,
         distance: 12.0,
         detail_distance: 12.0,
         depth_far: 1000.0,

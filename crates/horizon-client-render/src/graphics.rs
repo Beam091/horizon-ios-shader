@@ -484,7 +484,197 @@ impl Upscaling {
     }
 }
 
+/// Apple MetalFX upscaling mode (iOS/macOS, with WGSL CAS fallback on unsupported devices).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MetalFxMode {
+    #[default]
+    Off,
+    Temporal,
+    Spatial,
+}
+impl MetalFxMode {
+    pub const ALL: [MetalFxMode; 3] = [
+        MetalFxMode::Off,
+        MetalFxMode::Temporal,
+        MetalFxMode::Spatial,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            MetalFxMode::Off => "off",
+            MetalFxMode::Temporal => "temporal",
+            MetalFxMode::Spatial => "spatial",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            MetalFxMode::Off => "Off",
+            MetalFxMode::Temporal => "Temporal",
+            MetalFxMode::Spatial => "Spatial",
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.name() == s)
+            .unwrap_or_default()
+    }
+}
+
+/// 2x resolution upscaling presets for MetalFX: renders at a vertical tier and upscales 2x
+/// (clamped to the display's native resolution). Devices with native height < 720p cannot select
+/// 720p (nor any tier >= their native display height).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MetalFxPreset {
+    P360,
+    P480,
+    #[default]
+    P540,
+    P720,
+}
+impl MetalFxPreset {
+    pub const ALL: [MetalFxPreset; 4] = [
+        MetalFxPreset::P360,
+        MetalFxPreset::P480,
+        MetalFxPreset::P540,
+        MetalFxPreset::P720,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            MetalFxPreset::P360 => "360p",
+            MetalFxPreset::P480 => "480p",
+            MetalFxPreset::P540 => "540p",
+            MetalFxPreset::P720 => "720p",
+        }
+    }
+    pub fn render_height(self) -> u32 {
+        match self {
+            MetalFxPreset::P360 => 360,
+            MetalFxPreset::P480 => 480,
+            MetalFxPreset::P540 => 540,
+            MetalFxPreset::P720 => 720,
+        }
+    }
+    pub fn target_height(self) -> u32 {
+        self.render_height() * 2
+    }
+    /// Whether this preset is valid for a display with `native_height` vertical pixels.
+    /// Older displays below 720p cannot run 720p, and no preset may render at/above native height.
+    pub fn allowed_for(self, native_height: u32) -> bool {
+        if native_height == 0 {
+            return true;
+        }
+        if self == MetalFxPreset::P720 && native_height < 720 {
+            return false;
+        }
+        // Always allow P360 as the lowest fallback even on tiny test viewports.
+        self == MetalFxPreset::P360 || self.render_height() < native_height
+    }
+    /// Clamps `self` down to the highest preset allowed for `native_height`.
+    pub fn clamped_for(self, native_height: u32) -> Self {
+        if self.allowed_for(native_height) {
+            return self;
+        }
+        Self::ALL
+            .into_iter()
+            .rev()
+            .find(|p| p.allowed_for(native_height) && p.render_height() <= self.render_height())
+            .unwrap_or(MetalFxPreset::P360)
+    }
+    pub fn label_for(self, native_height: u32) -> String {
+        let p = self.clamped_for(native_height);
+        let out_h = if native_height > 0 {
+            p.target_height().min(native_height)
+        } else {
+            p.target_height()
+        };
+        match p {
+            MetalFxPreset::P720 if native_height > 0 && native_height < 1440 => {
+                format!("720p -> {}p (Max)", out_h)
+            }
+            _ => format!("{}p -> {}p (2x)", p.render_height(), out_h),
+        }
+    }
+    /// Computes `(render_size, upscale_output_size)` preserving the window's aspect ratio.
+    pub fn sizes_for_window(self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
+        let [win_w, win_h] = [window[0].max(2), window[1].max(2)];
+        let p = self.clamped_for(win_h);
+        let render_h = p.render_height().min(win_h).max(2);
+        let output_h = p.target_height().min(win_h).max(render_h);
+        let scale_w = |h: u32| -> u32 {
+            let w = ((win_w as f64 * h as f64 / win_h as f64).round() as u32).clamp(2, win_w);
+            (w & !1).max(2)
+        };
+        let render_w = scale_w(render_h);
+        let output_w = scale_w(output_h).max(render_w);
+        ([render_w, render_h], [output_w, output_h])
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|p| p.name() == s)
+            .unwrap_or_default()
+    }
+}
+
+/// Shader pack shadow map update cadence (reusing cached shadow maps between updates).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShadowUpdateRate {
+    #[default]
+    EveryFrame,
+    Hz20,
+    Hz10,
+    Hz5,
+}
+impl ShadowUpdateRate {
+    pub const ALL: [ShadowUpdateRate; 4] = [
+        ShadowUpdateRate::EveryFrame,
+        ShadowUpdateRate::Hz20,
+        ShadowUpdateRate::Hz10,
+        ShadowUpdateRate::Hz5,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            ShadowUpdateRate::EveryFrame => "everyFrame",
+            ShadowUpdateRate::Hz20 => "20hz",
+            ShadowUpdateRate::Hz10 => "10hz",
+            ShadowUpdateRate::Hz5 => "5hz",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ShadowUpdateRate::EveryFrame => "Every Frame",
+            ShadowUpdateRate::Hz20 => "20 Hz",
+            ShadowUpdateRate::Hz10 => "10 Hz",
+            ShadowUpdateRate::Hz5 => "5 Hz",
+        }
+    }
+    /// Tick bucket divisor (0 = redraw every frame, 1 = 20Hz, 2 = 10Hz, 4 = 5Hz).
+    pub fn tick_divisor(self) -> u64 {
+        match self {
+            ShadowUpdateRate::EveryFrame => 0,
+            ShadowUpdateRate::Hz20 => 1,
+            ShadowUpdateRate::Hz10 => 2,
+            ShadowUpdateRate::Hz5 => 4,
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|r| r.name() == s)
+            .unwrap_or_default()
+    }
+}
+
 static REDUCED_SUGGESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DISPLAY_HEIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Records the display's native vertical pixel height for MetalFX preset clamping.
+pub fn set_display_height(height: u32) {
+    DISPLAY_HEIGHT.store(height, std::sync::atomic::Ordering::Relaxed);
+}
+/// The display's native vertical pixel height (0 before a surface is configured).
+pub fn display_height() -> u32 {
+    DISPLAY_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Whether the settings suggest Reduced far detail: set when the renderer
 /// starts, on the GPUs `lod_capped` names (far terrain slows them most).
 pub fn suggest_reduced_far_detail(on: bool) {
@@ -725,6 +915,14 @@ pub struct Graphics {
     pub taa: bool,
     /// TAA upscaling; anything but `Native` comes with `taa` on.
     pub upscaling: Upscaling,
+    /// Apple MetalFX upscaling mode (Temporal / Spatial / Off).
+    pub metalfx_mode: MetalFxMode,
+    /// 2x resolution upscaling tier (360p->720p, 480p->960p, 540p->1080p, 720p->1440p/Max).
+    pub metalfx_preset: MetalFxPreset,
+    /// Downcast 32-bit float shader pack buffers (`RGBA32F`) to 16-bit (`RGBA16F`) on mobile GPUs.
+    pub shader_half_buffers: bool,
+    /// Shader pack shadow map update cadence (`EveryFrame`, `Hz20`, `Hz10`, `Hz5`).
+    pub shadow_update_rate: ShadowUpdateRate,
     /// F2 screenshots at this many times the game's resolution: 1, 2, 4 or 8.
     pub screenshot_quality: u32,
     /// Frame generation (Horizon setting), off by default.
@@ -825,6 +1023,14 @@ impl Default for Graphics {
             fxaa: false,
             taa: false,
             upscaling: Upscaling::Native,
+            metalfx_mode: MetalFxMode::Off,
+            metalfx_preset: MetalFxPreset::P540,
+            shader_half_buffers: false,
+            shadow_update_rate: if cfg!(target_os = "ios") {
+                ShadowUpdateRate::Hz20
+            } else {
+                ShadowUpdateRate::EveryFrame
+            },
             screenshot_quality: 1,
             frame_generation: FrameGeneration::Off,
             hdr: false,
@@ -973,6 +1179,10 @@ impl Graphics {
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
                 "upscaling" => g.upscaling = Upscaling::parse(value),
+                "metalfxMode" => g.metalfx_mode = MetalFxMode::parse(value),
+                "metalfxPreset" => g.metalfx_preset = MetalFxPreset::parse(value),
+                "shaderHalfBuffers" => g.shader_half_buffers = flag(g.shader_half_buffers),
+                "shadowUpdateRate" => g.shadow_update_rate = ShadowUpdateRate::parse(value),
                 "screenshotQuality" => {
                     g.screenshot_quality = Some(number(0))
                         .filter(|q| SCREENSHOT_QUALITIES.contains(q))
@@ -1073,6 +1283,13 @@ impl Graphics {
             bool_text(self.translucent_batching),
             bool_text(self.hdr_smooth_gradients),
             bool_text(self.gpu_culling),
+        );
+        text += &format!(
+            "metalfxMode:{}\nmetalfxPreset:{}\nshaderHalfBuffers:{}\nshadowUpdateRate:{}\n",
+            self.metalfx_mode.name(),
+            self.metalfx_preset.name(),
+            bool_text(self.shader_half_buffers),
+            self.shadow_update_rate.name(),
         );
         text += &self.blue_map.serialize();
         text
@@ -1239,6 +1456,10 @@ mod tests {
             fxaa: true,
             taa: true,
             upscaling: Upscaling::Balanced,
+            metalfx_mode: MetalFxMode::Temporal,
+            metalfx_preset: MetalFxPreset::P480,
+            shader_half_buffers: true,
+            shadow_update_rate: ShadowUpdateRate::Hz10,
             screenshot_quality: 4,
             frame_generation: FrameGeneration::Fsr31,
             hdr: true,
@@ -1530,5 +1751,70 @@ mod tests {
         assert_eq!(g.battery_limit(260, false, true), 30);
         assert_eq!(g.battery_limit(260, true, false), 30);
         assert_eq!(g.battery_limit(10, true, false), 10);
+    }
+
+    #[test]
+    fn metalfx_preset_guards_low_resolution_displays_and_scales_2x() {
+        // Older iPhone/iPad displays below 720p (e.g. 1136x640) must NOT allow 720p.
+        assert!(!MetalFxPreset::P720.allowed_for(640));
+        assert!(MetalFxPreset::P540.allowed_for(640));
+        assert!(MetalFxPreset::P480.allowed_for(640));
+        assert!(MetalFxPreset::P360.allowed_for(640));
+        assert_eq!(MetalFxPreset::P720.clamped_for(640), MetalFxPreset::P540);
+        // Output height never exceeds native display height (640p).
+        assert_eq!(
+            MetalFxPreset::P720.sizes_for_window([1136, 640]),
+            ([958, 540], [1136, 640])
+        );
+        assert_eq!(
+            MetalFxPreset::P360.sizes_for_window([1136, 640]),
+            ([638, 360], [1136, 640])
+        );
+
+        // Modern iPhone (2556x1179 landscape): 720p->1179p (clamped to native), 540p->1080p, 480p->960p, 360p->720p.
+        assert!(MetalFxPreset::P720.allowed_for(1179));
+        assert_eq!(
+            MetalFxPreset::P720.sizes_for_window([2556, 1179]),
+            ([1560, 720], [2556, 1179])
+        );
+        assert_eq!(
+            MetalFxPreset::P540.sizes_for_window([2556, 1179]),
+            ([1170, 540], [2340, 1080])
+        );
+        assert_eq!(
+            MetalFxPreset::P480.sizes_for_window([2556, 1179]),
+            ([1040, 480], [2080, 960])
+        );
+        assert_eq!(
+            MetalFxPreset::P360.sizes_for_window([2556, 1179]),
+            ([780, 360], [1560, 720])
+        );
+
+        // iPad Pro (2732x2048): 720p->1440p exact 2x!
+        assert_eq!(
+            MetalFxPreset::P720.sizes_for_window([2732, 2048]),
+            ([960, 720], [1920, 1440])
+        );
+
+        // 720p screen (1280x720): 720p render is >= native height, so it clamps to 540p.
+        assert!(!MetalFxPreset::P720.allowed_for(720));
+        assert_eq!(MetalFxPreset::P720.clamped_for(720), MetalFxPreset::P540);
+    }
+
+    #[test]
+    fn shadow_update_rate_divisors_and_serialization() {
+        assert_eq!(ShadowUpdateRate::EveryFrame.tick_divisor(), 0);
+        assert_eq!(ShadowUpdateRate::Hz20.tick_divisor(), 1);
+        assert_eq!(ShadowUpdateRate::Hz10.tick_divisor(), 2);
+        assert_eq!(ShadowUpdateRate::Hz5.tick_divisor(), 4);
+
+        let g = Graphics {
+            metalfx_mode: MetalFxMode::Temporal,
+            metalfx_preset: MetalFxPreset::P540,
+            shader_half_buffers: true,
+            shadow_update_rate: ShadowUpdateRate::Hz10,
+            ..Graphics::default()
+        };
+        assert_eq!(Graphics::parse(&g.serialize()), g);
     }
 }

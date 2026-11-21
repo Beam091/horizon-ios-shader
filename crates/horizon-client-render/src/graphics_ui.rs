@@ -6,8 +6,9 @@
 //! looks comes from `graphics_style`.
 use crate::{
     graphics::{
-        EntityCullingMode, FarDetail, FrameGeneration, GraphicsApi, LeafCullingMode, Overlay,
-        Pacing, ParticleCullingMode, PresentMode, Preset, Upscaling,
+        EntityCullingMode, FarDetail, FrameGeneration, GraphicsApi, LeafCullingMode, MetalFxMode,
+        MetalFxPreset, Overlay, Pacing, ParticleCullingMode, PresentMode, Preset,
+        ShadowUpdateRate, Upscaling,
     },
     graphics_style::{self as style, Cost},
     hud::{HudAtlas, HudBatch},
@@ -97,6 +98,10 @@ pub enum H {
     ResolutionScale,
     Antialiasing,
     Upscaling,
+    MetalFxMode,
+    MetalFxPreset,
+    ShaderHalfBuffers,
+    ShadowUpdateRate,
     ScreenshotQuality,
     FrameGeneration,
     Hdr,
@@ -373,6 +378,16 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "Renders the world smaller and rebuilds it with TAA. Faster, softer.",
                         ),
                         h(
+                            H::MetalFxMode,
+                            Saves,
+                            "Apple MetalFX 2x upscaling (Temporal or Spatial) for higher FPS.",
+                        ),
+                        h(
+                            H::MetalFxPreset,
+                            High,
+                            "2x render resolution tier for MetalFX (HUD stays native).",
+                        ),
+                        h(
                             H::ScreenshotQuality,
                             None,
                             "F2 screenshots at this many times the game's resolution. Higher takes longer.",
@@ -513,6 +528,16 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         H::ShadowCache,
                         Saves,
                         "Reuses the pack shadow map when sun, view and world match. Off by default.",
+                    ),
+                    h(
+                        H::ShadowUpdateRate,
+                        Saves,
+                        "How often shader shadows redraw (20/10/5 Hz saves GPU time).",
+                    ),
+                    h(
+                        H::ShaderHalfBuffers,
+                        Saves,
+                        "Uses 16-bit shader buffers instead of 32-bit for faster GPUs.",
                     ),
                 ],
             )],
@@ -885,6 +910,13 @@ impl H {
                 },
             ),
             H::Upscaling => labelled("Upscaling", g.upscaling.label()),
+            H::MetalFxMode => labelled("MetalFX Upscaling", g.metalfx_mode.label()),
+            H::MetalFxPreset => labelled(
+                "MetalFX Scale",
+                g.metalfx_preset.label_for(crate::graphics::display_height()),
+            ),
+            H::ShaderHalfBuffers => labelled("16-bit Shader Buffers", on_off(g.shader_half_buffers)),
+            H::ShadowUpdateRate => labelled("Shadow Update Rate", g.shadow_update_rate.label()),
             H::ScreenshotQuality => {
                 labelled("Screenshot Quality", format!("{}x", g.screenshot_quality))
             }
@@ -1032,6 +1064,29 @@ impl H {
                     (g.fxaa, g.taa) = (false, true);
                 }
             }
+            H::MetalFxMode => {
+                g.metalfx_mode = step(&MetalFxMode::ALL, g.metalfx_mode, back);
+                let native_h = crate::graphics::display_height();
+                g.metalfx_preset = g.metalfx_preset.clamped_for(native_h);
+            }
+            H::MetalFxPreset => {
+                let native_h = crate::graphics::display_height();
+                let allowed: Vec<MetalFxPreset> = MetalFxPreset::ALL
+                    .into_iter()
+                    .filter(|p| p.allowed_for(native_h))
+                    .collect();
+                if !allowed.is_empty() {
+                    let cur = g.metalfx_preset.clamped_for(native_h);
+                    g.metalfx_preset = step(&allowed, cur, back);
+                }
+            }
+            H::ShaderHalfBuffers => g.shader_half_buffers = !g.shader_half_buffers,
+            H::ShadowUpdateRate => {
+                g.shadow_update_rate = step(&ShadowUpdateRate::ALL, g.shadow_update_rate, back);
+                if g.shadow_update_rate != ShadowUpdateRate::EveryFrame {
+                    g.shadow_cache = true;
+                }
+            }
             H::ScreenshotQuality => {
                 g.screenshot_quality = step(
                     &crate::graphics::SCREENSHOT_QUALITIES,
@@ -1166,6 +1221,7 @@ impl Item {
             Item::Horizon(H::HdrLighting) => g.hdr_lighting,
             Item::Horizon(H::BatteryMode) => g.battery,
             Item::Horizon(H::ShadowCache) => g.shadow_cache,
+            Item::Horizon(H::ShaderHalfBuffers) => g.shader_half_buffers,
             Item::Horizon(H::TranslucentBatching) => {
                 g.translucent_batching && crate::graphics::translucent_batching_offered()
             }
@@ -1246,6 +1302,10 @@ impl Item {
                         | H::FrameGeneration
                         | H::BatteryMode
                         | H::ShadowCache
+                        | H::ShadowUpdateRate
+                        | H::ShaderHalfBuffers
+                        | H::MetalFxMode
+                        | H::MetalFxPreset
                         | H::GraphicsApi
                         | H::TranslucentBatching
                         | H::HdrSmoothGradients
@@ -1319,13 +1379,19 @@ pub enum Target {
 type Line = shell::Line<Page, Setting>;
 
 /// Whether a setting is on the screen now: Upscaling only while TAA is (and not under a shader
-/// pack, which uses Resolution Scale and its own TAA), and Frame Generation is desktop-only.
+/// pack, which uses Resolution Scale / MetalFX), MetalFX Scale only while MetalFX is on, and
+/// Frame Generation is desktop-only.
 fn shown(item: Item, s: &Settings) -> bool {
     if cfg!(target_os = "ios") && item == Item::Horizon(H::FrameGeneration) {
         return false;
     }
+    if item == Item::Horizon(H::MetalFxPreset) {
+        return s.horizon.metalfx_mode != MetalFxMode::Off;
+    }
     if item == Item::Horizon(H::Upscaling) {
-        return s.horizon.taa && s.horizon.shader_pack.is_empty();
+        return s.horizon.taa
+            && s.horizon.shader_pack.is_empty()
+            && s.horizon.metalfx_mode == MetalFxMode::Off;
     }
     true
 }
@@ -2173,11 +2239,17 @@ mod tests {
                 .filter_map(|l| l.setting.map(|r| (l.page, r.item)))
                 .collect::<Vec<_>>()
         };
-        // Upscaling shows only with TAA, off by default.
+        // Upscaling and MetalFX Scale show only when TAA / MetalFX are turned on.
         let on = |page| -> Vec<(Page, Item)> {
             items()
                 .into_iter()
-                .filter(|(p, i)| *p == page && *i != Item::Horizon(H::Upscaling))
+                .filter(|(p, i)| {
+                    *p == page
+                        && !matches!(
+                            i,
+                            Item::Horizon(H::Upscaling | H::MetalFxPreset)
+                        )
+                })
                 .collect()
         };
         assert_eq!(settings(&mut ui, &s), on(Page::General));

@@ -499,6 +499,7 @@ impl Scene {
             sky: f.sky,
             shadow_scene_revision: (0, 0),
             shadow_cache: false,
+            shadow_update_rate: crate::graphics::ShadowUpdateRate::EveryFrame,
             distance: f.distance,
             detail_distance: f.detail_distance,
             depth_far: f.depth_far,

@@ -682,6 +682,14 @@ struct FinalTarget {
     view: wgpu::TextureView,
 }
 
+/// Global mobile boost: downcast 32-bit float shader pack buffers (`RGBA32F`) to 16-bit (`RGBA16F`).
+static SHADER_HALF_BUFFERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn set_shader_half_buffers(on: bool) -> bool {
+    SHADER_HALF_BUFFERS.swap(on, std::sync::atomic::Ordering::Relaxed) != on
+}
+
 /// The wgpu format of a pack format (6.7), the nearest one wgpu can render to.
 fn texture_format(f: Format, features: wgpu::Features) -> wgpu::TextureFormat {
     use wgpu::TextureFormat as T;
@@ -702,7 +710,13 @@ fn texture_format(f: Format, features: wgpu::Features) -> wgpu::TextureFormat {
             pick(T::R16Unorm, T::Rg16Unorm, T::Rgba16Unorm)
         }
         (Kind::Unorm, b) if b <= 8 => pick(T::R8Unorm, T::Rg8Unorm, T::Rgba8Unorm),
-        (Kind::Float, 32) => pick(T::R32Float, T::Rg32Float, T::Rgba32Float),
+        (Kind::Float, 32) => {
+            if SHADER_HALF_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) {
+                half
+            } else {
+                pick(T::R32Float, T::Rg32Float, T::Rgba32Float)
+            }
+        }
         (Kind::Float, 11) if features.contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE) => {
             T::Rg11b10Ufloat
         }
@@ -4299,26 +4313,32 @@ impl PackPost {
         terrain: &mut TerrainDraw<'_>,
         frame: &super::Frame,
     ) {
-        // Opt-in only (`horizon-graphics.txt` shadowCache). Off: always redraw, drop any cache.
-        if !frame.shadow_cache {
+        let rate_div = frame.shadow_update_rate.tick_divisor();
+        let divisor = if rate_div > 0 {
+            rate_div
+        } else if frame.shadow_cache {
+            1
+        } else {
+            0
+        };
+        // Opt-in only (`horizon-graphics.txt` shadowCache / shadowUpdateRate). Off: always redraw.
+        if divisor == 0 {
             self.shadow_cache = ShadowCache::default();
             self.draw_shadow_pass(device, queue, encoder, terrain);
             return;
         }
 
         // Compute the current frame's cache key before borrowing shadow_targets mutably.
-        let cache_key = self.compute_shadow_cache_key(frame);
+        let cache_key = self.compute_shadow_cache_key(frame, divisor);
 
-        // Entity vertices are interpolated each frame, so their shadows cannot be reused.
+        // Entity vertices are interpolated each frame, so their shadows cannot be reused
+        // unless mobile/throttled shadow cadence is requested.
         let has_shadow_entities = self
             .entities
             .as_ref()
             .is_some_and(|entities| entities.geometry.draws.iter().any(|draw| draw.shadow));
-        // Custom images are cleared each frame (`pack_images::clear`) before the
-        // shadow pass writes them, so a pack with any redraws it too. On iOS, the shadow map
-        // is reused across frames within the same 50 ms game tick (`frame.ticks`) even when
-        // entities are present, saving 2/3 of shadow passes at 60 FPS.
-        let cache_hit = (!has_shadow_entities || cfg!(target_os = "ios"))
+        let allow_entity_reuse = cfg!(target_os = "ios") || divisor >= 2;
+        let cache_hit = (!has_shadow_entities || allow_entity_reuse)
             && self.images.is_empty()
             && self.shadow_cache.key == Some(cache_key)
             && self.shadow_targets.is_some();
@@ -4414,7 +4434,7 @@ impl PackPost {
     }
 
     /// Computes the cache key for the current frame.
-    fn compute_shadow_cache_key(&self, frame: &super::Frame) -> ShadowCacheKey {
+    fn compute_shadow_cache_key(&self, frame: &super::Frame, divisor: u64) -> ShadowCacheKey {
         let shadow = &self.uniforms.shadow;
         // Use the same logic as shadow_camera to compute the light direction and snapped camera.
         // Use the public shadow_light function which returns the normalized light direction.
@@ -4460,15 +4480,23 @@ impl PackPost {
         }
         let shadow_settings_hash = hasher.finish();
         let shadow_uniforms_hash = self.shadow_uniforms_hash();
+        let div = divisor.max(1);
+        let quantize_angle = |a: f32| {
+            if div >= 2 {
+                (a * 200.0).round() / 200.0
+            } else {
+                a
+            }
+        };
 
         ShadowCacheKey {
-            sun_angle: frame.sky.sun_angle,
-            moon_angle: frame.sky.moon_angle,
+            sun_angle: quantize_angle(frame.sky.sun_angle),
+            moon_angle: quantize_angle(frame.sky.moon_angle),
             snapped_camera,
             shadow_settings_hash,
             shadow_scene_revision: frame.shadow_scene_revision,
-            ticks: frame.ticks,
-            day_time: frame.pack.day_time,
+            ticks: frame.ticks / div,
+            day_time: frame.pack.day_time / (div as i64),
             shadow_uniforms_hash,
         }
     }
@@ -4531,6 +4559,40 @@ impl PackPost {
         pages: &[(u32, wgpu::Buffer)],
         terrain: &mut TerrainDraw<'_>,
     ) {
+        let _ = self.run_with_deferred_upscale(
+            device,
+            queue,
+            encoder,
+            world,
+            world_depth,
+            screen,
+            frame,
+            inputs,
+            size,
+            window,
+            pages,
+            terrain,
+            false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_deferred_upscale(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        world: &wgpu::TextureView,
+        world_depth: &wgpu::TextureView,
+        screen: &wgpu::TextureView,
+        frame: &super::Frame,
+        inputs: &PackInputs,
+        size: [u32; 2],
+        window: [u32; 2],
+        pages: &[(u32, wgpu::Buffer)],
+        terrain: &mut TerrainDraw<'_>,
+        defer_upscale: bool,
+    ) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
         self.resize(device, size);
         if let Some((layout, ids, rects)) = &self.block_ids {
             // A page that grew has a new buffer.
@@ -4574,7 +4636,7 @@ impl PackPost {
         }
         self.uniforms.eval_custom(&mut self.custom);
         if self.targets.is_none() {
-            return;
+            return None;
         }
         // Images start the frame cleared, before the shadow pass writes them.
         if let Some(dump) = &mut self.dump {
@@ -4588,7 +4650,7 @@ impl PackPost {
             self.gpu.clear,
             &mut self.zeros,
         );
-        let Some(targets) = &self.targets else { return };
+        let Some(targets) = &self.targets else { return None };
         // Every frame starts on A. A buffer that isn't cleared and ended the last frame on B has B
         // copied back to A, and B keeps what was last written into it: a model that fits Iris 1.11.7's
         // values in probe packs of our own (#9009), not a documented Iris rule. colortex0's A is
@@ -4976,6 +5038,9 @@ impl PackPost {
             rp.set_bind_group(0, &group, &[]);
             rp.draw(0..3, 0..1);
         } else if let Some(picture) = self.final_target.as_ref().map(|t| &t.view) {
+            if defer_upscale {
+                return Some((picture.clone(), targets.depth.clone()));
+            }
             // The picture at the world's size onto the window: one upscale, smoothly.
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Shader pack final"),
@@ -5001,6 +5066,7 @@ impl PackPost {
             rp.set_bind_group(0, &group, &[]);
             rp.draw(0..3, 0..1);
         }
+        None
     }
 }
 
