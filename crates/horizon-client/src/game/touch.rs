@@ -14,7 +14,7 @@ use winit::event::{Touch, TouchPhase};
 
 /// How far the view turns per GUI unit dragged, in mouse-movement units
 /// (`look_turn`): a drag across a phone's screen turns about half a circle.
-const LOOK_SPEED: f64 = 2.0;
+const LOOK_SPEED: f64 = 2.6;
 
 /// Colours, as the HUD's `0xAARRGGBB`, at full opacity.
 const FACE: u32 = 0x6000_0000;
@@ -445,9 +445,10 @@ impl Game<'_> {
         }
         self.pad.touch_state = state;
         if frame.look != (0.0, 0.0) {
+            let sens = self.ios_look_sensitivity();
             self.look_turn(
-                f64::from(frame.look.0) * LOOK_SPEED,
-                f64::from(frame.look.1) * LOOK_SPEED,
+                f64::from(frame.look.0) * LOOK_SPEED * sens,
+                f64::from(frame.look.1) * LOOK_SPEED * sens,
             );
         }
         if let Some(slot) = frame.slot
@@ -455,6 +456,13 @@ impl Game<'_> {
         {
             self.hotbar_presses.push(slot);
         }
+    }
+
+    /// Vanilla `MouseHandler.turnPlayer` sensitivity multiplier: 1.0 at default 100% (0.5),
+    /// up to ~4.1x at 200% (1.0), so Mouse Sensitivity controls both touch and iPadOS hardware mouse.
+    fn ios_look_sensitivity(&self) -> f64 {
+        let ss = f64::from(self.settings.sensitivity) * 0.6 + 0.2;
+        ss * ss * ss * 8.0
     }
 
     /// Moves what was drawn into `batch` since `from` (a vertex count) by the
@@ -787,6 +795,10 @@ impl Game<'_> {
         &mut self,
         event_loop: &dyn super::event_loop::EventLoopCtl,
     ) {
+        // Lock and hide the iPadOS/iOS hardware mouse pointer whenever in-world so the system
+        // arrow cursor never floats over gameplay and 360-degree turning never hits screen edges.
+        horizon_client_input::ios_controllers::set_pointer_locked(self.touch_playing());
+
         let hw = horizon_client_input::ios_controllers::poll_hardware_input();
         let any_activity = !hw.keys.is_empty()
             || hw.mouse_buttons.iter().any(|&b| b)
@@ -834,7 +846,10 @@ impl Game<'_> {
         if dx != 0.0 || dy != 0.0 {
             self.last_input = Instant::now();
             if self.touch_playing() {
-                self.look_turn(f64::from(dx) * 1.25, f64::from(dy) * 1.25);
+                let sens = self.ios_look_sensitivity();
+                let x = if self.settings.invert_x { -dx } else { dx };
+                let y = if self.settings.invert_y { -dy } else { dy };
+                self.look_turn(f64::from(x) * 2.5 * sens, f64::from(y) * 2.5 * sens);
             } else if let Some(batch) = self.gui_scale() {
                 let scale = batch.scale;
                 let nx = (self.cursor.0 * scale + dx).clamp(0.0, batch.width * scale);

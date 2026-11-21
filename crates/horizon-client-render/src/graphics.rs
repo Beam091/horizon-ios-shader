@@ -602,6 +602,20 @@ impl MetalFxPreset {
     pub fn target_height(self) -> u32 {
         self.render_height() * 2
     }
+    /// Target vertical resolution for `mode`: Spatial upscales as high as the display allows
+    /// (up to native resolution / 4x max); Temporal stays at its optimal 2x tier.
+    pub fn target_height_for_mode(self, mode: MetalFxMode, native_height: u32) -> u32 {
+        let render_h = self.render_height();
+        let max_h = match mode {
+            MetalFxMode::Spatial => render_h * 4,
+            MetalFxMode::Temporal | MetalFxMode::Off => render_h * 2,
+        };
+        if native_height > 0 {
+            max_h.min(native_height).max(render_h.min(native_height))
+        } else {
+            max_h
+        }
+    }
     /// Whether this preset is valid for a display with `native_height` vertical pixels.
     /// Older displays below 720p cannot run 720p, and no preset may render at/above native height.
     pub fn allowed_for(self, native_height: u32) -> bool {
@@ -626,26 +640,51 @@ impl MetalFxPreset {
             .unwrap_or(MetalFxPreset::P360)
     }
     pub fn label_for(self, native_height: u32) -> String {
+        self.label_for_mode(MetalFxMode::Temporal, native_height)
+    }
+    pub fn label_for_mode(self, mode: MetalFxMode, native_height: u32) -> String {
         let p = self.clamped_for(native_height);
-        let out_h = if native_height > 0 {
-            p.target_height().min(native_height)
-        } else {
-            p.target_height()
-        };
-        match p {
-            MetalFxPreset::P720 if native_height > 0 && native_height < 1440 => {
-                format!("720p -> {}p (Max)", out_h)
+        let render_h = p.render_height();
+        let out_h = p.target_height_for_mode(mode, native_height);
+        if mode == MetalFxMode::Spatial {
+            if native_height > 0 && out_h >= native_height {
+                format!("{render_h}p -> {out_h}p (Max)")
+            } else {
+                let ratio = out_h as f32 / render_h.max(1) as f32;
+                if (ratio - ratio.round()).abs() < 0.05 {
+                    format!("{render_h}p -> {out_h}p ({}x)", ratio.round() as u32)
+                } else {
+                    format!("{render_h}p -> {out_h}p ({ratio:.1}x)")
+                }
             }
-            _ => format!("{}p -> {}p (2x)", p.render_height(), out_h),
+        } else {
+            match p {
+                MetalFxPreset::P720 if native_height > 0 && native_height < 1440 => {
+                    format!("720p -> {}p (Max)", out_h)
+                }
+                _ => format!("{}p -> {}p (2x)", render_h, out_h),
+            }
         }
     }
-    /// Computes `(render_size, upscale_output_size)` preserving the window's aspect ratio.
+    /// Computes `(render_size, upscale_output_size)` preserving the window's aspect ratio (2x).
     pub fn sizes_for_window(self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
+        self.sizes_for_window_with_mode(MetalFxMode::Temporal, window)
+    }
+    /// Computes `(render_size, upscale_output_size)` for `mode`: Spatial scales up to native
+    /// display resolution (max 4x); Temporal scales 2x (clamped to native).
+    pub fn sizes_for_window_with_mode(
+        self,
+        mode: MetalFxMode,
+        window: [u32; 2],
+    ) -> ([u32; 2], [u32; 2]) {
         let [win_w, win_h] = [window[0].max(2), window[1].max(2)];
         let p = self.clamped_for(win_h);
         let render_h = p.render_height().min(win_h).max(2);
-        let output_h = p.target_height().min(win_h).max(render_h);
+        let output_h = p.target_height_for_mode(mode, win_h).min(win_h).max(render_h);
         let scale_w = |h: u32| -> u32 {
+            if h == win_h {
+                return win_w;
+            }
             let w = ((win_w as f64 * h as f64 / win_h as f64).round() as u32).clamp(2, win_w);
             (w & !1).max(2)
         };
@@ -1226,7 +1265,7 @@ impl Graphics {
                     }
                 }
                 "workers" => g.workers = number(g.workers).min(64),
-                "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(25, 200),
+                "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(25, 100),
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
                 "upscaling" => g.upscaling = Upscaling::parse(value),
@@ -1853,10 +1892,18 @@ mod tests {
             ([780, 360], [1560, 720])
         );
 
-        // iPad Pro (2732x2048): 720p->1440p exact 2x!
+        // iPad Pro (2732x2048): Temporal 720p->1440p exact 2x; Spatial upscales to full native 2048p!
         assert_eq!(
             MetalFxPreset::P720.sizes_for_window([2732, 2048]),
             ([960, 720], [1920, 1440])
+        );
+        assert_eq!(
+            MetalFxPreset::P720.sizes_for_window_with_mode(MetalFxMode::Spatial, [2732, 2048]),
+            ([960, 720], [2732, 2048])
+        );
+        assert_eq!(
+            MetalFxPreset::P540.sizes_for_window_with_mode(MetalFxMode::Spatial, [2360, 1640]),
+            ([776, 540], [2360, 1640])
         );
 
         // 720p screen (1280x720): 720p render is >= native height, so it clamps to 540p.

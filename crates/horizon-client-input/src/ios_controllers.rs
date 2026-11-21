@@ -327,3 +327,94 @@ pub fn poll_hardware_input() -> HardwareInput {
     out.mouse_delta = (atomic_take_f32(&MOUSE_DX), atomic_take_f32(&MOUSE_DY));
     out
 }
+
+use objc2::runtime::{Bool, Imp, Sel};
+use objc2::sel;
+use std::sync::atomic::AtomicBool;
+
+static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
+static POINTER_LOCK_INSTALLED_CLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn prefers_pointer_locked(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+    Bool::new(POINTER_LOCKED.load(Ordering::Relaxed))
+}
+
+unsafe fn root_view_controller() -> Option<Obj> {
+    let app: Option<Obj> = unsafe { msg_send![class!(UIApplication), sharedApplication] };
+    let app = app?;
+    let scenes: Option<Obj> = unsafe { msg_send![&*app, connectedScenes] };
+    if let Some(scenes) = scenes {
+        let all: Option<Obj> = unsafe { msg_send![&*scenes, allObjects] };
+        if let Some(all) = all {
+            let count: usize = unsafe { msg_send![&*all, count] };
+            let window_scene_cls = class!(UIWindowScene);
+            for i in 0..count {
+                let scene: Option<Obj> = unsafe { msg_send![&*all, objectAtIndex: i] };
+                let Some(scene) = scene else { continue };
+                let is_ws: bool = unsafe { msg_send![&*scene, isKindOfClass: window_scene_cls] };
+                if !is_ws {
+                    continue;
+                }
+                let windows: Option<Obj> = unsafe { msg_send![&*scene, windows] };
+                let Some(windows) = windows else { continue };
+                let wcount: usize = unsafe { msg_send![&*windows, count] };
+                let mut fallback: Option<Obj> = None;
+                for j in 0..wcount {
+                    let win: Option<Obj> = unsafe { msg_send![&*windows, objectAtIndex: j] };
+                    let Some(win) = win else { continue };
+                    let vc: Option<Obj> = unsafe { msg_send![&*win, rootViewController] };
+                    let Some(vc) = vc else { continue };
+                    let is_key: bool = unsafe { msg_send![&*win, isKeyWindow] };
+                    if is_key {
+                        return Some(vc);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(vc);
+                    }
+                }
+                if fallback.is_some() {
+                    return fallback;
+                }
+            }
+        }
+    }
+    let win: Option<Obj> = unsafe { msg_send![&*app, keyWindow] };
+    win.and_then(|w| unsafe { msg_send![&*w, rootViewController] })
+}
+
+/// Locks and hides the iPadOS/iOS hardware mouse pointer while in-world (`prefersPointerLocked`),
+/// and unlocks/restores it when a menu or inventory screen is open.
+pub fn set_pointer_locked(locked: bool) {
+    let prev = POINTER_LOCKED.swap(locked, Ordering::Relaxed);
+    unsafe {
+        let Some(vc) = root_view_controller() else {
+            return;
+        };
+        let cls = objc2::ffi::object_getClass((&*vc as *const AnyObject).cast_mut().cast());
+        if cls.is_null() {
+            return;
+        }
+        let cls_addr = cls as usize;
+        let installed_now =
+            POINTER_LOCK_INSTALLED_CLS.swap(cls_addr, Ordering::Relaxed) != cls_addr;
+        if installed_now {
+            let imp: Imp = std::mem::transmute::<
+                unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+                Imp,
+            >(prefers_pointer_locked);
+            objc2::ffi::class_replaceMethod(
+                cls.cast_mut(),
+                sel!(prefersPointerLocked),
+                imp,
+                c"B@:".as_ptr(),
+            );
+        }
+        if prev != locked || installed_now {
+            let update_sel = sel!(setNeedsUpdateOfPrefersPointerLocked);
+            let responds: bool = msg_send![&*vc, respondsToSelector: update_sel];
+            if responds {
+                let _: () = msg_send![&*vc, setNeedsUpdateOfPrefersPointerLocked];
+            }
+        }
+    }
+}

@@ -100,7 +100,8 @@ pub enum H {
     ResolutionScale,
     Antialiasing,
     Upscaling,
-    MetalFxMode,
+    MetalFxSpatial,
+    MetalFxTemporal,
     MetalFxPreset,
     ShaderHalfBuffers,
     ShadowUpdateRate,
@@ -380,14 +381,19 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "Renders the world smaller and rebuilds it with TAA. Faster, softer.",
                         ),
                         h(
-                            H::MetalFxMode,
+                            H::MetalFxSpatial,
                             Saves,
-                            "Apple MetalFX 2x upscaling (Temporal or Spatial) for higher FPS.",
+                            "Single-frame MetalFX up to native resolution (turns off Temporal).",
+                        ),
+                        h(
+                            H::MetalFxTemporal,
+                            Saves,
+                            "Multi-frame MetalFX 2x upscaling with anti-aliasing (turns off Spatial).",
                         ),
                         h(
                             H::MetalFxPreset,
                             High,
-                            "2x render resolution tier for MetalFX (HUD stays native).",
+                            "Render tier for MetalFX (Spatial scales to native; HUD stays sharp).",
                         ),
                         h(
                             H::ScreenshotQuality,
@@ -815,7 +821,7 @@ impl H {
                 Some(i as f32 / (LOD_STEPS.len() - 1) as f32)
             }
             H::Workers => Some(g.workers as f32 / max_workers() as f32),
-            H::ResolutionScale => Some((g.resolution_scale as f32 - 25.0) / 175.0),
+            H::ResolutionScale => Some((g.resolution_scale.clamp(25, 100) as f32 - 25.0) / 75.0),
             H::OverlayScale => Some((g.overlay_scale.clamp(50, 200) as f32 - 50.0) / 150.0),
             // Auto, then 10..480 by 10.
             H::HdrPaperWhite => Some(g.hdr_paper_white as f32 / 480.0),
@@ -835,7 +841,7 @@ impl H {
             H::EntityCullingPrecheck => Some(32),
             H::UploadBudget => Some((UPLOAD_STEPS.len() - 1) as u32),
             H::Workers => Some(max_workers()),
-            H::ResolutionScale => Some(35),
+            H::ResolutionScale => Some(15),
             H::OverlayScale => Some(15),
             H::HdrPaperWhite => Some(41),
             H::HdrPeak => Some(37),
@@ -926,10 +932,18 @@ impl H {
                 },
             ),
             H::Upscaling => labelled("Upscaling", g.upscaling.label()),
-            H::MetalFxMode => labelled("MetalFX Upscaling", g.metalfx_mode.label()),
+            H::MetalFxSpatial => labelled(
+                "MetalFX Spatial Upscaling",
+                on_off(g.metalfx_mode == MetalFxMode::Spatial),
+            ),
+            H::MetalFxTemporal => labelled(
+                "MetalFX Temporal Upscaling",
+                on_off(g.metalfx_mode == MetalFxMode::Temporal),
+            ),
             H::MetalFxPreset => labelled(
                 "MetalFX Scale",
-                g.metalfx_preset.label_for(crate::graphics::display_height()),
+                g.metalfx_preset
+                    .label_for_mode(g.metalfx_mode, crate::graphics::display_height()),
             ),
             H::ShaderHalfBuffers => labelled("16-bit Shader Buffers", on_off(g.shader_half_buffers)),
             H::ShadowUpdateRate => labelled("Shadow Update Rate", g.shadow_update_rate.label()),
@@ -1007,7 +1021,7 @@ impl H {
                 g.lod_distance = LOD_STEPS[(v * (LOD_STEPS.len() - 1) as f32).round() as usize]
             }
             H::Workers => g.workers = (v * max_workers() as f32).round() as u32,
-            H::ResolutionScale => g.resolution_scale = (25.0 + (v * 35.0).round() * 5.0) as u32,
+            H::ResolutionScale => g.resolution_scale = (25.0 + (v * 15.0).round() * 5.0) as u32,
             H::OverlayScale => g.overlay_scale = 50 + (v * 15.0).round() as u32 * 10,
             H::HdrPaperWhite => g.hdr_paper_white = (v * 48.0).round() as u32 * 10,
             H::HdrPeak => {
@@ -1084,8 +1098,21 @@ impl H {
                     (g.fxaa, g.taa) = (false, true);
                 }
             }
-            H::MetalFxMode => {
-                g.metalfx_mode = step(&MetalFxMode::ALL, g.metalfx_mode, back);
+            H::MetalFxSpatial => {
+                g.metalfx_mode = if g.metalfx_mode == MetalFxMode::Spatial {
+                    MetalFxMode::Off
+                } else {
+                    MetalFxMode::Spatial
+                };
+                let native_h = crate::graphics::display_height();
+                g.metalfx_preset = g.metalfx_preset.clamped_for(native_h);
+            }
+            H::MetalFxTemporal => {
+                g.metalfx_mode = if g.metalfx_mode == MetalFxMode::Temporal {
+                    MetalFxMode::Off
+                } else {
+                    MetalFxMode::Temporal
+                };
                 let native_h = crate::graphics::display_height();
                 g.metalfx_preset = g.metalfx_preset.clamped_for(native_h);
             }
@@ -1253,6 +1280,8 @@ impl Item {
             Item::Horizon(H::BatteryMode) => g.battery,
             Item::Horizon(H::ShadowCache) => g.shadow_cache,
             Item::Horizon(H::ShaderHalfBuffers) => g.shader_half_buffers,
+            Item::Horizon(H::MetalFxSpatial) => g.metalfx_mode == MetalFxMode::Spatial,
+            Item::Horizon(H::MetalFxTemporal) => g.metalfx_mode == MetalFxMode::Temporal,
             Item::Horizon(H::TranslucentBatching) => {
                 g.translucent_batching && crate::graphics::translucent_batching_offered()
             }
@@ -1337,7 +1366,8 @@ impl Item {
                         | H::ShadowCache
                         | H::ShadowUpdateRate
                         | H::ShaderHalfBuffers
-                        | H::MetalFxMode
+                        | H::MetalFxSpatial
+                        | H::MetalFxTemporal
                         | H::MetalFxPreset
                         | H::GraphicsApi
                         | H::TranslucentBatching

@@ -244,9 +244,9 @@ impl MetalFx {
         self.mode != MetalFxMode::Off
     }
 
-    /// Computes `(render_size, output_size)` for the active x2 preset on `window`.
+    /// Computes `(render_size, output_size)` for the active preset and mode on `window`.
     pub fn sizes(&self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
-        self.preset.sizes_for_window(window)
+        self.preset.sizes_for_window_with_mode(self.mode, window)
     }
 
     /// Sub-pixel jitter matrix (Halton 2, 3) for `MetalFxMode::Temporal` and camera reprojection.
