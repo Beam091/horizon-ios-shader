@@ -1,0 +1,72 @@
+# Builds the game for iPhone and iPad on GitHub's hosted macOS runners and uploads an unsigned
+# Horizon.ipa. A sideloading tool (Sideloadly, AltStore) signs it with the player's own Apple ID
+# when it installs it (packaging/ios/README.md). The .ipa holds none of Mojang's files.
+name: iOS build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ios-build]
+    # Horizon Mods has its own workflow (ios-mods-app.yml).
+    paths-ignore:
+      - packaging/ios/builder/**
+      - packaging/ios/native-mods.md
+      - .github/workflows/ios-mods-*.yml
+      - .github/workflows/ios-native-*.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    # GitHub's Apple Silicon Macs often have no capacity (the job is never picked up);
+    # its Intel ones build the same iPhone (arm64) binary.
+    runs-on: macos-15-intel
+    permissions:
+      contents: write
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+      - name: Build
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+          # The fork whose "Native mods for iOS" issue the app's Native tab ticks.
+          HORIZON_IOS_REPO: ${{ github.repository }}
+        run: cargo build --profile fast --locked --target aarch64-apple-ios -p horizon-client --bin horizon-client
+      - name: Package
+        id: package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/horizon-client/Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          packaging/ios/package.sh target/aarch64-apple-ios/fast/horizon-client "$version" dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Horizon-ios
+          path: dist/Horizon.ipa
+          if-no-files-found: error
+      # Each build of the ios-build branch is published as a pre-release with the .ipa, tagged
+      # ios-r<run number> on the commit it built; GitHub adds the source archives to every release.
+      - name: Publish the release
+        if: github.ref == 'refs/heads/ios-build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          tag=ios-r$GITHUB_RUN_NUMBER
+          cp dist/Horizon.ipa "dist/Horizon-ios-$VERSION-r$GITHUB_RUN_NUMBER.ipa"
+          gh release create "$tag" "dist/Horizon-ios-$VERSION-r$GITHUB_RUN_NUMBER.ipa" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Horizon for iOS $VERSION (build $GITHUB_RUN_NUMBER, experimental)" \
+            --notes-file packaging/ios/README.md

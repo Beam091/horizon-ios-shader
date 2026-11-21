@@ -1,0 +1,34 @@
+# Native mods on iOS
+
+Native mods change Horizon's own Rust source before it is compiled (docs/native-mods.md). An iPhone
+can't compile, so GitHub does it, into a custom `.ipa`:
+
+The easiest way is the **Horizon Mods** app (`builder/`, released as `ios-mods-r<N>` by
+`ios-mods-app.yml`): sideload it, paste a fine-grained GitHub token with **Actions: Read and write**
+on the fork, tick mods and tap **Build**. It starts the workflow below with the mods typed in (no
+issue needed), shows each build's progress, and opens the finished `.ipa` in SideStore or AltStore,
+or shares it to any other signer.
+
+Each build is an **instance**: its own app identifier (`dev.horizon.game.i<digits>`) and link
+(`horizon-i<digits>://`), so instances install side by side; building into an existing instance
+updates it. Horizon Mods' Play tab launches each one. With **Run them in LiveContainer** on, it installs
+and launches them inside [LiveContainer](https://github.com/LiveContainer/LiveContainer)
+(`livecontainer://install?url=…`, `livecontainer://livecontainer-launch?bundle-name=<identifier>.app`),
+so every instance shares LiveContainer's one app slot instead of taking one each.
+
+Without the app:
+
+1. **Pick the mods.** In the fork's **Native mods for iOS** issue, tick the mods, then tick
+   **Build now**. (Or run **Actions → iOS build with native mods** and type their ids.) The issue's
+   list is refreshed from the registry every day (`ios-native-list.yml`); run that workflow once to
+   make the issue. Issues must be on in the fork (Settings → General → Features → Issues).
+2. **GitHub builds it** (`ios-native-build.yml`): the mods are downloaded from Horizon's registry and
+   checked against its SHA-256 and size, then the launcher's own native staging
+   (`horizon-launcher native-stage`, the steps `native-build` runs before it compiles: horizon-mixins,
+   trait injections, the mods' crates) applies them to the `ios-build` branch's source, and a Mac
+   compiles it for iOS. Every mod is built on this branch's commit, whatever Horizon it was made for:
+   one that no longer applies fails the build, and the issue says so.
+3. **Sideload** the `.ipa` from the release linked in the issue, over Horizon: worlds and files stay.
+
+Native mods are not sandboxed: their code runs with full access to the app. The registry reviews each
+one before listing it.

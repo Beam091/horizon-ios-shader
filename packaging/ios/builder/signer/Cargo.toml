@@ -1,0 +1,31 @@
+# Horizon Mods' signer (packaging/ios/builder/play.md): turns a Horizon build's program into a
+# library Horizon Mods can load, and signs it with the player's own certificate on the iPhone.
+# Built as a static library for the app (package.sh) and tested on any computer.
+[package]
+name = "horizon-mods-signer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+apple-codesign = { version = "0.29", default-features = false }
+p12-keystore = "0.2"
+x509-certificate = "0.24"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# pkcs5 0.7.1 with one change (vendor/pkcs5/src/pbes2/kdf.rs): a .p12 whose PBKDF2 PRF leaves its
+# NULL parameters out is read, as iOS and OpenSSL read it, instead of failing as malformed.
+[patch.crates-io]
+pkcs5 = { path = "vendor/pkcs5" }
+
+# Its own workspace: not part of the game's.
+[workspace]

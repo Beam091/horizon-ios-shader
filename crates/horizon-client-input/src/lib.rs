@@ -1,0 +1,26 @@
+//! The client's input layer, below gameplay and screens: key bindings and their
+//! names, toggle keys, mouse settings, controllers, the clipboard and window
+//! options. horizon-client re-exports each module under its old path
+//! (`horizon_client::keybinds`, ...).
+#![cfg_attr(not(target_os = "ios"), forbid(unsafe_code))]
+// iOS: the clipboard calls UIKit (clipboard.rs) and the controllers GameController
+// (ios_controllers.rs), the places allowed unsafe code.
+#![cfg_attr(target_os = "ios", deny(unsafe_code))]
+pub mod clipboard;
+pub mod gamepad;
+pub mod held;
+pub mod input;
+pub mod interaction_input;
+#[cfg(target_os = "ios")]
+pub mod ios_controllers;
+#[cfg(target_os = "ios")]
+pub mod ios_files;
+pub mod key_names;
+pub mod keybinds;
+pub mod keymapping;
+pub mod modifiers;
+pub mod mouse;
+pub mod screen_keyboard;
+pub mod snap;
+pub mod touch;
+pub mod window;
