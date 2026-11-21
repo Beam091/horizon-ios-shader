@@ -214,6 +214,58 @@ pub fn extract(
 ) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("not a zip file: {e}"))?;
+    // GitHub Actions' upload-artifact wraps horizon-resources.zip inside an outer zip: unwrap
+    // it automatically when the outer zip holds a single inner .zip and no marker of its own.
+    if marker_prefix(zip.file_names().filter_map(Result::ok)).is_none()
+        && zip.len() == 1
+        && zip
+            .by_index(0)
+            .ok()
+            .and_then(|e| e.name().ok().map(|n| n.to_ascii_lowercase().ends_with(".zip")))
+            .unwrap_or(false)
+    {
+        let inner_path = archive.with_extension("inner.zip");
+        {
+            let mut entry = zip.by_index(0).map_err(|e| format!("bad zip entry: {e}"))?;
+            let mut out = std::fs::File::create(&inner_path)
+                .map_err(|e| format!("{}: {e}", inner_path.display()))?;
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut written = 0u64;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&inner_path);
+                    return Err("cancelled".into());
+                }
+                let n = entry.read(&mut buf).map_err(|e| format!("inner zip: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                written += n as u64;
+                if written > MAX_DOWNLOAD {
+                    let _ = std::fs::remove_file(&inner_path);
+                    return Err("the zip unpacks to too much: it is not the game files".into());
+                }
+                out.write_all(&buf[..n])
+                    .map_err(|e| format!("{}: {e}", inner_path.display()))?;
+            }
+        }
+        drop(zip);
+        let res = extract_single(&inner_path, resources, cancel, progress);
+        let _ = std::fs::remove_file(&inner_path);
+        return res;
+    }
+    drop(zip);
+    extract_single(archive, resources, cancel, progress)
+}
+
+fn extract_single(
+    archive: &Path,
+    resources: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(u64, u64),
+) -> Result<(), String> {
+    let file = std::fs::File::open(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("not a zip file: {e}"))?;
     let prefix = marker_prefix(zip.file_names().filter_map(Result::ok))
         .ok_or_else(|| format!("the zip has no {MARKER}: it is not the prepared game files"))?;
     let partial = {

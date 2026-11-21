@@ -44,6 +44,8 @@ pub(super) struct Pads {
     pub(super) touch_state: PadState,
     /// The touch F3 button is down (touch.rs).
     pub(super) touch_debug: bool,
+    /// The touch Zoom button is down (touch.rs).
+    pub(super) touch_zoom: bool,
     /// The mods screen, when open (mod_browser.rs).
     pub(super) mod_browser: Option<super::mod_browser::ModBrowser>,
     /// The iOS Microsoft sign-in overlay, when open (ios_account.rs).

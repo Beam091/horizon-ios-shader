@@ -4284,8 +4284,10 @@ impl PackPost {
             .as_ref()
             .is_some_and(|entities| entities.geometry.draws.iter().any(|draw| draw.shadow));
         // Custom images are cleared each frame (`pack_images::clear`) before the
-        // shadow pass writes them, so a pack with any redraws it too.
-        let cache_hit = !has_shadow_entities
+        // shadow pass writes them, so a pack with any redraws it too. On iOS, the shadow map
+        // is reused across frames within the same 50 ms game tick (`frame.ticks`) even when
+        // entities are present, saving 2/3 of shadow passes at 60 FPS.
+        let cache_hit = (!has_shadow_entities || cfg!(target_os = "ios"))
             && self.images.is_empty()
             && self.shadow_cache.key == Some(cache_key)
             && self.shadow_targets.is_some();

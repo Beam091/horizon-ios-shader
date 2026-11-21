@@ -245,10 +245,12 @@ impl super::Device {
 
                 let ep_resources = &layout.per_stage_map[naga_stage];
 
-                let bounds_check_policy = if stage.module.runtime_checks.bounds_checks {
-                    naga::proc::BoundsCheckPolicy::Restrict
-                } else {
+                let bounds_check_policy = if cfg!(target_os = "ios")
+                    || !stage.module.runtime_checks.bounds_checks
+                {
                     naga::proc::BoundsCheckPolicy::Unchecked
+                } else {
+                    naga::proc::BoundsCheckPolicy::Restrict
                 };
 
                 let options = naga::back::msl::Options {
@@ -283,8 +285,10 @@ impl super::Device {
                         // TODO: support bounds checks on binding arrays
                         binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
                     },
-                    zero_initialize_workgroup_memory: stage.zero_initialize_workgroup_memory,
-                    force_loop_bounding: stage.module.runtime_checks.force_loop_bounding,
+                    zero_initialize_workgroup_memory: !cfg!(target_os = "ios")
+                        && stage.zero_initialize_workgroup_memory,
+                    force_loop_bounding: !cfg!(target_os = "ios")
+                        && stage.module.runtime_checks.force_loop_bounding,
                     task_dispatch_limits: stage
                         .module
                         .runtime_checks
@@ -299,7 +303,8 @@ impl super::Device {
                         .module
                         .runtime_checks
                         .mesh_shader_primitive_indices_clamp,
-                    emit_int_div_checks: stage.module.runtime_checks.int_div_checks,
+                    emit_int_div_checks: !cfg!(target_os = "ios")
+                        && stage.module.runtime_checks.int_div_checks,
                     ray_query_initialization_tracking: stage
                         .module
                         .runtime_checks
@@ -343,9 +348,12 @@ impl super::Device {
 
                 let options = MTLCompileOptions::new();
                 options.setLanguageVersion(self.shared.private_caps.msl_version);
+                options.setFastMathEnabled(true);
 
                 // https://developer.apple.com/documentation/metal/mtlcompileoptions/preserveinvariance
-                if available!(macos = 11.0, ios = 13.0, tvos = 14.0, visionos = 1.0) {
+                if !cfg!(target_os = "ios")
+                    && available!(macos = 11.0, ios = 13.0, tvos = 14.0, visionos = 1.0)
+                {
                     options.setPreserveInvariance(true);
                 }
 

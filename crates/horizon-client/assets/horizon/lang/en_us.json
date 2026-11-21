@@ -892,5 +892,6 @@
   "horizon.account.signed_in": "Signed in as {name}",
   "horizon.account.online_ready": "Online multiplayer servers and Realms are ready.",
   "horizon.account.offline": "Playing offline. Sign in to join online servers.",
-  "horizon.account.try_again": "Try again"
+  "horizon.account.try_again": "Try again",
+  "horizon.touch.zoom": "Zoom"
 }

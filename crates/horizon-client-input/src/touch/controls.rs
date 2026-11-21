@@ -23,6 +23,7 @@ pub enum TouchButton {
     Sneak,
     Attack,
     Use,
+    Zoom,
     Drop,
     Inventory,
     Chat,
@@ -38,11 +39,12 @@ pub enum TouchButton {
 
 impl TouchButton {
     /// The buttons on screen, in the order they are laid out.
-    pub const PLACED: [TouchButton; 11] = [
+    pub const PLACED: [TouchButton; 12] = [
         Self::Jump,
         Self::Sneak,
         Self::Attack,
         Self::Use,
+        Self::Zoom,
         Self::Drop,
         Self::Pause,
         Self::Chat,
@@ -53,8 +55,8 @@ impl TouchButton {
     ];
 
     /// The key mapping it stands for; `None` for pause (the controller's
-    /// Start), F3 (the keyboard's key, which no controller button has) and
-    /// the editor's button.
+    /// Start), F3 (the keyboard's key, which no controller button has),
+    /// zoom (handled directly by the camera) and the editor's button.
     pub fn action(self) -> Option<&'static str> {
         Some(match self {
             Self::Jump => "key.jump",
@@ -66,8 +68,16 @@ impl TouchButton {
             Self::Drop => "key.drop",
             Self::Perspective => "key.togglePerspective",
             Self::Sprint => "key.sprint",
-            Self::Pause | Self::Edit | Self::Debug => return None,
+            Self::Zoom | Self::Pause | Self::Edit | Self::Debug => return None,
         })
+    }
+
+    /// Whether dragging the finger that holds this button also turns the camera view.
+    pub fn turns_view(self) -> bool {
+        matches!(
+            self,
+            Self::Jump | Self::Sneak | Self::Attack | Self::Use | Self::Zoom
+        )
     }
 
     /// Its name in the settings file.
@@ -77,6 +87,7 @@ impl TouchButton {
             Self::Sneak => "sneak",
             Self::Attack => "attack",
             Self::Use => "use",
+            Self::Zoom => "zoom",
             Self::Drop => "drop",
             Self::Inventory => "inventory",
             Self::Chat => "chat",
@@ -121,6 +132,7 @@ impl Control {
             Self::Button(TouchButton::Sneak) => "horizon.touch.sneak",
             Self::Button(TouchButton::Attack) => "horizon.touch.attack",
             Self::Button(TouchButton::Use) => "horizon.touch.use",
+            Self::Button(TouchButton::Zoom) => "horizon.touch.zoom",
             Self::Button(TouchButton::Drop) => "horizon.touch.drop",
             Self::Button(TouchButton::Inventory) => "horizon.touch.inventory",
             Self::Button(TouchButton::Chat) => "horizon.touch.chat",
@@ -416,12 +428,13 @@ impl Layout {
             Control::Button(TouchButton::Sneak) => big(col(1.0), row(0.0)),
             Control::Button(TouchButton::Attack) => big(col(0.0), row(1.0)),
             Control::Button(TouchButton::Use) => big(col(1.0), row(1.0)),
-            Control::Button(TouchButton::Drop) => big(col(0.0), row(2.0)),
+            Control::Button(TouchButton::Zoom) => big(col(0.0), row(2.0)),
             Control::Button(TouchButton::Pause) => top(0.0),
             Control::Button(TouchButton::Chat) => top(1.0),
             Control::Button(TouchButton::Perspective) => top(2.0),
             Control::Button(TouchButton::Edit) => top(3.0),
             Control::Button(TouchButton::Debug) => top(4.0),
+            Control::Button(TouchButton::Drop) => top(5.0),
             Control::Button(TouchButton::Inventory | TouchButton::Sprint) => Area {
                 x: hotbar.x + hotbar.w + GAP,
                 y: hotbar.y,
@@ -600,7 +613,10 @@ enum Role {
         moved: bool,
         attacking: bool,
     },
-    Button(TouchButton),
+    Button {
+        button: TouchButton,
+        last: (f32, f32),
+    },
     /// A finger on the hotbar picks its slot as it lands and then does nothing.
     Hotbar,
 }
@@ -695,7 +711,7 @@ impl TouchControls {
                         }
                         _ => self.pulse(button, now),
                     }
-                    Role::Button(button)
+                    Role::Button { button, last: at }
                 } else if let Some(slot) = layout.slot_at(at) {
                     self.slot = Some(slot);
                     Role::Hotbar
@@ -729,6 +745,13 @@ impl TouchControls {
                     if distance(*start, at) > STILL {
                         *moved = true;
                     }
+                }
+                // Slide-to-aim: dragging the thumb that holds Attack, Use, Zoom, Jump or Sneak
+                // turns the camera simultaneously while keeping the button pressed.
+                Some(Role::Button { button, last }) if button.turns_view() => {
+                    self.look.0 += at.0 - last.0;
+                    self.look.1 += at.1 - last.1;
+                    *last = at;
                 }
                 _ => {}
             },
@@ -871,7 +894,7 @@ impl TouchControls {
             || self
                 .fingers
                 .values()
-                .any(|r| matches!(r, Role::Button(b) if *b == button))
+                .any(|r| matches!(r, Role::Button { button: b, .. } if *b == button))
     }
 
     /// The state to apply this frame; the look and the tapped slot are
@@ -886,7 +909,7 @@ impl TouchControls {
         let radius = layout.stick_radius;
         for role in self.fingers.values_mut() {
             match role {
-                Role::Button(b)
+                Role::Button { button: b, .. }
                     if *b != TouchButton::Edit && (*b != TouchButton::Sneak || self.sneak_taps) =>
                 {
                     held.push(*b);

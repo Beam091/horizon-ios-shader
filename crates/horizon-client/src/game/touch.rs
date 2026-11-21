@@ -225,6 +225,7 @@ impl Game<'_> {
             if self.pad.touch.active() {
                 self.pad.touch.release_all();
             }
+            self.pad.touch_zoom = false;
             self.pad.touch_state = PadState::default();
             return;
         };
@@ -236,6 +237,7 @@ impl Game<'_> {
             left: frame.stick,
             ..PadState::default()
         };
+        self.pad.touch_zoom = frame.held.contains(&TouchButton::Zoom);
         // F3 is the keyboard's: pressed and released as the key.
         let debug = frame.held.contains(&TouchButton::Debug);
         if debug != self.pad.touch_debug {
@@ -454,7 +456,7 @@ fn faded(colour: u32, k: f32) -> u32 {
     (alpha << 24) | (colour & 0x00ff_ffff)
 }
 
-/// A button: its face, edge and icon, at opacity `k`.
+/// A button: its chamfered/rounded face, soft edge and icon, at opacity `k`.
 fn draw_button(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -463,13 +465,24 @@ fn draw_button(
     k: f32,
     pressed: bool,
 ) {
-    let (face, ink) = if pressed {
-        (FACE_PRESSED, INK_PRESSED)
+    let (face, edge, ink) = if pressed {
+        (FACE_PRESSED, SELECTED, INK_PRESSED)
     } else {
-        (FACE, INK)
+        (FACE, EDGE, INK)
     };
-    batch.fill(atlas, a.x, a.y, a.w, a.h, faded(face, k));
-    outline(batch, atlas, a, faded(EDGE, k));
+    let f = faded(face, k);
+    let e = faded(edge, k);
+    // Chamfered 1-unit corners give the button a clean rounded pill look on Retina displays.
+    if a.w >= 6.0 && a.h >= 6.0 {
+        batch.fill(atlas, a.x + 1.0, a.y + 1.0, a.w - 2.0, a.h - 2.0, f);
+        batch.fill(atlas, a.x + 1.0, a.y, a.w - 2.0, 1.0, e);
+        batch.fill(atlas, a.x + 1.0, a.y + a.h - 1.0, a.w - 2.0, 1.0, e);
+        batch.fill(atlas, a.x, a.y + 1.0, 1.0, a.h - 2.0, e);
+        batch.fill(atlas, a.x + a.w - 1.0, a.y + 1.0, 1.0, a.h - 2.0, e);
+    } else {
+        batch.fill(atlas, a.x, a.y, a.w, a.h, f);
+        outline(batch, atlas, a, e);
+    }
     draw_icon(batch, atlas, icons::icon(button), a, faded(ink, k));
 }
 

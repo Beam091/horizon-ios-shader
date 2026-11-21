@@ -524,5 +524,6 @@
   "horizon.account.signed_in": "เข้าสู่ระบบในชื่อ {name}",
   "horizon.account.online_ready": "พร้อมเชื่อมต่อเซิร์ฟเวอร์ออนไลน์และ Realms แล้ว",
   "horizon.account.offline": "กำลังเล่นแบบออฟไลน์ เข้าสู่ระบบเพื่อเข้าเซิร์ฟเวอร์ออนไลน์",
-  "horizon.account.try_again": "ลองอีกครั้ง"
+  "horizon.account.try_again": "ลองอีกครั้ง",
+  "horizon.touch.zoom": "ซูมกล้อง"
 }

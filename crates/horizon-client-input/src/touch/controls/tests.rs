@@ -505,3 +505,16 @@ fn the_editors_toolbar_covers_no_control_where_they_start() {
         }
     }
 }
+
+#[test]
+fn dragging_an_action_or_zoom_button_turns_the_view_while_holding_it() {
+    let l = layout();
+    let mut t = TouchControls::default();
+    let now = Instant::now();
+    let zoom = centre(&l, TouchButton::Zoom);
+    t.touch(&l, 1, Started, zoom, now);
+    t.touch(&l, 1, Moved, (zoom.0 - 15.0, zoom.1 + 8.0), after(now, 500));
+    let f = t.frame(&l, after(now, 500));
+    assert_eq!(f.held, [TouchButton::Zoom]);
+    assert_eq!(f.look, (-15.0, 8.0));
+}

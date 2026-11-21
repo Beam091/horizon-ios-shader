@@ -21,6 +21,7 @@ pub fn icon(button: TouchButton) -> &'static Icon {
         TouchButton::Pause => &PAUSE,
         TouchButton::Edit => &EDIT,
         TouchButton::Debug => &DEBUG,
+        TouchButton::Zoom => &ZOOM,
         TouchButton::Sprint => &SPRINT,
     }
 }
@@ -219,6 +220,22 @@ const EDIT: Icon = [
     ".##.........",
     "###.........",
     "............",
+];
+
+/// A magnifying glass (Zoom).
+const ZOOM: Icon = [
+    "............",
+    "...#####....",
+    "..##...##...",
+    ".##.....##..",
+    ".##..#..##..",
+    ".##.###.##..",
+    ".##..#..##..",
+    "..##...##...",
+    "...#####.##.",
+    "........###.",
+    ".........###",
+    "..........#.",
 ];
 
 /// Running legs (never on screen: sprint is the stick pushed forward).

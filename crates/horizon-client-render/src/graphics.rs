@@ -785,18 +785,30 @@ impl Default for Graphics {
             blue_map: crate::bluemap::Settings::default(),
             cave_culling: true,
             gpu_culling: false,
-            entity_culling: EntityCullingMode::Off,
+            entity_culling: if cfg!(target_os = "ios") {
+                EntityCullingMode::Asynchronous
+            } else {
+                EntityCullingMode::Off
+            },
             entity_culling_precheck: 64,
-            particle_culling: ParticleCullingMode::Off,
-            leaf_culling: LeafCullingMode::Off,
-            cache_shulker_boxes: false,
+            particle_culling: if cfg!(target_os = "ios") {
+                ParticleCullingMode::Asynchronous
+            } else {
+                ParticleCullingMode::Off
+            },
+            leaf_culling: if cfg!(target_os = "ios") {
+                LeafCullingMode::Hidden
+            } else {
+                LeafCullingMode::Off
+            },
+            cache_shulker_boxes: cfg!(target_os = "ios"),
             // Sign text has used its renderer cache independently of the new model caches.
             cache_signs: true,
-            cache_decorated_pots: false,
-            cache_bells: false,
-            cache_chests: false,
-            cache_banners: false,
-            cache_copper_golem_statues: false,
+            cache_decorated_pots: cfg!(target_os = "ios"),
+            cache_bells: cfg!(target_os = "ios"),
+            cache_chests: cfg!(target_os = "ios"),
+            cache_banners: cfg!(target_os = "ios"),
+            cache_copper_golem_statues: cfg!(target_os = "ios"),
             chunk_updates: 0,
             upload_budget_kib: 0,
             texture_budget_mib: 0,
@@ -809,7 +821,7 @@ impl Default for Graphics {
             pacing: Pacing::Efficient,
             workers: 0,
             overlay: Overlay::Off,
-            resolution_scale: 100,
+            resolution_scale: if cfg!(target_os = "ios") { 70 } else { 100 },
             fxaa: false,
             taa: false,
             upscaling: Upscaling::Native,
@@ -823,7 +835,7 @@ impl Default for Graphics {
             hdr_lighting: true,
             hdr_key: "key.keyboard.unknown".into(),
             battery: false,
-            shadow_cache: false,
+            shadow_cache: cfg!(target_os = "ios"),
             api: GraphicsApi::Auto,
             translucent_batching: true,
             hdr_smooth_gradients: true,
@@ -839,6 +851,32 @@ impl Graphics {
         let mut g: Self = fs::read_to_string(dir.join(FILE))
             .map(|t| Self::parse(&t))
             .unwrap_or_default();
+        // One-time migration for existing iOS installs that saved horizon-graphics.txt before
+        // mobile culling, block-entity caching, and shader shadow caching were enabled by default.
+        #[cfg(target_os = "ios")]
+        {
+            let marker = dir.join(".ios-shader-tuned");
+            if !marker.exists() {
+                if g.entity_culling == EntityCullingMode::Off {
+                    g.entity_culling = EntityCullingMode::Asynchronous;
+                }
+                if g.particle_culling == ParticleCullingMode::Off {
+                    g.particle_culling = ParticleCullingMode::Asynchronous;
+                }
+                if g.leaf_culling == LeafCullingMode::Off {
+                    g.leaf_culling = LeafCullingMode::Hidden;
+                }
+                g.cache_shulker_boxes = true;
+                g.cache_decorated_pots = true;
+                g.cache_bells = true;
+                g.cache_chests = true;
+                g.cache_banners = true;
+                g.cache_copper_golem_statues = true;
+                g.shadow_cache = true;
+                g.save(dir);
+                let _ = fs::write(marker, b"1");
+            }
+        }
         g.blue_map.servers = match fs::read_to_string(dir.join(crate::bluemap::SERVERS_FILE)) {
             Ok(text) => crate::bluemap::Settings::parse_servers(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -931,7 +969,7 @@ impl Graphics {
                     }
                 }
                 "workers" => g.workers = number(g.workers).min(64),
-                "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(50, 200),
+                "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(25, 200),
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
                 "upscaling" => g.upscaling = Upscaling::parse(value),
