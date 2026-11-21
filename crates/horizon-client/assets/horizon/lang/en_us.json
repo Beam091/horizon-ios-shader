@@ -893,5 +893,8 @@
   "horizon.account.online_ready": "Online multiplayer servers and Realms are ready.",
   "horizon.account.offline": "Playing offline. Sign in to join online servers.",
   "horizon.account.try_again": "Try again",
-  "horizon.touch.zoom": "Zoom"
+  "horizon.touch.zoom": "Zoom",
+  "horizon.touch.swap_offhand": "Swap Hands",
+  "horizon.touch.mouse": "Mouse",
+  "horizon.touch.shift": "Shift"
 }

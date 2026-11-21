@@ -6350,6 +6350,7 @@ impl Renderer {
     }
     /// Frame generation on or off (FSR 3.1's frame interpolation).
     pub fn set_frame_generation(&mut self, on: bool) {
+        let on = on && !cfg!(target_os = "ios");
         if !on {
             self.frame_gen.stop();
         }

@@ -24,6 +24,7 @@ pub enum TouchButton {
     Attack,
     Use,
     Zoom,
+    SwapOffhand,
     Drop,
     Inventory,
     Chat,
@@ -39,12 +40,13 @@ pub enum TouchButton {
 
 impl TouchButton {
     /// The buttons on screen, in the order they are laid out.
-    pub const PLACED: [TouchButton; 12] = [
+    pub const PLACED: [TouchButton; 13] = [
         Self::Jump,
         Self::Sneak,
         Self::Attack,
         Self::Use,
         Self::Zoom,
+        Self::SwapOffhand,
         Self::Drop,
         Self::Pause,
         Self::Chat,
@@ -63,6 +65,7 @@ impl TouchButton {
             Self::Sneak => "key.sneak",
             Self::Attack => "key.attack",
             Self::Use => "key.use",
+            Self::SwapOffhand => "key.swapOffhand",
             Self::Inventory => "key.inventory",
             Self::Chat => "key.chat",
             Self::Drop => "key.drop",
@@ -88,6 +91,7 @@ impl TouchButton {
             Self::Attack => "attack",
             Self::Use => "use",
             Self::Zoom => "zoom",
+            Self::SwapOffhand => "swap_offhand",
             Self::Drop => "drop",
             Self::Inventory => "inventory",
             Self::Chat => "chat",
@@ -133,6 +137,7 @@ impl Control {
             Self::Button(TouchButton::Attack) => "horizon.touch.attack",
             Self::Button(TouchButton::Use) => "horizon.touch.use",
             Self::Button(TouchButton::Zoom) => "horizon.touch.zoom",
+            Self::Button(TouchButton::SwapOffhand) => "horizon.touch.swap_offhand",
             Self::Button(TouchButton::Drop) => "horizon.touch.drop",
             Self::Button(TouchButton::Inventory) => "horizon.touch.inventory",
             Self::Button(TouchButton::Chat) => "horizon.touch.chat",
@@ -435,6 +440,7 @@ impl Layout {
             Control::Button(TouchButton::Edit) => top(3.0),
             Control::Button(TouchButton::Debug) => top(4.0),
             Control::Button(TouchButton::Drop) => top(5.0),
+            Control::Button(TouchButton::SwapOffhand) => top(6.0),
             Control::Button(TouchButton::Inventory | TouchButton::Sprint) => Area {
                 x: hotbar.x + hotbar.w + GAP,
                 y: hotbar.y,

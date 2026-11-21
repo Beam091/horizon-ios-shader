@@ -665,7 +665,21 @@ pub struct PackPost {
     blit_group: Option<([wgpu::TextureView; 2], wgpu::BindGroup)>,
     /// Shows colortex0 when the pack has no `final` (OQ-5).
     copy: (wgpu::RenderPipeline, wgpu::BindGroupLayout),
+    /// Copies the picture `final` drew at the world's size onto the window: no flip, it is
+    /// already in the screen's rows.
+    upscale: (wgpu::RenderPipeline, wgpu::BindGroupLayout),
+    /// The picture `final` draws while the world's size is not the window's.
+    final_target: Option<FinalTarget>,
+    screen: wgpu::TextureFormat,
     uniforms: FrameUniforms,
+}
+
+/// The picture a pack's `final` draws at the world's size while the window is another: it is
+/// copied onto the window once, after the pack's passes, as the game's own post pass does
+/// without a pack.
+struct FinalTarget {
+    size: [u32; 2],
+    view: wgpu::TextureView,
 }
 
 /// The wgpu format of a pack format (6.7), the nearest one wgpu can render to.
@@ -2766,6 +2780,20 @@ impl PackPost {
             &[target(screen)],
             None,
         );
+        let upscale = helper(
+            device,
+            "vs_screen",
+            "fs_copy",
+            &[
+                texture_entry(0, float),
+                entry(
+                    2,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+            &[target(screen)],
+            None,
+        );
         let filterable = |b: usize| {
             formats[b].sample_type(None, Some(device.features()))
                 == Some(wgpu::TextureSampleType::Float { filterable: true })
@@ -2967,6 +2995,9 @@ impl PackPost {
             }),
             blit,
             copy,
+            upscale,
+            final_target: None,
+            screen,
             uniforms: {
                 let mut u = FrameUniforms::default();
                 u.atlas = world.atlas.map_or([0; 2], |a| a.1);
@@ -4805,11 +4836,38 @@ impl PackPost {
             self.mips_valid |= stale;
             let final_pass = pass.group == Group::Final;
             // A pass writing buffers of a size of their own draws at that size (they share it).
+            // `final` draws the picture at the world's size; a copy takes it to the window.
             let out = match pass.writes.first() {
-                _ if final_pass => window,
                 Some(&(_, b)) => self.targets.as_ref().map_or(size, |t| t.sizes[b]),
                 None => size,
             };
+            if final_pass {
+                if size != window {
+                    if self.final_target.as_ref().is_none_or(|t| t.size != size) {
+                        let texture = device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Shader pack final"),
+                            size: wgpu::Extent3d {
+                                width: size[0],
+                                height: size[1],
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: self.screen,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        });
+                        self.final_target = Some(FinalTarget {
+                            size,
+                            view: texture.create_view(&Default::default()),
+                        });
+                    }
+                } else {
+                    self.final_target = None;
+                }
+            }
             let group = self.bind(device, queue, encoder, pass, out);
             let targets = self.targets.as_ref().expect("resized");
             let view = |i: usize| {
@@ -4829,7 +4887,11 @@ impl PackPost {
                 overwrite
             };
             if final_pass {
-                attachments.push(attach(screen, overwrite));
+                let target_view = self
+                    .final_target
+                    .as_ref()
+                    .map_or(screen, |t| &t.view);
+                attachments.push(attach(target_view, overwrite));
                 shown = true;
             } else if pass.sink {
                 attachments.push(attach(&targets.sink, ops));
@@ -4888,6 +4950,7 @@ impl PackPost {
         };
         // Without `final`, colortex0 holds floats (`new` refuses an integer one).
         if !shown {
+            self.final_target = None;
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Shader pack colortex0"),
                 layout: &self.copy.1,
@@ -4910,6 +4973,31 @@ impl PackPost {
                 ..Default::default()
             });
             rp.set_pipeline(&self.copy.0);
+            rp.set_bind_group(0, &group, &[]);
+            rp.draw(0..3, 0..1);
+        } else if let Some(picture) = self.final_target.as_ref().map(|t| &t.view) {
+            // The picture at the world's size onto the window: one upscale, smoothly.
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Shader pack final"),
+                layout: &self.upscale.1,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(picture),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.linear),
+                    },
+                ],
+            });
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Shader pack final"),
+                color_attachments: &[attach(screen, overwrite)],
+                timestamp_writes: self.timing.as_mut().and_then(|t| t.writes("final copy")),
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.upscale.0);
             rp.set_bind_group(0, &group, &[]);
             rp.draw(0..3, 0..1);
         }

@@ -2564,6 +2564,8 @@ struct Game<'a> {
     focused: bool,
     /// Whether the window currently accepts input method events.
     ime_allowed: bool,
+    /// Whether the soft keyboard was explicitly dismissed (by Return or tapping outside a field).
+    pub(super) ime_dismissed: bool,
     /// The candidate window's area last given to the window, in pixels.
     ime_area: Option<[i32; 4]>,
     /// When the window lost focus, while it is still without
@@ -10785,7 +10787,7 @@ impl Game<'_> {
     /// Real events word the modifiers by their own `ModifiersChanged`; a
     /// control socket's `key` is synthesized, so it words the bit directly
     /// and every reader can ask the one live state.
-    fn press_modifier_key(&mut self, key: KeyCode, down: bool) {
+    pub(super) fn press_modifier_key(&mut self, key: KeyCode, down: bool) {
         horizon_client_input::modifiers::set_key(
             &mut self.modifiers,
             &mut self.physical_keys,
@@ -17628,6 +17630,7 @@ impl ApplicationHandler for Game<'_> {
         }
         self.window = Some(window);
         self.ime_allowed = false;
+        self.ime_dismissed = false;
         self.ime_area = None;
         self.apply_settings();
         self.previous = Instant::now();
@@ -17637,6 +17640,7 @@ impl ApplicationHandler for Game<'_> {
         // else the first finger is the mouse (touch.rs).
         #[cfg(target_os = "ios")]
         if let WindowEvent::Touch(touch) = event {
+            let was_ime_allowed = self.ime_allowed;
             let lifted = touch.phase == winit::event::TouchPhase::Ended;
             let events = self.touch_event(touch);
             let clicked = lifted && !events.is_empty();
@@ -17644,7 +17648,7 @@ impl ApplicationHandler for Game<'_> {
                 self.window_event(event_loop, id, event);
             }
             if clicked {
-                self.touch_tapped();
+                self.touch_tapped(was_ime_allowed);
             }
             return;
         }
@@ -17816,9 +17820,16 @@ impl Game<'_> {
             && matches!(key_event.physical_key, PhysicalKey::Unidentified(_))
             && let Some(text) = key_event.text.as_deref()
         {
+            let has_enter = text.contains('\n') || text.contains('\r');
             let text: String = text.chars().filter(|c| !c.is_control()).collect();
             if !text.is_empty() && self.text_field_focused() && self.types_text() {
                 let _ = self.type_chars_into_screen(&text);
+            }
+            if has_enter {
+                if self.screen == Screen::Chat && self.title.is_none() {
+                    self.chat_key_code(KeyCode::Enter, None);
+                }
+                self.dismiss_ime();
             }
             return;
         }
@@ -19471,6 +19482,7 @@ impl<'a> Game<'a> {
             split_auth: None,
             focused: true,
             ime_allowed: false,
+            ime_dismissed: false,
             ime_area: None,
             focus_lost: None,
             modifiers: winit::keyboard::ModifiersState::empty(),

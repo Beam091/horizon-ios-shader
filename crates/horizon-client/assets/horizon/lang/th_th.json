@@ -525,5 +525,8 @@
   "horizon.account.online_ready": "พร้อมเชื่อมต่อเซิร์ฟเวอร์ออนไลน์และ Realms แล้ว",
   "horizon.account.offline": "กำลังเล่นแบบออฟไลน์ เข้าสู่ระบบเพื่อเข้าเซิร์ฟเวอร์ออนไลน์",
   "horizon.account.try_again": "ลองอีกครั้ง",
-  "horizon.touch.zoom": "ซูมกล้อง"
+  "horizon.touch.zoom": "ซูมกล้อง",
+  "horizon.touch.swap_offhand": "สลับมือซ้าย",
+  "horizon.touch.mouse": "เมาส์",
+  "horizon.touch.shift": "Shift"
 }

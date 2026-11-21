@@ -54,6 +54,14 @@ pub(super) struct Pads {
     pub(super) touch_loaded: bool,
     /// The finger acting as the mouse over menus.
     pub(super) touch_mouse: horizon_client_input::touch::TouchMouse,
+    /// Top-left Shift toggle/hold state in inventory and container screens.
+    pub(super) touch_menu_shift: bool,
+    pub(super) touch_menu_shift_finger: Option<(u64, Instant)>,
+    pub(super) touch_menu_shift_applied: bool,
+    /// Whether an iOS/iPadOS hardware keyboard or mouse (`GCKeyboard`/`GCMouse`) is active.
+    pub(super) ios_hw_active: bool,
+    pub(super) ios_hw_keys: Vec<KeyCode>,
+    pub(super) ios_hw_mouse_buttons: [bool; 3],
     /// The virtual pad was in use at the last poll.
     virtual_input: bool,
     /// Buttons a `pad ... tap` releases at the next poll.
@@ -263,7 +271,7 @@ impl Game<'_> {
 
     /// Once per loop iteration: read the pads and act on button changes.
     pub(super) fn poll_pads(&mut self, event_loop: &dyn EventLoopCtl) {
-        self.touch_frame();
+        self.touch_frame(event_loop);
         self.pad.virtual_input =
             self.pad.injected != PadState::default() || self.pad.touch_state != PadState::default();
         let context = self.pad_context();

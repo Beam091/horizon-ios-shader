@@ -487,9 +487,9 @@ impl Game<'_> {
         self.pad_pointer_button(event_loop, right, false);
     }
 
-    /// The wheel event being handled only scrolls (`MenuCursor::stick_scroll`).
+    /// The wheel event being handled only scrolls (`MenuCursor::stick_scroll` or 2-finger touch scroll).
     pub(super) fn pad_stick_scroll(&self) -> bool {
-        self.pad.menu.stick_scroll || self.pad.menu.step_scroll
+        self.pad.menu.stick_scroll || self.pad.menu.step_scroll || self.pad.touch_mouse.scrolling()
     }
 
     /// It came from a focus step, so the pointer still decides what scrolls.
@@ -1972,11 +1972,29 @@ impl Game<'_> {
 
     /// A finger lifted over a menu (touch.rs): on a text field, the
     /// on-screen keyboard opens, as A does there with a controller (on iOS
-    /// that's the iPhone's own keyboard, which the field's focus brings up).
+    /// that's the iPhone's own keyboard, which the field's focus brings up);
+    /// a tap outside any text field while the keyboard is up folds it down.
     #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
-    pub(super) fn touch_tapped(&mut self) {
-        if self.pad.menu.osk.is_none() && field_at(&self.pad_targets(), self.cursor) {
-            self.pad_open_keyboard();
+    pub(super) fn touch_tapped(&mut self, was_ime_allowed: bool) {
+        let on_creative_search = self.screen == Screen::Creative
+            && self.creative_screen.tab().search
+            && self.gui_scale().is_some_and(|batch| {
+                let (ox, oy) = Self::creative_origin(&batch);
+                let (mx, my) = self.cursor;
+                mx >= ox + 78.0 && mx < ox + 172.0 && my >= oy + 2.0 && my < oy + 20.0
+            });
+        let on_field = on_creative_search || field_at(&self.pad_targets(), self.cursor);
+        if on_field {
+            self.ime_dismissed = false;
+            if self.pad.menu.osk.is_none() {
+                self.pad_open_keyboard();
+            }
+            self.sync_ime();
+        } else if was_ime_allowed {
+            self.dismiss_ime();
+        } else {
+            self.ime_dismissed = false;
+            self.sync_ime();
         }
     }
 

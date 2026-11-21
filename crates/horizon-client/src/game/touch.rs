@@ -88,6 +88,42 @@ impl Game<'_> {
         }
     }
 
+    /// Whether the on-screen touch buttons should be drawn: hidden automatically
+    /// when a hardware keyboard/mouse (`GCKeyboard`/`GCMouse`) or game controller is in use.
+    pub(super) fn touch_controls_visible(&self) -> bool {
+        TOUCH_CONTROLS && !self.pad.ios_hw_active && !self.pad.in_use
+    }
+
+    /// Whether the top-left menu Shift button is currently active (toggled or held).
+    pub(super) fn touch_shift_active(&self) -> bool {
+        self.pad.touch_menu_shift || self.pad.touch_menu_shift_finger.is_some()
+    }
+
+    /// Syncs the top-left menu Shift button into `self.modifiers`, `self.physical_keys`, and `self.keys`.
+    fn sync_touch_menu_shift(&mut self) {
+        let in_container =
+            self.title.is_none() && matches!(self.screen, Screen::Inventory | Screen::Creative);
+        if !in_container {
+            self.pad.touch_menu_shift = false;
+            self.pad.touch_menu_shift_finger = None;
+        }
+        let active = in_container && self.touch_shift_active();
+        if active != self.pad.touch_menu_shift_applied {
+            self.pad.touch_menu_shift_applied = active;
+            horizon_client_input::modifiers::set_key(
+                &mut self.modifiers,
+                &mut self.physical_keys,
+                KeyCode::ShiftLeft,
+                active,
+            );
+            if active {
+                self.keys.insert(KeyCode::ShiftLeft);
+            } else {
+                self.keys.remove(&KeyCode::ShiftLeft);
+            }
+        }
+    }
+
     /// The Esc button: always top left in the safe area, on every screen, as
     /// the keyboard's Escape (a touch screen has no key for it). Playing, it
     /// opens the pause menu (where Save and Quit leaves the world); over a
@@ -95,7 +131,7 @@ impl Game<'_> {
     /// it closes it or goes back. Not while the layout editor or the mods
     /// screen is open (their Done and Close close them).
     fn touch_close_button(&self, batch: &HudBatch) -> Option<Area> {
-        if !TOUCH_CONTROLS
+        if !self.touch_controls_visible()
             || self.pad.mod_browser.is_some()
             || self.pad.account_panel.is_some()
             || (self.pad.touch.editing() && !self.pad_in_menu())
@@ -111,23 +147,71 @@ impl Game<'_> {
         })
     }
 
-    /// The Esc button (`touch_close_button`).
+    /// The Mouse toggle button next to Esc when a menu is open: switches between
+    /// direct touch and virtual trackpad mouse mode.
+    fn touch_mouse_button(&self, batch: &HudBatch) -> Option<Area> {
+        if !self.pad_in_menu() {
+            return None;
+        }
+        let esc = self.touch_close_button(batch)?;
+        Some(Area {
+            x: esc.x + esc.w + 4.0,
+            y: esc.y,
+            w: 38.0,
+            h: esc.h,
+        })
+    }
+
+    /// The Shift button next to Mouse when an inventory or container screen is open:
+    /// lets players quick-move items (`Shift-Click`) by tapping to toggle or holding.
+    fn touch_shift_button(&self, batch: &HudBatch) -> Option<Area> {
+        if self.title.is_some() || !matches!(self.screen, Screen::Inventory | Screen::Creative) {
+            return None;
+        }
+        let mouse_btn = self.touch_mouse_button(batch)?;
+        Some(Area {
+            x: mouse_btn.x + mouse_btn.w + 4.0,
+            y: mouse_btn.y,
+            w: 34.0,
+            h: mouse_btn.h,
+        })
+    }
+
+    /// The Esc, Mouse, and Shift buttons at the top-left, plus the virtual mouse cursor when active.
     pub(super) fn draw_touch_close(&self, batch: &mut HudBatch) {
+        let atlas = &self.gui.atlas;
         if let Some(a) = self.touch_close_button(batch) {
-            let atlas = &self.gui.atlas;
-            batch.fill(atlas, a.x, a.y, a.w, a.h, 0xc020_2020);
-            outline(batch, atlas, a, EDGE);
-            let label = horizon_client::lang::get("horizon.touch.escape");
-            let label = fit(atlas, &label, a.w - 4.0);
-            let width = HudBatch::text_width(atlas, &label);
-            batch.text(
+            draw_top_pill(
+                batch,
                 atlas,
-                &label,
-                a.x + (a.w - width) / 2.0,
-                a.y + (a.h - 8.0) / 2.0,
-                INK,
-                true,
+                a,
+                &horizon_client::lang::get("horizon.touch.escape"),
+                false,
             );
+        }
+        if let Some(a) = self.touch_mouse_button(batch) {
+            draw_top_pill(
+                batch,
+                atlas,
+                a,
+                &horizon_client::lang::get("horizon.touch.mouse"),
+                self.pad.touch_mouse.trackpad,
+            );
+        }
+        if let Some(a) = self.touch_shift_button(batch) {
+            draw_top_pill(
+                batch,
+                atlas,
+                a,
+                &horizon_client::lang::get("horizon.touch.shift"),
+                self.touch_shift_active(),
+            );
+        }
+        if TOUCH_CONTROLS
+            && self.pad_in_menu()
+            && (self.pad.touch_mouse.trackpad || self.pad.ios_hw_active)
+        {
+            draw_virtual_cursor(batch, atlas, self.cursor);
         }
     }
 
@@ -140,26 +224,75 @@ impl Game<'_> {
     /// came down while a menu was open. A finger on the controls gives none.
     pub(super) fn touch_event(&mut self, touch: Touch) -> Vec<WindowEvent> {
         self.touch_load();
+        // A direct finger touch on the screen brings touch controls back if hardware input hid them.
+        if touch.phase == TouchPhase::Started
+            && !self.pad.ios_hw_mouse_buttons.iter().any(|&b| b)
+        {
+            self.pad.ios_hw_active = false;
+        }
         // The iOS Microsoft sign-in overlay and the mods screen.
         if self.account_touch(&touch) || self.mods_touch(&touch) {
             return Vec::new();
         }
-        let mouse = self.pad.touch_mouse.finger() == Some(touch.id);
-        // The Esc button, top left in a world: Escape's job.
+        // Release or toggle the top-left Shift button if the finger holding it lifted.
+        if let Some((shift_id, since)) = self.pad.touch_menu_shift_finger
+            && shift_id == touch.id
+        {
+            if matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                self.pad.touch_menu_shift_finger = None;
+                if touch.phase == TouchPhase::Ended
+                    && Instant::now().duration_since(since) <= std::time::Duration::from_millis(260)
+                {
+                    self.pad.touch_menu_shift = !self.pad.touch_menu_shift;
+                }
+                self.sync_touch_menu_shift();
+            }
+            return Vec::new();
+        }
+        let mouse = self.pad.touch_mouse.has_finger(touch.id);
         if !mouse
             && touch.phase == TouchPhase::Started
             && let Some(batch) = self.gui_scale()
-            && let Some(close) = self.touch_close_button(&batch)
-            && close.contains((
+        {
+            let at = (
                 touch.location.x as f32 / batch.scale,
                 touch.location.y as f32 / batch.scale,
-            ))
-        {
-            log::info!("Horizon: touch Esc");
-            if let Err(e) = self.pad_back() {
-                log::warn!("Horizon: closing the menu: {e}");
+            );
+            // The Esc button, top left: Escape's job.
+            if let Some(close) = self.touch_close_button(&batch)
+                && close.contains(at)
+            {
+                log::info!("Horizon: touch Esc");
+                if let Err(e) = self.pad_back() {
+                    log::warn!("Horizon: closing the menu: {e}");
+                }
+                return Vec::new();
             }
-            return Vec::new();
+            // The Mouse toggle button, next to Esc in menus.
+            if let Some(mouse_btn) = self.touch_mouse_button(&batch)
+                && mouse_btn.contains(at)
+            {
+                self.pad.touch_mouse.trackpad = !self.pad.touch_mouse.trackpad;
+                self.pad.touch_mouse.reset_touches();
+                if self.pad.touch_mouse.trackpad {
+                    let cx = f64::from(batch.width * 0.5 * batch.scale);
+                    let cy = f64::from(batch.height * 0.5 * batch.scale);
+                    let pos = winit::dpi::PhysicalPosition::new(cx, cy);
+                    self.pad.touch_mouse.cursor = Some(pos);
+                    self.cursor = (batch.width * 0.5, batch.height * 0.5);
+                }
+                self.audio.play_button_click();
+                return Vec::new();
+            }
+            // The Shift toggle/hold button, next to Mouse in inventory/creative screens.
+            if let Some(shift_btn) = self.touch_shift_button(&batch)
+                && shift_btn.contains(at)
+            {
+                self.pad.touch_menu_shift_finger = Some((touch.id, Instant::now()));
+                self.sync_touch_menu_shift();
+                self.audio.play_button_click();
+                return Vec::new();
+            }
         }
         // The on-screen keyboard takes every finger while it is open.
         if !mouse && self.pad.menu.osk.is_some() {
@@ -198,15 +331,40 @@ impl Game<'_> {
             self.last_input = Instant::now();
             return Vec::new();
         }
-        self.pad.touch_mouse.translate(WindowEvent::Touch(touch))
+        let bounds = self
+            .window
+            .as_ref()
+            .map(|w| {
+                let s = w.inner_size();
+                (f64::from(s.width.max(1)), f64::from(s.height.max(1)))
+            })
+            .unwrap_or((1920.0, 1080.0));
+        self.pad
+            .touch_mouse
+            .translate_menu(touch, Instant::now(), bounds)
     }
 
     /// Once per loop iteration, before the pads are read: the controls'
     /// buttons and stick as a virtual controller, the view's drag as a turn
-    /// and a tapped slot as its number key.
-    pub(super) fn touch_frame(&mut self) {
+    /// and a tapped slot as its number key, plus trackpad long-press and
+    /// iOS/iPadOS hardware keyboard & mouse (`GCKeyboard`/`GCMouse`).
+    pub(super) fn touch_frame(&mut self, event_loop: &dyn super::event_loop::EventLoopCtl) {
         self.account_poll();
         self.mods_poll();
+        self.sync_touch_menu_shift();
+        if let Some(id) = self.window.as_ref().map(|w| w.id()) {
+            let events = self.pad.touch_mouse.poll(Instant::now());
+            for event in events {
+                self.handle_window_event(
+                    event_loop,
+                    id,
+                    event,
+                    super::input_trace::InputOrigin::User,
+                );
+            }
+        }
+        #[cfg(target_os = "ios")]
+        self.poll_ios_hardware_keyboard_mouse(event_loop);
         if let Some(settings) = self.pad.touch.take_saved() {
             let path = touch_settings_path();
             match std::fs::write(&path, settings.to_text()) {
@@ -292,7 +450,7 @@ impl Game<'_> {
     /// hotbar's offset in the touch layout: the hotbar, hearts, food and
     /// experience bar follow the hotbar wherever the player put it.
     pub(super) fn touch_follow_hotbar(&self, batch: &mut HudBatch, from: usize) {
-        if !TOUCH_CONTROLS {
+        if !self.touch_controls_visible() {
             return;
         }
         let safe = self.touch_safe(batch.width, batch.height, batch.scale);
@@ -309,7 +467,7 @@ impl Game<'_> {
 
     /// The controls over the HUD while playing, or the layout editor.
     pub(super) fn draw_touch_controls(&self, batch: &mut HudBatch) {
-        if !TOUCH_CONTROLS || !self.touch_playing() {
+        if !self.touch_controls_visible() || !self.touch_playing() {
             return;
         }
         let atlas = &self.gui.atlas;
@@ -551,4 +709,190 @@ fn fit(atlas: &HudAtlas, text: &str, width: f32) -> String {
         }
     }
     out
+}
+
+/// Draws a top-bar pill button (`Esc`, `Mouse`, `Shift`) with an active highlight state.
+fn draw_top_pill(batch: &mut HudBatch, atlas: &HudAtlas, a: Area, label: &str, active: bool) {
+    let (face, edge) = if active {
+        (0xd030_8040, SELECTED)
+    } else {
+        (0xc020_2020, EDGE)
+    };
+    if a.w >= 6.0 && a.h >= 6.0 {
+        batch.fill(atlas, a.x + 1.0, a.y + 1.0, a.w - 2.0, a.h - 2.0, face);
+        batch.fill(atlas, a.x + 1.0, a.y, a.w - 2.0, 1.0, edge);
+        batch.fill(atlas, a.x + 1.0, a.y + a.h - 1.0, a.w - 2.0, 1.0, edge);
+        batch.fill(atlas, a.x, a.y + 1.0, 1.0, a.h - 2.0, edge);
+        batch.fill(atlas, a.x + a.w - 1.0, a.y + 1.0, 1.0, a.h - 2.0, edge);
+    } else {
+        batch.fill(atlas, a.x, a.y, a.w, a.h, face);
+        outline(batch, atlas, a, edge);
+    }
+    let label = fit(atlas, label, a.w - 4.0);
+    let width = HudBatch::text_width(atlas, &label);
+    batch.text(
+        atlas,
+        &label,
+        a.x + (a.w - width) / 2.0,
+        a.y + (a.h - 8.0) / 2.0,
+        INK,
+        true,
+    );
+}
+
+/// Draws a high-contrast virtual mouse arrow pointer at `(cx, cy)` in GUI units.
+fn draw_virtual_cursor(batch: &mut HudBatch, atlas: &HudAtlas, (cx, cy): (f32, f32)) {
+    const POINTER: [&str; 11] = [
+        "#........",
+        "##.......",
+        "#@#......",
+        "#@@#.....",
+        "#@@@#....",
+        "#@@@@#...",
+        "#@@@@@#..",
+        "#@@@@@@#.",
+        "#@@@#####",
+        "#@#@@#...",
+        "##..##...",
+    ];
+    for (row, line) in POINTER.iter().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            let color = match ch {
+                '#' => 0xff10_1010,
+                '@' => 0xffff_ffff,
+                _ => continue,
+            };
+            batch.fill(atlas, cx + col as f32, cy + row as f32, 1.0, 1.0, color);
+        }
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl Game<'_> {
+    /// Polls `GCKeyboard` and `GCMouse` on iOS/iPadOS, automatically hiding on-screen touch
+    /// buttons while hardware peripherals are used and driving movement, camera look, clicks,
+    /// and scrolling 100% natively.
+    pub(super) fn poll_ios_hardware_keyboard_mouse(
+        &mut self,
+        event_loop: &dyn super::event_loop::EventLoopCtl,
+    ) {
+        let hw = horizon_client_input::ios_controllers::poll_hardware_input();
+        let any_activity = !hw.keys.is_empty()
+            || hw.mouse_buttons.iter().any(|&b| b)
+            || hw.mouse_delta != (0.0, 0.0)
+            || hw.mouse_scroll != (0.0, 0.0);
+        if (hw.keyboard_connected && hw.mouse_connected) || any_activity {
+            self.pad.ios_hw_active = true;
+        } else if !hw.keyboard_connected && !hw.mouse_connected {
+            self.pad.ios_hw_active = false;
+        }
+        let Some(id) = self.window.as_ref().map(|w| w.id()) else {
+            return;
+        };
+
+        // 1. Hardware keyboard key edges (when not typing into an active IME field).
+        let old_keys = std::mem::replace(&mut self.pad.ios_hw_keys, hw.keys.clone());
+        let ime_typing = self.ime_allowed;
+        for &key in &old_keys {
+            if !hw.keys.contains(&key) {
+                self.press_modifier_key(key, false);
+                self.physical_keys.remove(&key);
+                let _ = self.debug_key(key, horizon_client::debug_keys::KeyAction::Release);
+                let _ = self.mapped_key_event(key, false, false);
+            }
+        }
+        for &key in &hw.keys {
+            if !old_keys.contains(&key) {
+                self.last_input = Instant::now();
+                self.press_modifier_key(key, true);
+                self.physical_keys.insert(key);
+                if key == KeyCode::Escape && self.pad_in_menu() {
+                    let _ = self.pad_back();
+                    continue;
+                }
+                if !ime_typing {
+                    if !self.debug_key(key, horizon_client::debug_keys::KeyAction::Press) {
+                        let _ = self.mapped_key_event(key, true, false);
+                    }
+                }
+            }
+        }
+
+        // 2. Hardware mouse movement (`GCMouseInput.mouseMovedHandler`).
+        let (dx, dy) = hw.mouse_delta;
+        if dx != 0.0 || dy != 0.0 {
+            self.last_input = Instant::now();
+            if self.touch_playing() {
+                self.look_turn(f64::from(dx) * 1.25, f64::from(dy) * 1.25);
+            } else if let Some(batch) = self.gui_scale() {
+                let scale = batch.scale;
+                let nx = (self.cursor.0 * scale + dx).clamp(0.0, batch.width * scale);
+                let ny = (self.cursor.1 * scale + dy).clamp(0.0, batch.height * scale);
+                let position = winit::dpi::PhysicalPosition::new(f64::from(nx), f64::from(ny));
+                self.pad.touch_mouse.cursor = Some(position);
+                self.handle_window_event(
+                    event_loop,
+                    id,
+                    WindowEvent::CursorMoved {
+                        device_id: winit::event::DeviceId::dummy(),
+                        position,
+                    },
+                    super::input_trace::InputOrigin::User,
+                );
+            }
+        }
+
+        // 3. Hardware mouse buttons (`leftButton`, `rightButton`, `middleButton`).
+        let old_btns = std::mem::replace(&mut self.pad.ios_hw_mouse_buttons, hw.mouse_buttons);
+        let buttons = [
+            winit::event::MouseButton::Left,
+            winit::event::MouseButton::Right,
+            winit::event::MouseButton::Middle,
+        ];
+        for (i, &button) in buttons.iter().enumerate() {
+            if hw.mouse_buttons[i] != old_btns[i] {
+                let pressed = hw.mouse_buttons[i];
+                self.last_input = Instant::now();
+                if self.touch_playing() {
+                    self.captured = true;
+                }
+                let state = if pressed {
+                    winit::event::ElementState::Pressed
+                } else {
+                    winit::event::ElementState::Released
+                };
+                self.handle_window_event(
+                    event_loop,
+                    id,
+                    WindowEvent::MouseInput {
+                        device_id: winit::event::DeviceId::dummy(),
+                        state,
+                        button,
+                    },
+                    super::input_trace::InputOrigin::User,
+                );
+            }
+        }
+
+        // 4. Hardware mouse scroll wheel (`GCMouseInput.scroll`).
+        let (sx, sy) = hw.mouse_scroll;
+        if sx != 0.0 || sy != 0.0 {
+            self.last_input = Instant::now();
+            self.handle_window_event(
+                event_loop,
+                id,
+                WindowEvent::MouseWheel {
+                    device_id: winit::event::DeviceId::dummy(),
+                    delta: winit::event::MouseScrollDelta::PixelDelta(
+                        winit::dpi::PhysicalPosition::new(
+                            f64::from(sx) * 24.0,
+                            f64::from(sy) * 24.0,
+                        ),
+                    ),
+                    phase: TouchPhase::Moved,
+                },
+                super::input_trace::InputOrigin::User,
+            );
+        }
+    }
 }

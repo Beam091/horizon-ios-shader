@@ -42,11 +42,22 @@ impl Game<'_> {
         }
     }
 
-    /// Allow the input method only while a text box has focus.
+    /// Folds down the soft keyboard (e.g. when pressing Return or tapping outside a text box)
+    /// until the player taps a text field again.
+    pub(super) fn dismiss_ime(&mut self) {
+        self.ime_dismissed = true;
+        self.sync_ime();
+    }
+
+    /// Allow the input method only while a text box has focus and has not been dismissed.
     pub(super) fn sync_ime(&mut self) {
         // iOS: follow the iPhone keyboard's height, for the chat to sit above it.
         horizon_client::screen_keyboard::watch();
-        let want = self.text_field_focused();
+        let raw = self.text_field_focused();
+        if !raw {
+            self.ime_dismissed = false;
+        }
+        let want = raw && !self.ime_dismissed;
         if want != self.ime_allowed
             && let Some(window) = &self.window
         {
@@ -102,15 +113,25 @@ impl Game<'_> {
     /// Text the input method committed (`WindowEvent::Ime(Commit)`).
     pub(super) fn ime_commit(&mut self, text: &str) {
         preedit::set_preedit(None);
+        let has_enter = text.contains('\n') || text.contains('\r');
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         // ScreenEvent.CharacterTyped.Pre: the input method's committed text
         // reaches a text box by characters, as a key's own text does, so the
         // open screen hears of each of them first and a cancelled one never
         // reaches the box.
         let Some(text) = self.screen_text_typed(&text) else {
+            if has_enter {
+                self.dismiss_ime();
+            }
             return;
         };
         if text.is_empty() || !self.text_field_focused() {
+            if has_enter {
+                if self.screen == Screen::Chat && self.title.is_none() {
+                    self.chat_key_code(winit::keyboard::KeyCode::Enter, None);
+                }
+                self.dismiss_ime();
+            }
             return;
         }
         if self.dialog_type(&text) {

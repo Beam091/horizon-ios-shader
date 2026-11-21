@@ -1318,9 +1318,16 @@ pub enum Target {
 
 type Line = shell::Line<Page, Setting>;
 
-/// Whether a setting is on the screen now: Upscaling only while TAA is, which does it.
+/// Whether a setting is on the screen now: Upscaling only while TAA is (and not under a shader
+/// pack, which uses Resolution Scale and its own TAA), and Frame Generation is desktop-only.
 fn shown(item: Item, s: &Settings) -> bool {
-    item != Item::Horizon(H::Upscaling) || s.horizon.taa
+    if cfg!(target_os = "ios") && item == Item::Horizon(H::FrameGeneration) {
+        return false;
+    }
+    if item == Item::Horizon(H::Upscaling) {
+        return s.horizon.taa && s.horizon.shader_pack.is_empty();
+    }
+    true
 }
 /// A control's label as its name and its value ("Render Distance" and "12 chunks").
 fn parts(item: Item, s: &Settings, binding: bool) -> (String, Option<String>) {

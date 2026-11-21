@@ -22,6 +22,7 @@ pub fn icon(button: TouchButton) -> &'static Icon {
         TouchButton::Edit => &EDIT,
         TouchButton::Debug => &DEBUG,
         TouchButton::Zoom => &ZOOM,
+        TouchButton::SwapOffhand => &SWAP_OFFHAND,
         TouchButton::Sprint => &SPRINT,
     }
 }
@@ -236,6 +237,22 @@ const ZOOM: Icon = [
     "........###.",
     ".........###",
     "..........#.",
+];
+
+/// Two opposite arrows (swap main hand and offhand).
+const SWAP_OFFHAND: Icon = [
+    "............",
+    "...##.......",
+    "..##........",
+    ".##########.",
+    "..##........",
+    "...##.......",
+    ".......##...",
+    "........##..",
+    ".##########.",
+    "........##..",
+    ".......##...",
+    "............",
 ];
 
 /// Running legs (never on screen: sprint is the stick pushed forward).
