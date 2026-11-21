@@ -8756,8 +8756,15 @@ impl Game<'_> {
         // Gui.extractRenderState: the debug overlay comes after the screen
         // and the toasts, so it is over everything, menus included.
         self.draw_debug_overlay(&mut batch, size);
-        self.frame_graph
-            .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
+        let safe = self.touch_safe(batch.width, batch.height, batch.scale);
+        self.frame_graph.draw(
+            self.settings.horizon.overlay,
+            self.settings.horizon.overlay_corner,
+            self.settings.horizon.overlay_scale,
+            [safe.x, safe.y, safe.w, safe.h],
+            &mut batch,
+            &self.gui.atlas,
+        );
         self.draw_pad_cursor(&mut batch);
         self.draw_touch_controls(&mut batch);
         self.draw_touch_close(&mut batch);

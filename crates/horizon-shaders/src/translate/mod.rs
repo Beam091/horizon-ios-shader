@@ -42,7 +42,7 @@ mod rewrite;
 mod scan;
 mod varyings;
 
-pub use geometry::{GeometryInputs, translate_geometry};
+pub use geometry::{GeometryInputs, translate_geometry, translate_geometry_stage};
 
 use scan::Stage;
 #[cfg(test)]

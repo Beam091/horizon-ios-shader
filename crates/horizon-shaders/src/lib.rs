@@ -68,5 +68,6 @@ pub use translate::{
     AlphaTest, ComputeProgram, DRAW_UNIFORMS, Error, GbuffersInputs, GeometryInputs, Image,
     Interface, Parts, Program, Sampler, Target, Uniform, WATER_MASK, WATER_PATCHES,
     translate_composite, translate_compute, translate_gbuffers, translate_geometry,
+    translate_geometry_stage,
     translate_shadow,
 };

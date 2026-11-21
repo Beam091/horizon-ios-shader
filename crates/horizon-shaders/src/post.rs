@@ -1018,7 +1018,35 @@ pub fn load_post(
             p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
             p
         });
+    drop(gbuffers);
     if let Some(terrain) = &inputs.terrain {
+        let mut load_terrain = |names: &[&str], group, stage_inputs: &GbuffersInputs| {
+            names.iter().find_map(|name| {
+                // `alphaTest.<program>` replaces the geometry's default test (OQ-23).
+                let key = properties.get(&format!("alphaTest.{name}"));
+                let test = key.and_then(|v| crate::AlphaTest::parse(v.trim()));
+                let mut stage_inputs = stage_inputs.clone();
+                if let Some(test) = test {
+                    stage_inputs.alpha_test = test;
+                    // One program's solid and cutout parts in one pass: both, as in two.
+                    if let Some(parts) = &mut stage_inputs.parts {
+                        parts.cutout_alpha_test = test;
+                    }
+                }
+                loader.geometry = inputs.terrain_geometry.clone().map(|mut g| {
+                    g.inputs.alpha_test = stage_inputs.alpha_test;
+                    g.inputs.after = stage_inputs.after.clone();
+                    g.inputs.parts = stage_inputs.parts.clone();
+                    g.inputs.water_mask = stage_inputs.water_mask;
+                    g
+                });
+                let loaded = loader.load(name.to_string(), group, |v, f| {
+                    translate_gbuffers(v, f, Target::Buffers, &stage_inputs)
+                });
+                loader.geometry = None;
+                loaded
+            })
+        };
         // Cutout terrain's alpha test, unless `alphaTest.*` says otherwise (3.2): alpha above
         // 0.5, which `alphaTestRef` reads. Iris 1.11.7 with probe packs of ours (#9307), through
         // gbuffers_terrain alone or gbuffers_terrain_cutout: cutout fragments written with alpha
@@ -1045,8 +1073,8 @@ pub fn load_post(
         let mut lone = None;
         let (solid, terrain_cutout) = match parts {
             Some([solid, cut]) => {
-                let solid = gbuffers(&TERRAIN_SOLID, Group::Gbuffers, solid);
-                let cut = gbuffers(&TERRAIN_CUTOUT, Group::Gbuffers, &cutout(cut));
+                let solid = load_terrain(&TERRAIN_SOLID, Group::Gbuffers, solid);
+                let cut = load_terrain(&TERRAIN_CUTOUT, Group::Gbuffers, &cutout(cut));
                 // One part loaded: its name, the other part, and whether the pack has a
                 // program for that one.
                 let one = match (&solid, &cut) {
@@ -1082,15 +1110,15 @@ pub fn load_post(
                     if let Some(parts) = &mut both.parts {
                         parts.cutout_alpha_test = parts.cutout_alpha_test.or(cut);
                     }
-                    (gbuffers(&TERRAIN, Group::Gbuffers, &both), None)
+                    (load_terrain(&TERRAIN, Group::Gbuffers, &both), None)
                 }
                 // A game that draws terrain in one part: all of it with the cutout test.
-                None => (gbuffers(&TERRAIN, Group::Gbuffers, &cutout(terrain)), None),
+                None => (load_terrain(&TERRAIN, Group::Gbuffers, &cutout(terrain)), None),
             },
         };
         // gbuffers_water falls back to gbuffers_terrain's chain (2.3).
         // Water discards what lies behind the boats' water patches (`GbuffersInputs::water_mask`).
-        let water = gbuffers(
+        let water = load_terrain(
             &WATER,
             Group::Translucent,
             &GbuffersInputs {
@@ -1615,19 +1643,24 @@ impl Loader<'_> {
             return None;
         }
         let [vertex, geometry, fragment] = &stages;
-        let (program, triangles) =
-            match crate::translate_geometry(vertex, geometry, fragment, inputs) {
-                Ok(p) => p,
-                Err(errors) => {
-                    notes.extend(
-                        errors
-                            .iter()
-                            .map(|e| format!("{}:{}: {}", e.file, e.line, e.message)),
-                    );
-                    notes.push(format!("{name}: skipped"));
-                    return None;
-                }
-            };
+        let (program, triangles) = match crate::translate_geometry_stage(
+            vertex,
+            geometry,
+            fragment,
+            inputs,
+            group.shadow(),
+        ) {
+            Ok(p) => p,
+            Err(errors) => {
+                notes.extend(
+                    errors
+                        .iter()
+                        .map(|e| format!("{}:{}: {}", e.file, e.line, e.message)),
+                );
+                notes.push(format!("{name}: skipped"));
+                return None;
+            }
+        };
         notes.extend(
             program
                 .notes
@@ -1637,12 +1670,14 @@ impl Loader<'_> {
         self.post.config.read_vertex(vertex);
         self.post.config.read(fragment);
         let mut buffers =
-            config::draw_buffers(fragment).unwrap_or_else(|| default_draw_buffers(true));
-        let kept = buffers
-            .iter()
-            .position(|&b| b as usize >= self.shadow_buffers(fragment))
-            .unwrap_or(buffers.len());
-        buffers.truncate(kept);
+            config::draw_buffers(fragment).unwrap_or_else(|| default_draw_buffers(group.shadow()));
+        if group.shadow() {
+            let kept = buffers
+                .iter()
+                .position(|&b| b as usize >= self.shadow_buffers(fragment))
+                .unwrap_or(buffers.len());
+            buffers.truncate(kept);
+        }
         Some(PostProgram {
             buffer_blends: buffer_blends(self.properties, &name),
             flips: flips(self.properties, &name),
@@ -3193,6 +3228,57 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
             "{:?}",
             post.notes
         );
+    }
+
+    #[test]
+    fn a_terrain_geometry_stage_loads_gbuffers_terrain_and_draw_buffers() {
+        let vsh = "#version 330\nout vec2 vUv;\nvoid main() { gl_Position = ftransform(); vUv = vec2(0.5); }\n";
+        let gsh = "#version 330\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 3) out;\n\
+                   in vec2 vUv[];\nout vec2 gUv;\nflat out float texRes;\nvoid main() {\n\
+                   texRes = 16.0;\nfor (int i = 0; i < 3; i++) {\n\
+                   gl_Position = gl_in[i].gl_Position;\ngUv = vUv[i];\nEmitVertex();\n}\nEndPrimitive();\n}\n";
+        let fsh = "#version 330\n/* DRAWBUFFERS:0125 */\nin vec2 gUv;\nflat in float texRes;\n\
+                   layout(location = 0) out vec4 c0;\nlayout(location = 1) out vec4 c1;\n\
+                   layout(location = 2) out vec4 c2;\nlayout(location = 3) out vec4 c3;\n\
+                   void main() { c0 = vec4(gUv, texRes, 1.0); c1 = c0; c2 = c0; c3 = c0; }\n";
+        let files = [
+            ("shaders/gbuffers_terrain.vsh", vsh),
+            ("shaders/gbuffers_terrain.gsh", gsh),
+            ("shaders/gbuffers_terrain.fsh", fsh),
+        ];
+        let pack = Pack::from_zip_bytes("t", zip(&files)).unwrap();
+        let game = crate::GbuffersInputs {
+            declarations: "layout(location = 0) in vec3 hz_v_pos;\n\
+                           layout(set = 1, binding = 0) readonly buffer V { uint v[]; };\n"
+                .into(),
+            body: "    hz_Vertex = vec4(hz_v_pos, 1.0);\n".into(),
+            ..Default::default()
+        };
+        let geometry = crate::GeometryInputs {
+            inputs: game.clone(),
+            pull: "        hz_v_pos = uintBitsToFloat(uvec3(v[hz_vertex_index], v[hz_vertex_index], v[hz_vertex_index]));\n"
+                .into(),
+            index: "uint(@)".into(),
+        };
+        let inputs = GameInputs {
+            terrain: Some(game),
+            terrain_geometry: Some(geometry),
+            ..Default::default()
+        };
+        let post = load_post(
+            &pack,
+            "",
+            &Properties::default(),
+            &Macros::standard(),
+            &inputs,
+        );
+        let terrain = post
+            .terrain
+            .as_ref()
+            .expect("gbuffers_terrain with .gsh should load");
+        assert_eq!(terrain.name, "gbuffers_terrain");
+        assert_eq!(terrain.geometry_triangles, 1);
+        assert_eq!(terrain.buffers, [0, 1, 2, 5]);
     }
 
     /// Water falls back to the terrain chain and blends by default, as the sky does; entities

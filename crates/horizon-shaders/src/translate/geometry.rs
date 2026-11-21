@@ -37,6 +37,19 @@ pub fn translate_geometry(
     fragment: &Preprocessed,
     inputs: &GeometryInputs,
 ) -> Result<(Program, u32), Vec<Error>> {
+    translate_geometry_stage(vertex, geometry, fragment, inputs, true)
+}
+
+/// Translates `vertex`, `geometry` and `fragment` for a shadow (`shadow = true`) or gbuffers /
+/// translucent (`shadow = false`) program: the program, and how many triangles the geometry stage
+/// can emit (the instances to draw).
+pub fn translate_geometry_stage(
+    vertex: &Preprocessed,
+    geometry: &Preprocessed,
+    fragment: &Preprocessed,
+    inputs: &GeometryInputs,
+    shadow: bool,
+) -> Result<(Program, u32), Vec<Error>> {
     let (combined, triangles) = combine(vertex, geometry, inputs)?;
     let mut gbuffers = inputs.inputs.clone();
     gbuffers.declarations = gbuffers
@@ -49,10 +62,17 @@ pub fn translate_geometry(
         .fold(String::new(), |s, l| s + l + "\n");
     // The pack's vertex stage reads its inputs in our loop, not in `main`.
     gbuffers.body = String::new();
+    // If one-pass terrain splits solid and cutout quads via `hz_cutout`, refresh it after
+    // `hz_main()` once the vertex pull loop has populated `hz_v_layer`.
+    if let Some(parts) = &gbuffers.parts
+        && gbuffers.alpha_test != parts.cutout_alpha_test
+    {
+        writeln!(gbuffers.after, "    hz_cutout = ({}) ? 0u : 1u;", parts.solid).unwrap();
+    }
     // The vertex's place isn't the fragment's through a geometry stage.
     gbuffers.water_patches = false;
     gbuffers.attributes = Vec::new();
-    let program = super::translate(&combined, fragment, Target::Buffers, Some(&gbuffers), true)?;
+    let program = super::translate(&combined, fragment, Target::Buffers, Some(&gbuffers), shadow)?;
     Ok((program, triangles))
 }
 

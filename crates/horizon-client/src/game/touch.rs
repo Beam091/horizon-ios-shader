@@ -332,12 +332,22 @@ impl Game<'_> {
             self.last_input = Instant::now();
             return Vec::new();
         }
+        // On iOS, winit's `inner_size()` reports the Safe Area (excluding notch/Dynamic Island
+        // insets), which stops the virtual cursor short of the right edge of the display.
+        // Use the full framebuffer dimensions instead so the cursor reaches every edge.
         let bounds = self
-            .window
-            .as_ref()
-            .map(|w| {
-                let s = w.inner_size();
-                (f64::from(s.width.max(1)), f64::from(s.height.max(1)))
+            .gui_scale()
+            .map(|b| {
+                (
+                    f64::from(b.width * b.scale).max(1.0),
+                    f64::from(b.height * b.scale).max(1.0),
+                )
+            })
+            .or_else(|| {
+                self.window.as_ref().map(|w| {
+                    let s = w.outer_size();
+                    (f64::from(s.width.max(1)), f64::from(s.height.max(1)))
+                })
             })
             .unwrap_or((1920.0, 1080.0));
         self.pad

@@ -296,10 +296,55 @@ pub enum Pacing {
 pub enum Overlay {
     #[default]
     Off,
+    /// Compact single-line FPS counter in the chosen corner.
+    Simple,
     /// Frames per second and frame time.
     Fps,
     /// The numbers and a graph of recent frame times.
     Graph,
+}
+
+/// Which corner of the screen hosts the performance / FPS overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OverlayCorner {
+    TopLeft,
+    #[default]
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+impl OverlayCorner {
+    pub const ALL: [Self; 4] = [
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TopLeft => "top_left",
+            Self::TopRight => "top_right",
+            Self::BottomLeft => "bottom_left",
+            Self::BottomRight => "bottom_right",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TopLeft => "Top Left",
+            Self::TopRight => "Top Right",
+            Self::BottomLeft => "Bottom Left",
+            Self::BottomRight => "Bottom Right",
+        }
+    }
+    fn parse(s: &str) -> Self {
+        match s {
+            "top_left" => Self::TopLeft,
+            "top_right" => Self::TopRight,
+            "bottom_left" => Self::BottomLeft,
+            "bottom_right" => Self::BottomRight,
+            _ => Self::TopRight,
+        }
+    }
 }
 
 /// How finely far terrain is drawn (`FarDetail` in the LOD options).
@@ -907,6 +952,10 @@ pub struct Graphics {
     /// Chunk worker threads; 0 uses every core but one. Applies at the next start.
     pub workers: u32,
     pub overlay: Overlay,
+    /// Which screen corner hosts the performance / FPS overlay.
+    pub overlay_corner: OverlayCorner,
+    /// Size of the performance / FPS overlay in percent (50..=200).
+    pub overlay_scale: u32,
     /// World resolution as a percentage of the window's (50..=200).
     pub resolution_scale: u32,
     /// FXAA over the world.
@@ -1019,6 +1068,8 @@ impl Default for Graphics {
             pacing: Pacing::Efficient,
             workers: 0,
             overlay: Overlay::Off,
+            overlay_corner: OverlayCorner::TopRight,
+            overlay_scale: 100,
             resolution_scale: if cfg!(target_os = "ios") { 70 } else { 100 },
             fxaa: false,
             taa: false,
@@ -1216,9 +1267,16 @@ impl Graphics {
                 "pickedShaderPack" => g.shader_pack = value.to_owned(),
                 "overlay" => {
                     g.overlay = match value {
+                        "simple" => Overlay::Simple,
                         "fps" => Overlay::Fps,
                         "graph" => Overlay::Graph,
                         _ => Overlay::Off,
+                    }
+                }
+                "overlayCorner" => g.overlay_corner = OverlayCorner::parse(value),
+                "overlayScale" => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        g.overlay_scale = (n.clamp(50, 200) + 5) / 10 * 10;
                     }
                 }
                 _ => {}
@@ -1260,6 +1318,7 @@ impl Graphics {
             self.workers,
             match self.overlay {
                 Overlay::Off => "off",
+                Overlay::Simple => "simple",
                 Overlay::Fps => "fps",
                 Overlay::Graph => "graph",
             },
@@ -1285,11 +1344,13 @@ impl Graphics {
             bool_text(self.gpu_culling),
         );
         text += &format!(
-            "metalfxMode:{}\nmetalfxPreset:{}\nshaderHalfBuffers:{}\nshadowUpdateRate:{}\n",
+            "metalfxMode:{}\nmetalfxPreset:{}\nshaderHalfBuffers:{}\nshadowUpdateRate:{}\noverlayCorner:{}\noverlayScale:{}\n",
             self.metalfx_mode.name(),
             self.metalfx_preset.name(),
             bool_text(self.shader_half_buffers),
             self.shadow_update_rate.name(),
+            self.overlay_corner.name(),
+            self.overlay_scale,
         );
         text += &self.blue_map.serialize();
         text
@@ -1452,6 +1513,8 @@ mod tests {
             pacing: Pacing::Precise,
             workers: 6,
             overlay: Overlay::Graph,
+            overlay_corner: OverlayCorner::BottomLeft,
+            overlay_scale: 140,
             resolution_scale: 75,
             fxaa: true,
             taa: true,

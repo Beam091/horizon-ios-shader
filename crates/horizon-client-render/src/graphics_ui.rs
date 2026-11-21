@@ -7,7 +7,7 @@
 use crate::{
     graphics::{
         EntityCullingMode, FarDetail, FrameGeneration, GraphicsApi, LeafCullingMode, MetalFxMode,
-        MetalFxPreset, Overlay, Pacing, ParticleCullingMode, PresentMode, Preset,
+        MetalFxPreset, Overlay, OverlayCorner, Pacing, ParticleCullingMode, PresentMode, Preset,
         ShadowUpdateRate, Upscaling,
     },
     graphics_style::{self as style, Cost},
@@ -95,6 +95,8 @@ pub enum H {
     Pacing,
     Workers,
     Overlay,
+    OverlayCorner,
+    OverlayScale,
     ResolutionScale,
     Antialiasing,
     Upscaling,
@@ -572,11 +574,23 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                 ),
                 (
                     "Overlay",
-                    vec![h(
-                        H::Overlay,
-                        None,
-                        "Frame rate and frame times over the game, with a graph.",
-                    )],
+                    vec![
+                        h(
+                            H::Overlay,
+                            None,
+                            "Frame rate and frame times over the game, with a graph.",
+                        ),
+                        h(
+                            H::OverlayCorner,
+                            None,
+                            "Which corner of the screen shows the FPS overlay.",
+                        ),
+                        h(
+                            H::OverlayScale,
+                            None,
+                            "Size of the FPS overlay (50% to 200%).",
+                        ),
+                    ],
                 ),
             ],
         ),
@@ -802,6 +816,7 @@ impl H {
             }
             H::Workers => Some(g.workers as f32 / max_workers() as f32),
             H::ResolutionScale => Some((g.resolution_scale as f32 - 25.0) / 175.0),
+            H::OverlayScale => Some((g.overlay_scale.clamp(50, 200) as f32 - 50.0) / 150.0),
             // Auto, then 10..480 by 10.
             H::HdrPaperWhite => Some(g.hdr_paper_white as f32 / 480.0),
             // Auto, then 200..2000 by 50.
@@ -821,6 +836,7 @@ impl H {
             H::UploadBudget => Some((UPLOAD_STEPS.len() - 1) as u32),
             H::Workers => Some(max_workers()),
             H::ResolutionScale => Some(35),
+            H::OverlayScale => Some(15),
             H::HdrPaperWhite => Some(41),
             H::HdrPeak => Some(37),
             H::HdrBlackLevel => Some(100),
@@ -969,10 +985,13 @@ impl H {
                 "Performance Overlay",
                 match g.overlay {
                     Overlay::Off => "Off",
+                    Overlay::Simple => "FPS Only",
                     Overlay::Fps => "FPS",
                     Overlay::Graph => "FPS and Graph",
                 },
             ),
+            H::OverlayCorner => labelled("Overlay Corner", g.overlay_corner.label()),
+            H::OverlayScale => labelled_percent("Overlay Size", g.overlay_scale),
         }
     }
     fn set_slider(self, s: &mut Settings, v: f32) {
@@ -989,6 +1008,7 @@ impl H {
             }
             H::Workers => g.workers = (v * max_workers() as f32).round() as u32,
             H::ResolutionScale => g.resolution_scale = (25.0 + (v * 35.0).round() * 5.0) as u32,
+            H::OverlayScale => g.overlay_scale = 50 + (v * 15.0).round() as u32 * 10,
             H::HdrPaperWhite => g.hdr_paper_white = (v * 48.0).round() as u32 * 10,
             H::HdrPeak => {
                 g.hdr_peak = match (v * 37.0).round() as u32 {
@@ -1112,10 +1132,13 @@ impl H {
             }
             H::Overlay => {
                 g.overlay = step(
-                    &[Overlay::Off, Overlay::Fps, Overlay::Graph],
+                    &[Overlay::Off, Overlay::Simple, Overlay::Fps, Overlay::Graph],
                     g.overlay,
                     back,
                 )
+            }
+            H::OverlayCorner => {
+                g.overlay_corner = step(&OverlayCorner::ALL, g.overlay_corner, back)
             }
             _ => {}
         }
@@ -1178,6 +1201,14 @@ impl Item {
                 if s.horizon.entity_culling != EntityCullingMode::Asynchronous =>
             {
                 Some("Only applies to asynchronous entity culling.")
+            }
+            Item::Horizon(H::ResolutionScale)
+                if s.horizon.metalfx_mode != MetalFxMode::Off =>
+            {
+                Some("Controlled by MetalFX Scale.")
+            }
+            Item::Horizon(H::Antialiasing) if s.horizon.metalfx_mode != MetalFxMode::Off => {
+                Some("Controlled by MetalFX Upscaling.")
             }
             Item::Horizon(H::GpuCulling) => crate::graphics::gpu_culling_offer().reason(),
             // VideoSettingsScreen.tick: Max Anisotropy only works with Anisotropic filtering.
@@ -1295,6 +1326,8 @@ impl Item {
                         | H::BlueMapAutoDetect
                         | H::BlueMapRadius
                         | H::Overlay
+                        | H::OverlayCorner
+                        | H::OverlayScale
                         | H::ScreenshotQuality
                         | H::Pacing
                         | H::PresentMode
@@ -1379,14 +1412,17 @@ pub enum Target {
 type Line = shell::Line<Page, Setting>;
 
 /// Whether a setting is on the screen now: Upscaling only while TAA is (and not under a shader
-/// pack, which uses Resolution Scale / MetalFX), MetalFX Scale only while MetalFX is on, and
-/// Frame Generation is desktop-only.
+/// pack, which uses Resolution Scale / MetalFX), MetalFX Scale only while MetalFX is on,
+/// Overlay Corner/Size only while Overlay is on, and Frame Generation is desktop-only.
 fn shown(item: Item, s: &Settings) -> bool {
     if cfg!(target_os = "ios") && item == Item::Horizon(H::FrameGeneration) {
         return false;
     }
     if item == Item::Horizon(H::MetalFxPreset) {
         return s.horizon.metalfx_mode != MetalFxMode::Off;
+    }
+    if matches!(item, Item::Horizon(H::OverlayCorner | H::OverlayScale)) {
+        return s.horizon.overlay != Overlay::Off;
     }
     if item == Item::Horizon(H::Upscaling) {
         return s.horizon.taa
@@ -2239,7 +2275,7 @@ mod tests {
                 .filter_map(|l| l.setting.map(|r| (l.page, r.item)))
                 .collect::<Vec<_>>()
         };
-        // Upscaling and MetalFX Scale show only when TAA / MetalFX are turned on.
+        // Upscaling, MetalFX Scale, and Overlay Corner/Size show only when their parent is on.
         let on = |page| -> Vec<(Page, Item)> {
             items()
                 .into_iter()
@@ -2247,7 +2283,12 @@ mod tests {
                     *p == page
                         && !matches!(
                             i,
-                            Item::Horizon(H::Upscaling | H::MetalFxPreset)
+                            Item::Horizon(
+                                H::Upscaling
+                                    | H::MetalFxPreset
+                                    | H::OverlayCorner
+                                    | H::OverlayScale
+                            )
                         )
                 })
                 .collect()
