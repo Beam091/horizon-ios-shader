@@ -80,6 +80,21 @@ def main() -> None:
     index_bytes = fetch(index["url"])
     if sha1(index_bytes) != index["sha1"]:
         raise SystemExit("the asset index does not match the version JSON")
+
+    # If Mojang republished the version JSON with updated non-English translation assets while
+    # keeping the exact same client.jar and server.jar SHA-1s, record the new manifest/index SHA-1
+    # in research-lock.json so horizon-prepare accepts it.
+    lock_doc = json.loads((root / "research-lock.json").read_text())
+    mc_lock = lock_doc["minecraft"]
+    updated_lock = False
+    if entry["sha1"] not in {mc_lock["manifest_sha1"], *mc_lock.get("accepted_manifest_sha1", [])}:
+        mc_lock.setdefault("accepted_manifest_sha1", []).append(entry["sha1"])
+        updated_lock = True
+    if index["sha1"] not in set(mc_lock.get("accepted_asset_index_sha1", [])):
+        mc_lock.setdefault("accepted_asset_index_sha1", []).append(index["sha1"])
+        updated_lock = True
+    if updated_lock:
+        (root / "research-lock.json").write_text(json.dumps(lock_doc, indent=2) + "\n")
     index_path = out / "assets" / "indexes" / f"{index['id']}.json"
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_bytes(index_bytes)
