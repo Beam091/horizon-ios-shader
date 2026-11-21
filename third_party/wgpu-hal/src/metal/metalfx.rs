@@ -79,13 +79,29 @@ impl TemporalScaler {
         }
         let scaler: Option<Retained<AnyObject>> =
             unsafe { msg_send![&*desc, newTemporalScalerWithDevice: device] };
-        scaler.map(|raw| Self { raw })
+        let raw = scaler?;
+        // Verify our textures satisfy every MTLTextureUsage bit required by MetalFX.
+        unsafe {
+            let need_c: usize = msg_send![&*raw, colorTextureUsage];
+            let need_d: usize = msg_send![&*raw, depthTextureUsage];
+            let need_m: usize = msg_send![&*raw, motionTextureUsage];
+            let need_o: usize = msg_send![&*raw, outputTextureUsage];
+            if (color.usage().0 & need_c) != need_c
+                || (depth.usage().0 & need_d) != need_d
+                || (motion.usage().0 & need_m) != need_m
+                || (output.usage().0 & need_o) != need_o
+            {
+                return None;
+            }
+        }
+        Some(Self { raw })
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &self,
         cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+        input_size: [u32; 2],
         color: &ProtocolObject<dyn MTLTexture>,
         depth: &ProtocolObject<dyn MTLTexture>,
         motion: &ProtocolObject<dyn MTLTexture>,
@@ -99,6 +115,8 @@ impl TemporalScaler {
             let _: () = msg_send![&*self.raw, setDepthTexture: depth];
             let _: () = msg_send![&*self.raw, setMotionTexture: motion];
             let _: () = msg_send![&*self.raw, setOutputTexture: output];
+            let _: () = msg_send![&*self.raw, setInputContentWidth: input_size[0] as usize];
+            let _: () = msg_send![&*self.raw, setInputContentHeight: input_size[1] as usize];
             let _: () = msg_send![&*self.raw, setJitterOffsetX: jitter_px[0]];
             let _: () = msg_send![&*self.raw, setJitterOffsetY: jitter_px[1]];
             let _: () = msg_send![&*self.raw, setMotionVectorScaleX: 1.0f32];
@@ -157,18 +175,29 @@ impl SpatialScaler {
         }
         let scaler: Option<Retained<AnyObject>> =
             unsafe { msg_send![&*desc, newSpatialScalerWithDevice: device] };
-        scaler.map(|raw| Self { raw })
+        let raw = scaler?;
+        unsafe {
+            let need_c: usize = msg_send![&*raw, colorTextureUsage];
+            let need_o: usize = msg_send![&*raw, outputTextureUsage];
+            if (color.usage().0 & need_c) != need_c || (output.usage().0 & need_o) != need_o {
+                return None;
+            }
+        }
+        Some(Self { raw })
     }
 
     pub fn encode(
         &self,
         cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+        input_size: [u32; 2],
         color: &ProtocolObject<dyn MTLTexture>,
         output: &ProtocolObject<dyn MTLTexture>,
     ) {
         unsafe {
             let _: () = msg_send![&*self.raw, setColorTexture: color];
             let _: () = msg_send![&*self.raw, setOutputTexture: output];
+            let _: () = msg_send![&*self.raw, setInputContentWidth: input_size[0] as usize];
+            let _: () = msg_send![&*self.raw, setInputContentHeight: input_size[1] as usize];
             let _: () = msg_send![&*self.raw, encodeToCommandBuffer: cmd_buf];
         }
     }

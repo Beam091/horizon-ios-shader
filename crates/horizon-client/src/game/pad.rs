@@ -62,6 +62,9 @@ pub(super) struct Pads {
     pub(super) ios_hw_active: bool,
     pub(super) ios_hw_keys: Vec<KeyCode>,
     pub(super) ios_hw_mouse_buttons: [bool; 3],
+    /// Whether a real physical game controller (not virtual touch controls) is active.
+    pub(super) hw_pad_active: bool,
+    hw_pad_activity: gamepad::Activity,
     /// The virtual pad was in use at the last poll.
     virtual_input: bool,
     /// Buttons a `pad ... tap` releases at the next poll.
@@ -323,6 +326,10 @@ impl Game<'_> {
         self.ui.options.pad_by_letter =
             style == GlyphStyle::Nintendo && self.pad.by_letter(&self.settings.controller);
         self.ui.options.pad_driving = self.pad.in_use && self.pad_focus_mode();
+        let hw_activity = self
+            .pad
+            .hw_pad_activity
+            .observe(&hardware, &self.settings.controller);
         let mut state = hardware
             .merge(&self.pad.injected)
             .merge(&self.pad.touch_state);
@@ -346,6 +353,9 @@ impl Game<'_> {
         }
         let threshold = self.settings.controller.trigger_threshold;
         let edges = self.pad.edges.update(&state, threshold);
+        if hw_activity && self.pad_focused() {
+            self.pad.hw_pad_active = true;
+        }
         if activity && self.pad_focused() {
             self.last_input = Instant::now();
             self.pad.in_use = true;

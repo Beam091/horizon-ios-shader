@@ -67,6 +67,6 @@ jobs:
           tag=ios-r$GITHUB_RUN_NUMBER
           cp dist/Horizon.ipa "dist/Horizon-ios-$VERSION-r$GITHUB_RUN_NUMBER.ipa"
           gh release create "$tag" "dist/Horizon-ios-$VERSION-r$GITHUB_RUN_NUMBER.ipa" \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
-            --title "Horizon for iOS $VERSION (build $GITHUB_RUN_NUMBER, experimental)" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "Horizon for iOS $VERSION (Build r$GITHUB_RUN_NUMBER)" \
             --notes-file packaging/ios/README.md

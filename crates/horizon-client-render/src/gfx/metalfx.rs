@@ -495,6 +495,7 @@ impl MetalFx {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        pending_cmds: &mut Vec<wgpu::CommandBuffer>,
         src_color: Option<&wgpu::TextureView>,
         depth_view: &wgpu::TextureView,
         screen: &wgpu::TextureView,
@@ -602,11 +603,27 @@ impl MetalFx {
                 rp.draw(0..3, 0..1);
             }
 
+            // wgpu-core forbids mixing wgpu render passes and `as_hal_mut` on the same
+            // CommandEncoder (`EncodingApi::Wgpu` vs `EncodingApi::Raw`). Finish the prior
+            // encoder, encode MetalFX into a brand-new untouched CommandEncoder, and swap in
+            // a fresh wgpu encoder for the present pass + HUD so GPU execution stays strictly
+            // ordered in one `queue.submit` batch.
+            let prev = std::mem::replace(
+                encoder,
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Horizon post-MetalFX"),
+                }),
+            );
+            pending_cmds.push(prev.finish());
+
+            let mut mfx_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("MetalFX"),
+            });
             let reset = self.reset_history || targets.reset_next;
             targets.reset_next = false;
             let jitter_px = self.jitter_px;
             unsafe {
-                encoder.as_hal_mut::<wgpu::hal::api::Metal, _, _>(|hal_enc| {
+                mfx_enc.as_hal_mut::<wgpu::hal::api::Metal, _, _>(|hal_enc| {
                     let Some(hal_enc) = hal_enc else {
                         return;
                     };
@@ -632,6 +649,7 @@ impl MetalFx {
                             };
                             ts.encode(
                                 cmd_buf,
+                                input_size,
                                 c_tex.raw_handle(),
                                 d_tex.raw_handle(),
                                 m_tex.raw_handle(),
@@ -643,11 +661,14 @@ impl MetalFx {
                             used_native = true;
                         }
                         NativeScaler::Spatial(ss) => {
-                            ss.encode(cmd_buf, c_tex.raw_handle(), o_tex.raw_handle());
+                            ss.encode(cmd_buf, input_size, c_tex.raw_handle(), o_tex.raw_handle());
                             used_native = true;
                         }
                     }
                 });
+            }
+            if used_native {
+                pending_cmds.push(mfx_enc.finish());
             }
         }
 

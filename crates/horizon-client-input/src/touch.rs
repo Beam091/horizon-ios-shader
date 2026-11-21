@@ -13,15 +13,17 @@ use winit::event::{
 };
 
 /// Max finger movement (physical pixels) for a touch to count as stationary (tap or long-press).
-const TAP_SLOP: f64 = 18.0;
+const TAP_SLOP: f64 = 10.0;
 /// Max duration of a single tap in trackpad mode.
-const TAP_MAX: Duration = Duration::from_millis(260);
+const TAP_MAX: Duration = Duration::from_millis(200);
 /// Max time between a tap and the next touch-down to start a double-tap-and-hold left drag.
-const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(320);
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(260);
+/// Max distance (physical pixels) between the first and second tap to count as a double-tap-drag.
+const DOUBLE_TAP_SLOP: f64 = 64.0;
 /// Hold duration in place to trigger a right-click in trackpad mode.
-const HOLD_RIGHT_CLICK: Duration = Duration::from_millis(380);
+const HOLD_RIGHT_CLICK: Duration = Duration::from_millis(520);
 /// Relative cursor speed multiplier in trackpad mode.
-const TRACKPAD_SPEED: f64 = 1.35;
+const TRACKPAD_SPEED: f64 = 1.15;
 
 /// A touch screen as a mouse: in direct mode, the first finger down moves the
 /// cursor and holds the left button until it lifts, while two fingers scroll
@@ -42,7 +44,7 @@ pub struct TouchMouse {
     pub trackpad: bool,
     /// Virtual cursor position in physical window pixels (used in trackpad mode).
     pub cursor: Option<PhysicalPosition<f64>>,
-    last_tap: Option<Instant>,
+    last_tap: Option<(Instant, PhysicalPosition<f64>)>,
     trackpad_left_drag: bool,
     trackpad_right_down: bool,
     device_id: Option<DeviceId>,
@@ -222,10 +224,11 @@ impl TouchMouse {
                 self.primary_moved = false;
                 self.scrolling = false;
                 self.trackpad_right_down = false;
-                if self
-                    .last_tap
-                    .is_some_and(|t| now.duration_since(t) <= DOUBLE_TAP_WINDOW)
-                {
+                if self.last_tap.is_some_and(|(t, pos)| {
+                    now.duration_since(t) <= DOUBLE_TAP_WINDOW
+                        && ((location.x - pos.x).powi(2) + (location.y - pos.y).powi(2)).sqrt()
+                            <= DOUBLE_TAP_SLOP
+                }) {
                     self.last_tap = None;
                     self.trackpad_left_drag = true;
                     vec![
@@ -236,6 +239,7 @@ impl TouchMouse {
                         btn(MouseButton::Left, ElementState::Pressed),
                     ]
                 } else {
+                    self.last_tap = None;
                     self.trackpad_left_drag = false;
                     Vec::new()
                 }
@@ -337,7 +341,12 @@ impl TouchMouse {
                         btn(MouseButton::Right, ElementState::Released),
                     ]
                 } else if !was_scrolling && phase == TouchPhase::Ended && !self.primary_moved {
-                    if since.is_some_and(|s| now.duration_since(s) >= HOLD_RIGHT_CLICK) {
+                    let end_dist = ((location.x - self.primary_start.x).powi(2)
+                        + (location.y - self.primary_start.y).powi(2))
+                    .sqrt();
+                    if end_dist > TAP_SLOP {
+                        Vec::new()
+                    } else if since.is_some_and(|s| now.duration_since(s) >= HOLD_RIGHT_CLICK) {
                         vec![
                             WindowEvent::CursorMoved {
                                 device_id,
@@ -347,7 +356,7 @@ impl TouchMouse {
                             btn(MouseButton::Right, ElementState::Released),
                         ]
                     } else if since.is_some_and(|s| now.duration_since(s) <= TAP_MAX) {
-                        self.last_tap = Some(now);
+                        self.last_tap = Some((now, location));
                         vec![
                             WindowEvent::CursorMoved {
                                 device_id,
@@ -564,7 +573,7 @@ mod tests {
             ]
         );
 
-        // 2. Second tap within DOUBLE_TAP_WINDOW -> holds Left button and drags
+        // 2. Second tap within DOUBLE_TAP_WINDOW & DOUBLE_TAP_SLOP -> holds Left button and drags
         let t2 = now + Duration::from_millis(180);
         assert_eq!(
             outs(t.translate_menu(raw_touch(2, TouchPhase::Started, 100.0, 100.0), t2, bounds)),
@@ -572,36 +581,58 @@ mod tests {
         );
         assert_eq!(
             outs(t.translate_menu(raw_touch(2, TouchPhase::Moved, 120.0, 100.0), t2, bounds)),
-            [Out::Move(527.0, 250.0)]
+            [Out::Move(523.0, 250.0)]
         );
         assert_eq!(
             outs(t.translate_menu(raw_touch(2, TouchPhase::Ended, 120.0, 100.0), t2, bounds)),
-            [Out::Move(527.0, 250.0), Out::Button(ElementState::Released)]
+            [Out::Move(523.0, 250.0), Out::Button(ElementState::Released)]
         );
 
-        // 3. Long press in place -> Right click
+        // 3. Long press in place (>= 520ms) -> Right click
         let t3 = now + Duration::from_millis(1000);
         assert!(
             t.translate_menu(raw_touch(3, TouchPhase::Started, 100.0, 100.0), t3, bounds)
                 .is_empty()
         );
+        // Resting briefly (350ms) before moving does NOT trigger right-click.
+        assert!(t.poll(t3 + Duration::from_millis(350)).is_empty());
         assert_eq!(
-            outs(t.poll(t3 + Duration::from_millis(400))),
+            outs(t.poll(t3 + Duration::from_millis(550))),
             [
-                Out::Move(527.0, 250.0),
+                Out::Move(523.0, 250.0),
                 Out::RightButton(ElementState::Pressed),
             ]
         );
         assert_eq!(
             outs(t.translate_menu(
                 raw_touch(3, TouchPhase::Ended, 100.0, 100.0),
-                t3 + Duration::from_millis(450),
+                t3 + Duration::from_millis(600),
                 bounds,
             )),
             [
-                Out::Move(527.0, 250.0),
+                Out::Move(523.0, 250.0),
                 Out::RightButton(ElementState::Released),
             ]
+        );
+
+        // 4. Short drag (12px) never accidentally clicks on lift.
+        let t4 = now + Duration::from_millis(2000);
+        assert!(
+            t.translate_menu(raw_touch(4, TouchPhase::Started, 200.0, 200.0), t4, bounds)
+                .is_empty()
+        );
+        let _ = t.translate_menu(
+            raw_touch(4, TouchPhase::Moved, 212.0, 200.0),
+            t4 + Duration::from_millis(40),
+            bounds,
+        );
+        assert!(
+            t.translate_menu(
+                raw_touch(4, TouchPhase::Ended, 212.0, 200.0),
+                t4 + Duration::from_millis(80),
+                bounds,
+            )
+            .is_empty()
         );
     }
 }

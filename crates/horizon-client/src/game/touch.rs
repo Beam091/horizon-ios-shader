@@ -91,7 +91,7 @@ impl Game<'_> {
     /// Whether the on-screen touch buttons should be drawn: hidden automatically
     /// when a hardware keyboard/mouse (`GCKeyboard`/`GCMouse`) or game controller is in use.
     pub(super) fn touch_controls_visible(&self) -> bool {
-        TOUCH_CONTROLS && !self.pad.ios_hw_active && !self.pad.in_use
+        TOUCH_CONTROLS && !self.pad.ios_hw_active && !self.pad.hw_pad_active
     }
 
     /// Whether the top-left menu Shift button is currently active (toggled or held).
@@ -229,6 +229,7 @@ impl Game<'_> {
             && !self.pad.ios_hw_mouse_buttons.iter().any(|&b| b)
         {
             self.pad.ios_hw_active = false;
+            self.pad.hw_pad_active = false;
         }
         // The iOS Microsoft sign-in overlay and the mods screen.
         if self.account_touch(&touch) || self.mods_touch(&touch) {
@@ -781,7 +782,7 @@ impl Game<'_> {
             || hw.mouse_buttons.iter().any(|&b| b)
             || hw.mouse_delta != (0.0, 0.0)
             || hw.mouse_scroll != (0.0, 0.0);
-        if (hw.keyboard_connected && hw.mouse_connected) || any_activity {
+        if any_activity {
             self.pad.ios_hw_active = true;
         } else if !hw.keyboard_connected && !hw.mouse_connected {
             self.pad.ios_hw_active = false;

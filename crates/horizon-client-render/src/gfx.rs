@@ -7224,7 +7224,8 @@ impl Renderer {
         // since the last one: Metal commits every command buffer wgpu-core
         // makes (one per run of copies and two per pass) on its own.
         let section_copies = self.section_copies.take();
-        let has_section_copies = section_copies.is_some();
+        let mut has_section_copies = section_copies.is_some();
+        let mut pending_cmds: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut encoder = section_copies.unwrap_or_else(|| {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -10447,10 +10448,17 @@ impl Renderer {
                 mfx_active,
             );
             if let Some((picture, pack_depth)) = deferred {
+                self.uploads.finish(&encoder);
+                if has_section_copies {
+                    self.section_copy_bytes = 0;
+                    self.section_uploads.finish(&encoder);
+                    has_section_copies = false;
+                }
                 self.metalfx.finish(
                     &self.device,
                     &self.queue,
                     &mut encoder,
+                    &mut pending_cmds,
                     Some(&picture),
                     &pack_depth,
                     &view_target,
@@ -10520,10 +10528,17 @@ impl Renderer {
             }
         } else if let Some((color, depth)) = &scaled {
             if mfx_active {
+                self.uploads.finish(&encoder);
+                if has_section_copies {
+                    self.section_copy_bytes = 0;
+                    self.section_uploads.finish(&encoder);
+                    has_section_copies = false;
+                }
                 self.metalfx.finish(
                     &self.device,
                     &self.queue,
                     &mut encoder,
+                    &mut pending_cmds,
                     Some(color),
                     depth,
                     &view_target,
@@ -10654,6 +10669,7 @@ impl Renderer {
         // thread), the first frame's startup log, VSync's frame callback, a reconfigure.
         // Frame generation presents its own frames (`frame_gen.present` below).
         let (encoder, surface_frame, after) = if readback.is_none()
+            && pending_cmds.is_empty()
             && fg_frames.is_none()
             && hdr_readback.is_none()
             && checks.is_none()
@@ -10706,7 +10722,14 @@ impl Renderer {
             startup_step(format_args!("submitting the first frame"));
             self.first_frame = FirstFrame::Drawn;
         }
-        let submission = crate::spans::time("submit", || self.queue.submit([commands]));
+        let submission = crate::spans::time("submit", || {
+            if pending_cmds.is_empty() {
+                self.queue.submit([commands])
+            } else {
+                pending_cmds.push(commands);
+                self.queue.submit(pending_cmds)
+            }
+        });
         if let Some(read) = after.or_else(|| self.after_submit()) {
             read();
         }
