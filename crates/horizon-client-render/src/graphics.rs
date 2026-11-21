@@ -565,9 +565,61 @@ impl MetalFxMode {
     }
 }
 
-/// 2x resolution upscaling presets for MetalFX: renders at a vertical tier and upscales 2x
-/// (clamped to the display's native resolution). Devices with native height < 720p cannot select
-/// 720p (nor any tier >= their native display height).
+/// MetalFX upscale multiplier per axis:
+/// - `2x`: supports all render tiers (`360p`, `480p`, `540p`, `720p`)
+/// - `3x`: supports low render tiers (`360p`, `480p` -> up to `1080p` / `1440p`)
+/// - `4x`: Spatial only, `360p` render tier only (`360p -> 1440p`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MetalFxFactor {
+    #[default]
+    X2,
+    X3,
+    X4,
+}
+impl MetalFxFactor {
+    pub const ALL: [MetalFxFactor; 3] = [MetalFxFactor::X2, MetalFxFactor::X3, MetalFxFactor::X4];
+    pub fn name(self) -> &'static str {
+        match self {
+            MetalFxFactor::X2 => "2x",
+            MetalFxFactor::X3 => "3x",
+            MetalFxFactor::X4 => "4x",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        self.name()
+    }
+    pub fn multiplier(self) -> u32 {
+        match self {
+            MetalFxFactor::X2 => 2,
+            MetalFxFactor::X3 => 3,
+            MetalFxFactor::X4 => 4,
+        }
+    }
+    /// Spatial supports 2x, 3x, and 4x; Temporal is capped at Apple Silicon's 3x max.
+    pub fn allowed_for_mode(self, mode: MetalFxMode) -> bool {
+        match mode {
+            MetalFxMode::Spatial => true,
+            MetalFxMode::Temporal | MetalFxMode::Off => self != MetalFxFactor::X4,
+        }
+    }
+    pub fn clamped_for_mode(self, mode: MetalFxMode) -> Self {
+        if self.allowed_for_mode(mode) {
+            self
+        } else {
+            MetalFxFactor::X3
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|f| f.name() == s)
+            .unwrap_or_default()
+    }
+}
+
+/// Resolution upscaling tiers for MetalFX: renders at a vertical tier and upscales by the chosen
+/// `MetalFxFactor` (clamped to the display's native resolution). Devices with native height < 720p
+/// cannot select 720p (nor any tier >= their native display height).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MetalFxPreset {
     P360,
@@ -602,14 +654,17 @@ impl MetalFxPreset {
     pub fn target_height(self) -> u32 {
         self.render_height() * 2
     }
-    /// Target vertical resolution for `mode`: Spatial upscales as high as the display allows
-    /// (up to native resolution / 4x max); Temporal stays at its optimal 2x tier.
-    pub fn target_height_for_mode(self, mode: MetalFxMode, native_height: u32) -> u32 {
-        let render_h = self.render_height();
-        let max_h = match mode {
-            MetalFxMode::Spatial => render_h * 4,
-            MetalFxMode::Temporal | MetalFxMode::Off => render_h * 2,
-        };
+    /// Target vertical resolution for `mode` and `factor` (clamped to `native_height`).
+    pub fn target_height_for_factor(
+        self,
+        mode: MetalFxMode,
+        factor: MetalFxFactor,
+        native_height: u32,
+    ) -> u32 {
+        let f = factor.clamped_for_mode(mode);
+        let p = self.clamped_for_factor(f, native_height);
+        let render_h = p.render_height();
+        let max_h = render_h * f.multiplier();
         if native_height > 0 {
             max_h.min(native_height).max(render_h.min(native_height))
         } else {
@@ -628,59 +683,78 @@ impl MetalFxPreset {
         // Always allow P360 as the lowest fallback even on tiny test viewports.
         self == MetalFxPreset::P360 || self.render_height() < native_height
     }
+    /// Whether this preset is valid under `factor` on `native_height`:
+    /// - `2x`: all display-allowed tiers (`360p`, `480p`, `540p`, `720p`)
+    /// - `3x`: `360p` and `480p` only
+    /// - `4x`: `360p` only
+    pub fn allowed_for_factor(self, factor: MetalFxFactor, native_height: u32) -> bool {
+        if !self.allowed_for(native_height) {
+            return false;
+        }
+        match factor {
+            MetalFxFactor::X2 => true,
+            MetalFxFactor::X3 => matches!(self, MetalFxPreset::P360 | MetalFxPreset::P480),
+            MetalFxFactor::X4 => self == MetalFxPreset::P360,
+        }
+    }
     /// Clamps `self` down to the highest preset allowed for `native_height`.
     pub fn clamped_for(self, native_height: u32) -> Self {
-        if self.allowed_for(native_height) {
+        self.clamped_for_factor(MetalFxFactor::X2, native_height)
+    }
+    /// Clamps `self` down to the highest preset allowed for `factor` and `native_height`.
+    pub fn clamped_for_factor(self, factor: MetalFxFactor, native_height: u32) -> Self {
+        if self.allowed_for_factor(factor, native_height) {
             return self;
         }
         Self::ALL
             .into_iter()
             .rev()
-            .find(|p| p.allowed_for(native_height) && p.render_height() <= self.render_height())
+            .find(|p| {
+                p.allowed_for_factor(factor, native_height)
+                    && p.render_height() <= self.render_height()
+            })
             .unwrap_or(MetalFxPreset::P360)
     }
     pub fn label_for(self, native_height: u32) -> String {
-        self.label_for_mode(MetalFxMode::Temporal, native_height)
+        self.label_for_factor(MetalFxMode::Temporal, MetalFxFactor::X2, native_height)
     }
-    pub fn label_for_mode(self, mode: MetalFxMode, native_height: u32) -> String {
-        let p = self.clamped_for(native_height);
+    pub fn label_for_factor(
+        self,
+        mode: MetalFxMode,
+        factor: MetalFxFactor,
+        native_height: u32,
+    ) -> String {
+        let f = factor.clamped_for_mode(mode);
+        let p = self.clamped_for_factor(f, native_height);
         let render_h = p.render_height();
-        let out_h = p.target_height_for_mode(mode, native_height);
-        if mode == MetalFxMode::Spatial {
-            if native_height > 0 && out_h >= native_height {
-                format!("{render_h}p -> {out_h}p (Max)")
-            } else {
-                let ratio = out_h as f32 / render_h.max(1) as f32;
-                if (ratio - ratio.round()).abs() < 0.05 {
-                    format!("{render_h}p -> {out_h}p ({}x)", ratio.round() as u32)
-                } else {
-                    format!("{render_h}p -> {out_h}p ({ratio:.1}x)")
-                }
-            }
+        let raw_target = render_h * f.multiplier();
+        let out_h = if native_height > 0 {
+            raw_target.min(native_height).max(render_h.min(native_height))
         } else {
-            match p {
-                MetalFxPreset::P720 if native_height > 0 && native_height < 1440 => {
-                    format!("720p -> {}p (Max)", out_h)
-                }
-                _ => format!("{}p -> {}p (2x)", render_h, out_h),
-            }
+            raw_target
+        };
+        if native_height > 0 && raw_target > native_height {
+            format!("{render_h}p -> {out_h}p (Max)")
+        } else {
+            format!("{render_h}p -> {out_h}p ({}x)", f.multiplier())
         }
     }
     /// Computes `(render_size, upscale_output_size)` preserving the window's aspect ratio (2x).
     pub fn sizes_for_window(self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
-        self.sizes_for_window_with_mode(MetalFxMode::Temporal, window)
+        self.sizes_for_window_with_factor(MetalFxMode::Temporal, MetalFxFactor::X2, window)
     }
-    /// Computes `(render_size, upscale_output_size)` for `mode`: Spatial scales up to native
-    /// display resolution (max 4x); Temporal scales 2x (clamped to native).
-    pub fn sizes_for_window_with_mode(
+    /// Computes `(render_size, upscale_output_size)` for `mode` and `factor`.
+    pub fn sizes_for_window_with_factor(
         self,
         mode: MetalFxMode,
+        factor: MetalFxFactor,
         window: [u32; 2],
     ) -> ([u32; 2], [u32; 2]) {
         let [win_w, win_h] = [window[0].max(2), window[1].max(2)];
-        let p = self.clamped_for(win_h);
+        let f = factor.clamped_for_mode(mode);
+        let p = self.clamped_for_factor(f, win_h);
         let render_h = p.render_height().min(win_h).max(2);
-        let output_h = p.target_height_for_mode(mode, win_h).min(win_h).max(render_h);
+        let output_h = (render_h * f.multiplier()).min(win_h).max(render_h);
         let scale_w = |h: u32| -> u32 {
             if h == win_h {
                 return win_w;
@@ -1005,8 +1079,10 @@ pub struct Graphics {
     pub upscaling: Upscaling,
     /// Apple MetalFX upscaling mode (Temporal / Spatial / Off).
     pub metalfx_mode: MetalFxMode,
-    /// 2x resolution upscaling tier (360p->720p, 480p->960p, 540p->1080p, 720p->1440p/Max).
+    /// Render resolution tier for MetalFX (`360p`, `480p`, `540p`, `720p`).
     pub metalfx_preset: MetalFxPreset,
+    /// Upscale multiplier (`2x`, `3x`, `4x` for Spatial; `2x`, `3x` for Temporal).
+    pub metalfx_factor: MetalFxFactor,
     /// Downcast 32-bit float shader pack buffers (`RGBA32F`) to 16-bit (`RGBA16F`) on mobile GPUs.
     pub shader_half_buffers: bool,
     /// Shader pack shadow map update cadence (`EveryFrame`, `Hz20`, `Hz10`, `Hz5`).
@@ -1115,6 +1191,7 @@ impl Default for Graphics {
             upscaling: Upscaling::Native,
             metalfx_mode: MetalFxMode::Off,
             metalfx_preset: MetalFxPreset::P540,
+            metalfx_factor: MetalFxFactor::X2,
             shader_half_buffers: false,
             shadow_update_rate: if cfg!(target_os = "ios") {
                 ShadowUpdateRate::Hz20
@@ -1271,6 +1348,7 @@ impl Graphics {
                 "upscaling" => g.upscaling = Upscaling::parse(value),
                 "metalfxMode" => g.metalfx_mode = MetalFxMode::parse(value),
                 "metalfxPreset" => g.metalfx_preset = MetalFxPreset::parse(value),
+                "metalfxFactor" => g.metalfx_factor = MetalFxFactor::parse(value),
                 "shaderHalfBuffers" => g.shader_half_buffers = flag(g.shader_half_buffers),
                 "shadowUpdateRate" => g.shadow_update_rate = ShadowUpdateRate::parse(value),
                 "screenshotQuality" => {
@@ -1383,9 +1461,10 @@ impl Graphics {
             bool_text(self.gpu_culling),
         );
         text += &format!(
-            "metalfxMode:{}\nmetalfxPreset:{}\nshaderHalfBuffers:{}\nshadowUpdateRate:{}\noverlayCorner:{}\noverlayScale:{}\n",
+            "metalfxMode:{}\nmetalfxPreset:{}\nmetalfxFactor:{}\nshaderHalfBuffers:{}\nshadowUpdateRate:{}\noverlayCorner:{}\noverlayScale:{}\n",
             self.metalfx_mode.name(),
             self.metalfx_preset.name(),
+            self.metalfx_factor.name(),
             bool_text(self.shader_half_buffers),
             self.shadow_update_rate.name(),
             self.overlay_corner.name(),
@@ -1560,6 +1639,7 @@ mod tests {
             upscaling: Upscaling::Balanced,
             metalfx_mode: MetalFxMode::Temporal,
             metalfx_preset: MetalFxPreset::P480,
+            metalfx_factor: MetalFxFactor::X3,
             shader_half_buffers: true,
             shadow_update_rate: ShadowUpdateRate::Hz10,
             screenshot_quality: 4,
@@ -1892,18 +1972,56 @@ mod tests {
             ([780, 360], [1560, 720])
         );
 
-        // iPad Pro (2732x2048): Temporal 720p->1440p exact 2x; Spatial upscales to full native 2048p!
+        // iPad Pro (2732x2048): Temporal 720p->1440p exact 2x; Spatial upscales per chosen factor.
         assert_eq!(
             MetalFxPreset::P720.sizes_for_window([2732, 2048]),
             ([960, 720], [1920, 1440])
         );
+        // 3x only allows 360p and 480p (540p/720p clamp down to 480p -> 1440p).
         assert_eq!(
-            MetalFxPreset::P720.sizes_for_window_with_mode(MetalFxMode::Spatial, [2732, 2048]),
-            ([960, 720], [2732, 2048])
+            MetalFxPreset::P720.clamped_for_factor(MetalFxFactor::X3, 2048),
+            MetalFxPreset::P480
         );
         assert_eq!(
-            MetalFxPreset::P540.sizes_for_window_with_mode(MetalFxMode::Spatial, [2360, 1640]),
-            ([776, 540], [2360, 1640])
+            MetalFxPreset::P540.clamped_for_factor(MetalFxFactor::X3, 2048),
+            MetalFxPreset::P480
+        );
+        assert_eq!(
+            MetalFxPreset::P480.sizes_for_window_with_factor(
+                MetalFxMode::Spatial,
+                MetalFxFactor::X3,
+                [2360, 1640],
+            ),
+            ([690, 480], [2072, 1440])
+        );
+        assert_eq!(
+            MetalFxPreset::P360.sizes_for_window_with_factor(
+                MetalFxMode::Spatial,
+                MetalFxFactor::X3,
+                [2360, 1640],
+            ),
+            ([518, 360], [1554, 1080])
+        );
+        // 4x only allows 360p (360p -> 1440p on iPad) and clamps to 3x on Temporal.
+        assert_eq!(
+            MetalFxPreset::P720.clamped_for_factor(MetalFxFactor::X4, 2048),
+            MetalFxPreset::P360
+        );
+        assert_eq!(
+            MetalFxPreset::P480.clamped_for_factor(MetalFxFactor::X4, 2048),
+            MetalFxPreset::P360
+        );
+        assert_eq!(
+            MetalFxPreset::P720.sizes_for_window_with_factor(
+                MetalFxMode::Spatial,
+                MetalFxFactor::X4,
+                [2360, 1640],
+            ),
+            ([518, 360], [2072, 1440])
+        );
+        assert_eq!(
+            MetalFxFactor::X4.clamped_for_mode(MetalFxMode::Temporal),
+            MetalFxFactor::X3
         );
 
         // 720p screen (1280x720): 720p render is >= native height, so it clamps to 540p.

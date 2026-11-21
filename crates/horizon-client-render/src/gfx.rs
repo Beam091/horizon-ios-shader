@@ -6373,14 +6373,16 @@ impl Renderer {
         self.world_post.taa = taa;
         self.world_post.upscale = if taa { upscale.clamp(1.0, 4.0) } else { 1.0 };
     }
-    /// Apple MetalFX 2x hardware upscaling (Temporal / Spatial) and target tier.
+    /// Apple MetalFX hardware upscaling (Temporal / Spatial), scale factor (2x/3x/4x), and tier.
     pub fn set_metalfx(
         &mut self,
         mode: crate::graphics::MetalFxMode,
         preset: crate::graphics::MetalFxPreset,
+        factor: crate::graphics::MetalFxFactor,
     ) {
         self.metalfx.mode = mode;
         self.metalfx.preset = preset;
+        self.metalfx.factor = factor;
     }
     /// Downcast 32-bit float shader pack buffers (`RGBA32F`) to 16-bit (`RGBA16F`).
     /// Reloads the active shader pack immediately when toggled.

@@ -6,9 +6,9 @@
 //! looks comes from `graphics_style`.
 use crate::{
     graphics::{
-        EntityCullingMode, FarDetail, FrameGeneration, GraphicsApi, LeafCullingMode, MetalFxMode,
-        MetalFxPreset, Overlay, OverlayCorner, Pacing, ParticleCullingMode, PresentMode, Preset,
-        ShadowUpdateRate, Upscaling,
+        EntityCullingMode, FarDetail, FrameGeneration, GraphicsApi, LeafCullingMode, MetalFxFactor,
+        MetalFxMode, MetalFxPreset, Overlay, OverlayCorner, Pacing, ParticleCullingMode,
+        PresentMode, Preset, ShadowUpdateRate, Upscaling,
     },
     graphics_style::{self as style, Cost},
     hud::{HudAtlas, HudBatch},
@@ -102,6 +102,7 @@ pub enum H {
     Upscaling,
     MetalFxSpatial,
     MetalFxTemporal,
+    MetalFxFactor,
     MetalFxPreset,
     ShaderHalfBuffers,
     ShadowUpdateRate,
@@ -389,6 +390,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::MetalFxTemporal,
                             Saves,
                             "Multi-frame MetalFX 2x upscaling with anti-aliasing (turns off Spatial).",
+                        ),
+                        h(
+                            H::MetalFxFactor,
+                            High,
+                            "Upscale multiplier: 2x (all), 3x (360p-480p), 4x Spatial (360p).",
                         ),
                         h(
                             H::MetalFxPreset,
@@ -940,10 +946,17 @@ impl H {
                 "MetalFX Temporal Upscaling",
                 on_off(g.metalfx_mode == MetalFxMode::Temporal),
             ),
+            H::MetalFxFactor => labelled(
+                "MetalFX Factor",
+                g.metalfx_factor.clamped_for_mode(g.metalfx_mode).label(),
+            ),
             H::MetalFxPreset => labelled(
                 "MetalFX Scale",
-                g.metalfx_preset
-                    .label_for_mode(g.metalfx_mode, crate::graphics::display_height()),
+                g.metalfx_preset.label_for_factor(
+                    g.metalfx_mode,
+                    g.metalfx_factor,
+                    crate::graphics::display_height(),
+                ),
             ),
             H::ShaderHalfBuffers => labelled("16-bit Shader Buffers", on_off(g.shader_half_buffers)),
             H::ShadowUpdateRate => labelled("Shadow Update Rate", g.shadow_update_rate.label()),
@@ -1105,7 +1118,10 @@ impl H {
                     MetalFxMode::Spatial
                 };
                 let native_h = crate::graphics::display_height();
-                g.metalfx_preset = g.metalfx_preset.clamped_for(native_h);
+                g.metalfx_factor = g.metalfx_factor.clamped_for_mode(g.metalfx_mode);
+                g.metalfx_preset = g
+                    .metalfx_preset
+                    .clamped_for_factor(g.metalfx_factor, native_h);
             }
             H::MetalFxTemporal => {
                 g.metalfx_mode = if g.metalfx_mode == MetalFxMode::Temporal {
@@ -1114,16 +1130,34 @@ impl H {
                     MetalFxMode::Temporal
                 };
                 let native_h = crate::graphics::display_height();
-                g.metalfx_preset = g.metalfx_preset.clamped_for(native_h);
+                g.metalfx_factor = g.metalfx_factor.clamped_for_mode(g.metalfx_mode);
+                g.metalfx_preset = g
+                    .metalfx_preset
+                    .clamped_for_factor(g.metalfx_factor, native_h);
+            }
+            H::MetalFxFactor => {
+                let allowed: Vec<MetalFxFactor> = MetalFxFactor::ALL
+                    .into_iter()
+                    .filter(|f| f.allowed_for_mode(g.metalfx_mode))
+                    .collect();
+                if !allowed.is_empty() {
+                    let cur = g.metalfx_factor.clamped_for_mode(g.metalfx_mode);
+                    g.metalfx_factor = step(&allowed, cur, back);
+                }
+                let native_h = crate::graphics::display_height();
+                g.metalfx_preset = g
+                    .metalfx_preset
+                    .clamped_for_factor(g.metalfx_factor, native_h);
             }
             H::MetalFxPreset => {
                 let native_h = crate::graphics::display_height();
+                let factor = g.metalfx_factor.clamped_for_mode(g.metalfx_mode);
                 let allowed: Vec<MetalFxPreset> = MetalFxPreset::ALL
                     .into_iter()
-                    .filter(|p| p.allowed_for(native_h))
+                    .filter(|p| p.allowed_for_factor(factor, native_h))
                     .collect();
                 if !allowed.is_empty() {
-                    let cur = g.metalfx_preset.clamped_for(native_h);
+                    let cur = g.metalfx_preset.clamped_for_factor(factor, native_h);
                     g.metalfx_preset = step(&allowed, cur, back);
                 }
             }
@@ -1236,6 +1270,15 @@ impl Item {
             }
             Item::Horizon(H::Antialiasing) if s.horizon.metalfx_mode != MetalFxMode::Off => {
                 Some("Controlled by MetalFX Upscaling.")
+            }
+            Item::Horizon(H::MetalFxPreset)
+                if s.horizon.metalfx_mode != MetalFxMode::Off
+                    && s.horizon
+                        .metalfx_factor
+                        .clamped_for_mode(s.horizon.metalfx_mode)
+                        == MetalFxFactor::X4 =>
+            {
+                Some("4x uses 360p only.")
             }
             Item::Horizon(H::GpuCulling) => crate::graphics::gpu_culling_offer().reason(),
             // VideoSettingsScreen.tick: Max Anisotropy only works with Anisotropic filtering.
@@ -1368,6 +1411,7 @@ impl Item {
                         | H::ShaderHalfBuffers
                         | H::MetalFxSpatial
                         | H::MetalFxTemporal
+                        | H::MetalFxFactor
                         | H::MetalFxPreset
                         | H::GraphicsApi
                         | H::TranslucentBatching
@@ -1448,7 +1492,7 @@ fn shown(item: Item, s: &Settings) -> bool {
     if cfg!(target_os = "ios") && item == Item::Horizon(H::FrameGeneration) {
         return false;
     }
-    if item == Item::Horizon(H::MetalFxPreset) {
+    if matches!(item, Item::Horizon(H::MetalFxFactor | H::MetalFxPreset)) {
         return s.horizon.metalfx_mode != MetalFxMode::Off;
     }
     if matches!(item, Item::Horizon(H::OverlayCorner | H::OverlayScale)) {
@@ -2315,6 +2359,7 @@ mod tests {
                             i,
                             Item::Horizon(
                                 H::Upscaling
+                                    | H::MetalFxFactor
                                     | H::MetalFxPreset
                                     | H::OverlayCorner
                                     | H::OverlayScale

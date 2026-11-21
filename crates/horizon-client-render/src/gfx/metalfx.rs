@@ -6,7 +6,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{DMat4, DVec3, Mat4, Vec2};
 
-use crate::graphics::{MetalFxMode, MetalFxPreset};
+use crate::graphics::{MetalFxFactor, MetalFxMode, MetalFxPreset};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -51,6 +51,7 @@ struct Targets {
 pub struct MetalFx {
     pub mode: MetalFxMode,
     pub preset: MetalFxPreset,
+    pub factor: MetalFxFactor,
     format: wgpu::TextureFormat,
     motion_pipeline: wgpu::RenderPipeline,
     motion_layout: wgpu::BindGroupLayout,
@@ -220,6 +221,7 @@ impl MetalFx {
         Self {
             mode: MetalFxMode::Off,
             preset: MetalFxPreset::P540,
+            factor: MetalFxFactor::X2,
             format: screen_format,
             motion_pipeline,
             motion_layout,
@@ -244,9 +246,10 @@ impl MetalFx {
         self.mode != MetalFxMode::Off
     }
 
-    /// Computes `(render_size, output_size)` for the active preset and mode on `window`.
+    /// Computes `(render_size, output_size)` for the active preset, mode, and factor on `window`.
     pub fn sizes(&self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
-        self.preset.sizes_for_window_with_mode(self.mode, window)
+        self.preset
+            .sizes_for_window_with_factor(self.mode, self.factor, window)
     }
 
     /// Sub-pixel jitter matrix (Halton 2, 3) for `MetalFxMode::Temporal` and camera reprojection.

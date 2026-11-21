@@ -529,7 +529,11 @@ impl Game<'_> {
                 s.horizon.taa,
                 s.horizon.upscaling.ratio(),
             );
-            r.set_metalfx(s.horizon.metalfx_mode, s.horizon.metalfx_preset);
+            r.set_metalfx(
+                s.horizon.metalfx_mode,
+                s.horizon.metalfx_preset,
+                s.horizon.metalfx_factor,
+            );
             r.set_shader_half_buffers(s.horizon.shader_half_buffers);
             r.set_frame_generation(
                 s.horizon.frame_generation != horizon_client::graphics::FrameGeneration::Off,
