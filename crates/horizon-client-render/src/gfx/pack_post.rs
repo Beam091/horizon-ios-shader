@@ -4592,7 +4592,11 @@ impl PackPost {
         pages: &[(u32, wgpu::Buffer)],
         terrain: &mut TerrainDraw<'_>,
         defer_upscale: bool,
-    ) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
+    ) -> Option<(
+        wgpu::TextureView,
+        wgpu::TextureView,
+        Option<wgpu::TextureView>,
+    )> {
         self.resize(device, size);
         if let Some((layout, ids, rects)) = &self.block_ids {
             // A page that grew has a new buffer.
@@ -5039,7 +5043,8 @@ impl PackPost {
             rp.draw(0..3, 0..1);
         } else if let Some(picture) = self.final_target.as_ref().map(|t| &t.view) {
             if defer_upscale {
-                return Some((picture.clone(), targets.depth.clone()));
+                let opaque = targets.depth1.as_ref().map(|(_, v)| v.clone());
+                return Some((picture.clone(), targets.depth.clone(), opaque));
             }
             // The picture at the world's size onto the window: one upscale, smoothly.
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {

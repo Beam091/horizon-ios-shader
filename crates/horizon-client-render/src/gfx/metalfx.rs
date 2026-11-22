@@ -12,9 +12,10 @@ use crate::graphics::{MetalFxFactor, MetalFxMode, MetalFxPreset};
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MotionUniform {
     reproject: [[f32; 4]; 4],
+    reproject_sky: [[f32; 4]; 4],
     size: [f32; 2],
-    flip_y_and_gl_depth: f32,
-    _pad: f32,
+    jitter_px: [f32; 2],
+    flags: [f32; 4],
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -35,9 +36,12 @@ struct Targets {
     /// `input_size` Rg16Float motion vectors (for `MTLFXTemporalScaler`).
     motion: wgpu::Texture,
     motion_view: wgpu::TextureView,
-    /// `input_size` R32Float screen-aligned depth (for `MTLFXTemporalScaler`).
+    /// `input_size` R32Float screen-aligned reverse-Z depth (for `MTLFXTemporalScaler`).
     depth_r32: wgpu::Texture,
     depth_r32_view: wgpu::TextureView,
+    /// `input_size` R8Unorm reactive mask (iOS 17.4+ / macOS 14.4+ `MTLFXTemporalScaler`).
+    reactive: wgpu::Texture,
+    reactive_view: wgpu::TextureView,
     /// `output_size` Rgba16Float/Rgba8Unorm upscaled picture (`STORAGE_BINDING` required by MetalFX).
     output: wgpu::Texture,
     output_view: wgpu::TextureView,
@@ -64,11 +68,11 @@ pub struct MetalFx {
     linear: wgpu::Sampler,
     targets: Option<Targets>,
     frame_index: u32,
-    previous_camera: Option<(DMat4, DVec3)>,
+    previous_camera: Option<(DMat4, DVec3, bool)>,
     jitter_px: [f32; 2],
     reproject: Mat4,
+    reproject_sky: Mat4,
     reset_history: bool,
-    logged_backend: bool,
 }
 
 impl MetalFx {
@@ -100,6 +104,16 @@ impl MetalFx {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let motion_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -128,6 +142,11 @@ impl MetalFx {
                     }),
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::R32Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R8Unorm,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -237,8 +256,8 @@ impl MetalFx {
             previous_camera: None,
             jitter_px: [0.0; 2],
             reproject: Mat4::IDENTITY,
+            reproject_sky: Mat4::IDENTITY,
             reset_history: true,
-            logged_backend: false,
         }
     }
 
@@ -266,27 +285,41 @@ impl MetalFx {
         if !world_active || self.mode == MetalFxMode::Off {
             self.previous_camera = None;
             self.jitter_px = [0.0; 2];
+            self.reproject = Mat4::IDENTITY;
+            self.reproject_sky = Mat4::IDENTITY;
             self.reset_history = true;
             return Mat4::IDENTITY;
         }
+        let has_pack = !apply_jitter;
         let current = view_proj.as_dmat4();
-        let (reproject, reset) = match self.previous_camera {
-            Some((prev_vp, prev_cam)) => {
+        let (reproject, reproject_sky, reset) = match self.previous_camera {
+            Some((prev_vp, prev_cam, prev_pack)) => {
                 let delta = camera - prev_cam;
                 let moved = delta.length_squared() > 100.0;
-                if moved {
-                    (DMat4::IDENTITY, true)
+                if moved || prev_pack != has_pack {
+                    (DMat4::IDENTITY, DMat4::IDENTITY, true)
                 } else {
-                    (
-                        prev_vp * DMat4::from_translation(delta) * current.inverse(),
-                        false,
-                    )
+                    let current_inv = current.inverse();
+                    let reproj_sky = prev_vp * current_inv;
+                    // Detect abrupt camera cuts (e.g., F5 perspective flip) where screen center
+                    // jumps far off-axis in a single frame.
+                    let center_prev = reproj_sky * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
+                    let cut = center_prev.w <= 1e-4
+                        || (center_prev.x / center_prev.w).abs() > 1.5
+                        || (center_prev.y / center_prev.w).abs() > 1.5;
+                    if cut {
+                        (DMat4::IDENTITY, DMat4::IDENTITY, true)
+                    } else {
+                        let reproj = prev_vp * DMat4::from_translation(delta) * current_inv;
+                        (reproj, reproj_sky, false)
+                    }
                 }
             }
-            None => (DMat4::IDENTITY, true),
+            None => (DMat4::IDENTITY, DMat4::IDENTITY, true),
         };
-        self.previous_camera = Some((current, camera));
+        self.previous_camera = Some((current, camera, has_pack));
         self.reproject = reproject.as_mat4();
+        self.reproject_sky = reproject_sky.as_mat4();
         self.reset_history = reset;
 
         if self.mode != MetalFxMode::Temporal || !apply_jitter {
@@ -379,6 +412,13 @@ impl MetalFx {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let depth_r32_view = depth_r32.create_view(&Default::default());
+        let reactive = tex(
+            "MetalFX reactive",
+            input_size,
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let reactive_view = reactive.create_view(&Default::default());
         let output = tex(
             "MetalFX output",
             output_size,
@@ -414,6 +454,7 @@ impl MetalFx {
                         let c_tex = input_color.as_hal::<wgpu::hal::api::Metal>()?;
                         let d_tex = depth_r32.as_hal::<wgpu::hal::api::Metal>()?;
                         let m_tex = motion.as_hal::<wgpu::hal::api::Metal>()?;
+                        let r_tex = reactive.as_hal::<wgpu::hal::api::Metal>();
                         let o_tex = output.as_hal::<wgpu::hal::api::Metal>()?;
                         match self.mode {
                             MetalFxMode::Temporal => {
@@ -424,6 +465,7 @@ impl MetalFx {
                                     c_tex.raw_handle(),
                                     d_tex.raw_handle(),
                                     m_tex.raw_handle(),
+                                    r_tex.as_ref().map(|t| t.raw_handle()),
                                     o_tex.raw_handle(),
                                     linear,
                                 )
@@ -444,26 +486,24 @@ impl MetalFx {
                         }
                     })
             };
-            if !self.logged_backend {
-                self.logged_backend = true;
-                if built.is_some() {
-                    log::info!(
-                        "Horizon: MetalFX {:?} active ({}x{} -> {}x{})",
-                        self.mode,
-                        input_size[0],
-                        input_size[1],
-                        output_size[0],
-                        output_size[1],
-                    );
-                } else {
-                    log::info!(
-                        "Horizon: MetalFX hardware unavailable on this device; using WGSL CAS 2x upscale ({}x{} -> {}x{})",
-                        input_size[0],
-                        input_size[1],
-                        output_size[0],
-                        output_size[1],
-                    );
-                }
+            if built.is_some() {
+                log::info!(
+                    "Horizon: MetalFX {:?} active ({}x{} -> {}x{})",
+                    self.mode,
+                    input_size[0],
+                    input_size[1],
+                    output_size[0],
+                    output_size[1],
+                );
+            } else {
+                log::warn!(
+                    "Horizon: MetalFX {:?} unavailable for {}x{} -> {}x{}; falling back to WGSL CAS",
+                    self.mode,
+                    input_size[0],
+                    input_size[1],
+                    output_size[0],
+                    output_size[1],
+                );
             }
             built
         };
@@ -479,6 +519,8 @@ impl MetalFx {
             motion_view,
             depth_r32,
             depth_r32_view,
+            reactive,
+            reactive_view,
             output,
             output_view,
             output_blit_group,
@@ -490,6 +532,7 @@ impl MetalFx {
 
     /// Runs MetalFX (Temporal or Spatial, or WGSL CAS fallback) from `src_color` (or internal
     /// `input_color` when `src_color` is `None`) and `depth_view` onto `screen`.
+    /// `opaque_depth`: optional Shader Pack `depthtex1` (pre-translucent depth) for water detection.
     /// `gl_depth_flipped`: `true` for Shader Pack `depthtex0` (GL bottom-up forward-Z),
     /// `false` for Vanilla `world_depth` (top-down reverse-Z).
     #[allow(clippy::too_many_arguments, unused_variables)]
@@ -501,6 +544,7 @@ impl MetalFx {
         pending_cmds: &mut Vec<wgpu::CommandBuffer>,
         src_color: Option<&wgpu::TextureView>,
         depth_view: &wgpu::TextureView,
+        opaque_depth: Option<&wgpu::TextureView>,
         screen: &wgpu::TextureView,
         window: [u32; 2],
         gl_depth_flipped: bool,
@@ -549,7 +593,7 @@ impl MetalFx {
             rp.draw(0..3, 0..1);
         }
 
-        // Run motion vector + screen-aligned depth pass for Temporal mode.
+        // Run motion vector + reverse-Z depth + reactive mask pass for Temporal mode.
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         let mut used_native = false;
         #[cfg(not(any(target_os = "ios", target_os = "macos")))]
@@ -558,11 +602,18 @@ impl MetalFx {
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         if let Some(scaler) = &targets.scaler {
             if matches!(scaler, NativeScaler::Temporal(_)) {
+                let has_opaque = opaque_depth.is_some();
                 let u = MotionUniform {
                     reproject: self.reproject.to_cols_array_2d(),
+                    reproject_sky: self.reproject_sky.to_cols_array_2d(),
                     size: [input_size[0] as f32, input_size[1] as f32],
-                    flip_y_and_gl_depth: if gl_depth_flipped { 1.0 } else { 0.0 },
-                    _pad: 0.0,
+                    jitter_px: self.jitter_px,
+                    flags: [
+                        if gl_depth_flipped { 1.0 } else { 0.0 },
+                        if has_opaque { 1.0 } else { 0.0 },
+                        0.0,
+                        0.0,
+                    ],
                 };
                 queue.write_buffer(&self.motion_uniform, 0, bytemuck::bytes_of(&u));
                 let motion_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -576,6 +627,12 @@ impl MetalFx {
                         wgpu::BindGroupEntry {
                             binding: 1,
                             resource: self.motion_uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(
+                                opaque_depth.unwrap_or(depth_view),
+                            ),
                         },
                     ],
                 });
@@ -594,6 +651,12 @@ impl MetalFx {
                         }),
                         Some(wgpu::RenderPassColorAttachment {
                             view: &targets.depth_r32_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: clear,
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &targets.reactive_view,
                             depth_slice: None,
                             resolve_target: None,
                             ops: clear,
@@ -650,15 +713,19 @@ impl MetalFx {
                             else {
                                 return;
                             };
+                            let r_tex = targets.reactive.as_hal::<wgpu::hal::api::Metal>();
+                            // `fs_motion` always outputs reverse-Z depth (1 near, 0 far), so
+                            // `depth_reversed` is always `true` for both Vanilla and Shader Packs.
                             ts.encode(
                                 cmd_buf,
                                 input_size,
                                 c_tex.raw_handle(),
                                 d_tex.raw_handle(),
                                 m_tex.raw_handle(),
+                                r_tex.as_ref().map(|t| t.raw_handle()),
                                 o_tex.raw_handle(),
                                 jitter_px,
-                                !gl_depth_flipped,
+                                true,
                                 reset,
                             );
                             used_native = true;
@@ -739,4 +806,96 @@ fn halton(mut index: u32, base: u32) -> f32 {
         index /= base;
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::{DVec4, Vec3};
+
+    #[test]
+    fn motion_vector_points_from_current_to_previous_pixel_in_metalfx_convention() {
+        // Object at (0, 0, -10); camera turns right (yaw increases) so object moves LEFT on screen.
+        // MetalFX expects mv = prev_px - curr_px, which must be POSITIVE in X (pointing right
+        // back to where the object was in the previous frame).
+        let size = Vec2::new(640.0, 360.0);
+        let proj = Mat4::perspective_rh(70f32.to_radians(), size.x / size.y, 512.0, 0.05).as_dmat4();
+        let prev_vp = proj * crate::camera::view_matrix(0.0, 0.0).as_dmat4();
+        let curr_vp = proj * crate::camera::view_matrix(5.0, 0.0).as_dmat4();
+        let cam = DVec3::new(0.0, 64.0, 0.0);
+        // Look direction at yaw=0 is +Z in Minecraft (`view_matrix` rotates by PI - yaw).
+        let block = DVec3::new(0.0, 64.0, 10.0);
+
+        let project_uv = |vp: DMat4| -> (Vec2, f64) {
+            let c = vp * (block - cam).extend(1.0);
+            let ndc = c.truncate() / c.w;
+            (
+                Vec2::new((ndc.x * 0.5 + 0.5) as f32, (0.5 - ndc.y * 0.5) as f32),
+                ndc.z,
+            )
+        };
+        let (prev_uv, _) = project_uv(prev_vp);
+        let (curr_uv, curr_z) = project_uv(curr_vp);
+        let reproj = prev_vp * curr_vp.inverse();
+        let curr_ndc = DVec4::new(
+            f64::from(curr_uv.x) * 2.0 - 1.0,
+            1.0 - f64::from(curr_uv.y) * 2.0,
+            curr_z,
+            1.0,
+        );
+        let p = reproj * curr_ndc;
+        let recovered_prev = Vec2::new(
+            ((p.x / p.w) * 0.5 + 0.5) as f32,
+            (0.5 - (p.y / p.w) * 0.5) as f32,
+        );
+        let mv = (recovered_prev - curr_uv) * size;
+        let expected_mv = (prev_uv - curr_uv) * size;
+        assert!((mv - expected_mv).length() < 1e-3);
+        assert!(
+            mv.x > 10.0,
+            "turning right moves object left, so prev - curr must point right (+X), got {mv:?}"
+        );
+    }
+
+    #[test]
+    fn sky_reprojection_ignores_camera_translation_parallax() {
+        let proj = Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 64.0, 0.05).as_dmat4();
+        let vp = proj * crate::camera::view_matrix(0.0, 0.0).as_dmat4();
+        let reproj_sky = vp * vp.inverse();
+        let p = reproj_sky * DVec4::new(0.2, -0.3, 0.0, 1.0);
+        let ndc = Vec2::new((p.x / p.w) as f32, (p.y / p.w) as f32);
+        assert!((ndc - Vec2::new(0.2, -0.3)).length() < 1e-6);
+    }
+
+    #[test]
+    fn shader_pack_gl_depth_converts_to_horizon_reverse_z_and_isolates_hand_depth() {
+        let (gl_proj, _) = super::super::pack_uniforms::pack_projection(70.0, 16.0 / 9.0, 512.0);
+        let rev_proj = Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 512.0, 0.05);
+        for dist in [0.25f32, 1.0, 10.0, 100.0, 500.0] {
+            let eye = Vec3::new(0.0, 0.0, -dist).extend(1.0);
+            let gl_c = gl_proj * eye;
+            let d_gl = ((gl_c.z + gl_c.w) * 0.5) / gl_c.w;
+            let rev_c = rev_proj * eye;
+            let d_rev = rev_c.z / rev_c.w;
+            assert!(
+                ((1.0 - d_gl) - d_rev).abs() < 1e-5,
+                "dist={dist}: 1-d_gl={} vs d_rev={d_rev}",
+                1.0 - d_gl
+            );
+            assert!(
+                d_gl > 0.565,
+                "world block at dist={dist} must stay above hand depth threshold 0.565, got {d_gl}"
+            );
+        }
+        // First-person hand uses pack_hand::projection (HAND_DEPTH = 0.125), mapping strictly <= 0.5625.
+        let hand_proj = super::super::pack_hand::projection(70.0, 16.0 / 9.0, 512.0);
+        for dist in [0.1f32, 0.5, 2.0, 50.0] {
+            let c = hand_proj * Vec3::new(0.0, 0.0, -dist).extend(1.0);
+            let d_hand = ((c.z + c.w) * 0.5) / c.w;
+            assert!(
+                d_hand <= 0.565,
+                "hand at dist={dist} must fall inside <= 0.565 mask, got {d_hand}"
+            );
+        }
+    }
 }

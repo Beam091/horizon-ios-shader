@@ -130,7 +130,11 @@ pub fn connected() -> Vec<Pad> {
     pads
 }
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use objc2::encode::{Encode, Encoding};
+use objc2::rc::Allocated;
+use objc2::runtime::{AnyClass, Bool, Imp, NSObject, Sel};
+use objc2::{ClassType, define_class, sel};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use winit::keyboard::KeyCode;
 
 /// State of a hardware keyboard (`GCKeyboard`) and mouse/trackpad (`GCMouse`) connected to iOS/iPadOS.
@@ -142,13 +146,25 @@ pub struct HardwareInput {
     pub mouse_buttons: [bool; 3],
     pub mouse_delta: (f32, f32),
     pub mouse_scroll: (f32, f32),
+    /// Native iPadOS pointer position in physical pixels from `UIHoverGestureRecognizer`, when moved.
+    pub hover_pos: Option<(f32, f32)>,
 }
 
 static MOUSE_DX: AtomicU32 = AtomicU32::new(0);
 static MOUSE_DY: AtomicU32 = AtomicU32::new(0);
+static MOUSE_SCROLL_X: AtomicU32 = AtomicU32::new(0);
+static MOUSE_SCROLL_Y: AtomicU32 = AtomicU32::new(0);
 static INSTALLED_MOUSE_INPUT: AtomicUsize = AtomicUsize::new(0);
 
+static HOVER_X: AtomicU32 = AtomicU32::new(0);
+static HOVER_Y: AtomicU32 = AtomicU32::new(0);
+static HOVER_DIRTY: AtomicBool = AtomicBool::new(false);
+static HOVER_INSTALLED_VIEW: AtomicUsize = AtomicUsize::new(0);
+
 fn atomic_add_f32(atom: &AtomicU32, delta: f32) {
+    if !delta.is_finite() || delta == 0.0 {
+        return;
+    }
     let mut cur = atom.load(Ordering::Relaxed);
     loop {
         let next = (f32::from_bits(cur) + delta).to_bits();
@@ -195,6 +211,25 @@ unsafe extern "C" fn on_mouse_moved(
     atomic_add_f32(&MOUSE_DY, -dy);
 }
 
+unsafe extern "C" fn on_mouse_scroll(
+    _block: *const StaticBlock,
+    _dpad: *mut AnyObject,
+    sx: f32,
+    sy: f32,
+) {
+    // Apple iOS/iPadOS GameController quirk (matches SDL3's SDL_uikitevents.m):
+    // `GCMouseInput.scroll.valueChangedHandler` delivers vertical wheel scroll on the first
+    // axis (`sx`, negative = wheel up, positive = wheel down) and horizontal scroll on `sy`.
+    let horizontal = sy;
+    let vertical = -sx;
+    if horizontal != 0.0 {
+        atomic_add_f32(&MOUSE_SCROLL_X, horizontal);
+    }
+    if vertical != 0.0 {
+        atomic_add_f32(&MOUSE_SCROLL_Y, vertical);
+    }
+}
+
 static BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
     reserved: 0,
     size: std::mem::size_of::<StaticBlock>(),
@@ -207,6 +242,96 @@ static MOUSE_MOVED_BLOCK: StaticBlock = StaticBlock {
     invoke: on_mouse_moved,
     descriptor: &BLOCK_DESCRIPTOR,
 };
+
+static MOUSE_SCROLL_BLOCK: StaticBlock = StaticBlock {
+    isa: unsafe { &_NSConcreteGlobalBlock },
+    flags: 1 << 28,
+    reserved: 0,
+    invoke: on_mouse_scroll,
+    descriptor: &BLOCK_DESCRIPTOR,
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+// SAFETY: `CGPoint` layout on 64-bit iOS (`CGFloat` = `f64`).
+unsafe impl Encode for Point {
+    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+
+define_class!(
+    // SAFETY: `NSObject` has no subclassing requirements and `HoverWatch` has no `Drop`.
+    #[unsafe(super(NSObject))]
+    #[name = "HorizonHoverWatch"]
+    struct HoverWatch;
+
+    impl HoverWatch {
+        #[unsafe(method(hoverChanged:))]
+        fn hover_changed(&self, recognizer: &AnyObject) {
+            handle_hover(recognizer);
+        }
+    }
+);
+
+fn handle_hover(recognizer: &AnyObject) {
+    // UIGestureRecognizerState: 1 = Began, 2 = Changed.
+    let state: isize = unsafe { msg_send![recognizer, state] };
+    if state != 1 && state != 2 {
+        return;
+    }
+    let view: Option<Obj> = unsafe { msg_send![recognizer, view] };
+    let Some(view) = view else {
+        return;
+    };
+    let pt: Point = unsafe { msg_send![recognizer, locationInView: &*view] };
+    let scale: f64 = unsafe { msg_send![&*view, contentScaleFactor] };
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    if pt.x.is_finite() && pt.y.is_finite() {
+        HOVER_X.store(((pt.x * scale) as f32).to_bits(), Ordering::Relaxed);
+        HOVER_Y.store(((pt.y * scale) as f32).to_bits(), Ordering::Relaxed);
+        HOVER_DIRTY.store(true, Ordering::Release);
+    }
+}
+
+unsafe fn ensure_hover_recognizer(vc: &AnyObject) {
+    let view: Option<Obj> = unsafe { msg_send![vc, view] };
+    let Some(view) = view else {
+        return;
+    };
+    let view_addr = &*view as *const AnyObject as usize;
+    if HOVER_INSTALLED_VIEW.load(Ordering::Relaxed) == view_addr {
+        return;
+    }
+    let Some(hover_cls) = AnyClass::get(c"UIHoverGestureRecognizer") else {
+        return;
+    };
+    unsafe {
+        let watch: Retained<HoverWatch> = msg_send![HoverWatch::class(), new];
+        let alloc: Allocated<AnyObject> = msg_send![hover_cls, alloc];
+        let rec: Option<Obj> = msg_send![
+            alloc,
+            initWithTarget: &*watch,
+            action: sel!(hoverChanged:)
+        ];
+        let Some(rec) = rec else {
+            return;
+        };
+        // WinitUIView already implements UIGestureRecognizerDelegate returning YES for simultaneous recognition.
+        let _: () = msg_send![&*rec, setDelegate: &*view];
+        let _: () = msg_send![&*view, addGestureRecognizer: &*rec];
+        // Keep the target alive for the app's lifetime (UIGestureRecognizer holds target unretained).
+        std::mem::forget(watch);
+    }
+    HOVER_INSTALLED_VIEW.store(view_addr, Ordering::Relaxed);
+}
 
 /// USB HID Usage IDs (Keyboard/Keypad Page 0x07) used by Apple's `GCKeyCode`.
 const GC_KEY_MAP: &[(isize, KeyCode)] = &[
@@ -289,6 +414,28 @@ const GC_KEY_MAP: &[(isize, KeyCode)] = &[
     (231, KeyCode::SuperRight),
 ];
 
+/// Returns true if any physical button on `GCMouse.current` is pressed right now.
+pub fn is_hardware_mouse_button_down() -> bool {
+    let mouse: Option<Obj> = unsafe { msg_send![class!(GCMouse), current] };
+    let Some(m) = mouse else {
+        return false;
+    };
+    let Some(input) = get!(m, mouseInput) else {
+        return false;
+    };
+    pressed(get!(input, leftButton))
+        || pressed(get!(input, rightButton))
+        || pressed(get!(input, middleButton))
+}
+
+/// Discards accumulated hardware mouse motion and scroll deltas (used when switching between menus and world).
+pub fn flush_hardware_mouse_deltas() {
+    let _ = atomic_take_f32(&MOUSE_DX);
+    let _ = atomic_take_f32(&MOUSE_DY);
+    let _ = atomic_take_f32(&MOUSE_SCROLL_X);
+    let _ = atomic_take_f32(&MOUSE_SCROLL_Y);
+}
+
 /// Polls any connected hardware keyboard (`GCKeyboard.coalescedKeyboard`) and mouse (`GCMouse.current`).
 pub fn poll_hardware_input() -> HardwareInput {
     let mut out = HardwareInput::default();
@@ -311,26 +458,34 @@ pub fn poll_hardware_input() -> HardwareInput {
         out.mouse_connected = true;
         let ptr = &*input as *const AnyObject as usize;
         if INSTALLED_MOUSE_INPUT.swap(ptr, Ordering::Relaxed) != ptr {
-            let block = (&MOUSE_MOVED_BLOCK as *const StaticBlock).cast::<AnyObject>();
-            let _: () = unsafe { msg_send![&*input, setMouseMovedHandler: block] };
+            let move_block = (&MOUSE_MOVED_BLOCK as *const StaticBlock).cast::<AnyObject>();
+            let _: () = unsafe { msg_send![&*input, setMouseMovedHandler: move_block] };
+            if let Some(scroll) = get!(input, scroll) {
+                let scroll_block = (&MOUSE_SCROLL_BLOCK as *const StaticBlock).cast::<AnyObject>();
+                let _: () = unsafe { msg_send![&*scroll, setValueChangedHandler: scroll_block] };
+            }
         }
         out.mouse_buttons = [
             pressed(get!(input, leftButton)),
             pressed(get!(input, rightButton)),
             pressed(get!(input, middleButton)),
         ];
-        let [sx, sy] = stick(get!(input, scroll));
-        out.mouse_scroll = (sx, sy);
     } else {
         INSTALLED_MOUSE_INPUT.store(0, Ordering::Relaxed);
     }
     out.mouse_delta = (atomic_take_f32(&MOUSE_DX), atomic_take_f32(&MOUSE_DY));
+    out.mouse_scroll = (
+        atomic_take_f32(&MOUSE_SCROLL_X),
+        atomic_take_f32(&MOUSE_SCROLL_Y),
+    );
+    if HOVER_DIRTY.swap(false, Ordering::AcqRel) {
+        out.hover_pos = Some((
+            f32::from_bits(HOVER_X.load(Ordering::Relaxed)),
+            f32::from_bits(HOVER_Y.load(Ordering::Relaxed)),
+        ));
+    }
     out
 }
-
-use objc2::runtime::{Bool, Imp, Sel};
-use objc2::sel;
-use std::sync::atomic::AtomicBool;
 
 static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
 static POINTER_LOCK_INSTALLED_CLS: AtomicUsize = AtomicUsize::new(0);
@@ -383,13 +538,15 @@ unsafe fn root_view_controller() -> Option<Obj> {
 }
 
 /// Locks and hides the iPadOS/iOS hardware mouse pointer while in-world (`prefersPointerLocked`),
-/// and unlocks/restores it when a menu or inventory screen is open.
+/// unlocks/restores it when a menu or inventory screen is open, and attaches the native
+/// `UIHoverGestureRecognizer` for exact 1:1 cursor tracking in menus.
 pub fn set_pointer_locked(locked: bool) {
     let prev = POINTER_LOCKED.swap(locked, Ordering::Relaxed);
     unsafe {
         let Some(vc) = root_view_controller() else {
             return;
         };
+        ensure_hover_recognizer(&vc);
         let cls = objc2::ffi::object_getClass((&*vc as *const AnyObject).cast_mut().cast());
         if cls.is_null() {
             return;

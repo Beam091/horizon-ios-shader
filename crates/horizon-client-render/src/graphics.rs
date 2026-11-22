@@ -753,8 +753,9 @@ impl MetalFxPreset {
         let [win_w, win_h] = [window[0].max(2), window[1].max(2)];
         let f = factor.clamped_for_mode(mode);
         let p = self.clamped_for_factor(f, win_h);
+        let mult = f.multiplier();
         let render_h = p.render_height().min(win_h).max(2);
-        let output_h = (render_h * f.multiplier()).min(win_h).max(render_h);
+        let output_h = (render_h * mult).min(win_h).max(render_h);
         let scale_w = |h: u32| -> u32 {
             if h == win_h {
                 return win_w;
@@ -763,7 +764,9 @@ impl MetalFxPreset {
             (w & !1).max(2)
         };
         let render_w = scale_w(render_h);
-        let output_w = scale_w(output_h).max(render_w);
+        // Apple's MTLFXTemporalScaler rejects any descriptor where outputWidth / inputWidth > 3.0
+        // (even by 2 pixels after even-width rounding), so cap output_w strictly at render_w * mult.
+        let output_w = scale_w(output_h).clamp(render_w, render_w * mult);
         ([render_w, render_h], [output_w, output_h])
     }
     fn parse(s: &str) -> Self {
@@ -1992,8 +1995,15 @@ mod tests {
                 MetalFxFactor::X3,
                 [2360, 1640],
             ),
-            ([690, 480], [2072, 1440])
+            ([690, 480], [2070, 1440])
         );
+        // Verify strict <= 3.0x Temporal ratio even on iPad Pro 12.9" (2732x2048).
+        let (r_pro, o_pro) = MetalFxPreset::P360.sizes_for_window_with_factor(
+            MetalFxMode::Temporal,
+            MetalFxFactor::X3,
+            [2732, 2048],
+        );
+        assert!(o_pro[0] <= r_pro[0] * 3 && o_pro[1] <= r_pro[1] * 3);
         assert_eq!(
             MetalFxPreset::P360.sizes_for_window_with_factor(
                 MetalFxMode::Spatial,

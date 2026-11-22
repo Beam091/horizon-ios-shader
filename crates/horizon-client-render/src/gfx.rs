@@ -7266,12 +7266,22 @@ impl Renderer {
         let has_pack = self.pack_post.as_ref().is_some_and(|p| p.1.is_some())
             || self.native.as_ref().is_some_and(|n| n.post.is_some());
         let mfx_active = !frame.title && self.metalfx.active();
-        self.world_post.fixed_size = mfx_active.then(|| self.metalfx.sizes(window_size).0);
+        let mfx_render_size = mfx_active.then(|| self.metalfx.sizes(window_size).0);
+        self.world_post.fixed_size = mfx_render_size;
+        let mfx_view_proj = if has_pack
+            && let Some(r_size) = mfx_render_size
+        {
+            let aspect = r_size[0] as f32 / r_size[1].max(1) as f32;
+            View::screen(frame.yaw, frame.pitch, frame.fov_degrees, aspect, frame.depth_far)
+                .view_proj(pose)
+        } else {
+            view_proj
+        };
         let mfx_jitter = self.metalfx.begin_frame(
             window_size,
             mfx_active,
             !has_pack,
-            view_proj,
+            mfx_view_proj,
             frame.camera,
         );
         // TAA runs where the world post pass does, not under a shader pack's own or MetalFX.
@@ -10449,7 +10459,7 @@ impl Renderer {
                 &mut terrain,
                 mfx_active,
             );
-            if let Some((picture, pack_depth)) = deferred {
+            if let Some((picture, pack_depth, opaque_depth)) = deferred {
                 self.uploads.finish(&encoder);
                 if has_section_copies {
                     self.section_copy_bytes = 0;
@@ -10463,6 +10473,7 @@ impl Renderer {
                     &mut pending_cmds,
                     Some(&picture),
                     &pack_depth,
+                    opaque_depth.as_ref(),
                     &view_target,
                     [self.config.width, self.config.height],
                     true,
@@ -10543,6 +10554,7 @@ impl Renderer {
                     &mut pending_cmds,
                     Some(color),
                     depth,
+                    None,
                     &view_target,
                     [self.config.width, self.config.height],
                     false,

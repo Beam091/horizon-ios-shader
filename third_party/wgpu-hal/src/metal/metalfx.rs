@@ -32,6 +32,7 @@ fn ensure_loaded() {
 #[derive(Debug)]
 pub struct TemporalScaler {
     raw: Retained<AnyObject>,
+    reactive_enabled: bool,
 }
 
 // SAFETY: MetalFX scalers are only encoded on one command buffer at a time while
@@ -48,6 +49,7 @@ impl TemporalScaler {
         unsafe { msg_send![cls, supportsDevice: device] }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ProtocolObject<dyn MTLDevice>,
         input_size: [u32; 2],
@@ -55,6 +57,7 @@ impl TemporalScaler {
         color: &ProtocolObject<dyn MTLTexture>,
         depth: &ProtocolObject<dyn MTLTexture>,
         motion: &ProtocolObject<dyn MTLTexture>,
+        reactive: Option<&ProtocolObject<dyn MTLTexture>>,
         output: &ProtocolObject<dyn MTLTexture>,
         auto_exposure: bool,
     ) -> Option<Self> {
@@ -66,6 +69,7 @@ impl TemporalScaler {
         }
         let desc: Option<Retained<AnyObject>> = unsafe { msg_send![cls, new] };
         let desc = desc?;
+        let mut reactive_enabled = false;
         unsafe {
             let _: () = msg_send![&*desc, setInputWidth: input_size[0] as usize];
             let _: () = msg_send![&*desc, setInputHeight: input_size[1] as usize];
@@ -76,6 +80,20 @@ impl TemporalScaler {
             let _: () = msg_send![&*desc, setMotionTextureFormat: motion.pixelFormat().0];
             let _: () = msg_send![&*desc, setOutputTextureFormat: output.pixelFormat().0];
             let _: () = msg_send![&*desc, setAutoExposureEnabled: auto_exposure];
+            // iOS 17.4+ / macOS 14.4+: enable reactive mask to prevent warping on translucent
+            // water, first-person hand, and shader-pack post-processed pixels.
+            if let Some(r_tex) = reactive {
+                let supports_reactive: bool = msg_send![
+                    cls,
+                    instancesRespondToSelector: objc2::sel!(setReactiveMaskTextureEnabled:)
+                ];
+                if supports_reactive {
+                    let _: () = msg_send![&*desc, setReactiveMaskTextureEnabled: true];
+                    let _: () =
+                        msg_send![&*desc, setReactiveMaskTextureFormat: r_tex.pixelFormat().0];
+                    reactive_enabled = true;
+                }
+            }
         }
         let scaler: Option<Retained<AnyObject>> =
             unsafe { msg_send![&*desc, newTemporalScalerWithDevice: device] };
@@ -93,8 +111,19 @@ impl TemporalScaler {
             {
                 return None;
             }
+            if reactive_enabled {
+                if let Some(r_tex) = reactive {
+                    let need_r: usize = msg_send![&*raw, reactiveTextureUsage];
+                    if (r_tex.usage().0 & need_r) != need_r {
+                        return None;
+                    }
+                }
+            }
         }
-        Some(Self { raw })
+        Some(Self {
+            raw,
+            reactive_enabled,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -105,6 +134,7 @@ impl TemporalScaler {
         color: &ProtocolObject<dyn MTLTexture>,
         depth: &ProtocolObject<dyn MTLTexture>,
         motion: &ProtocolObject<dyn MTLTexture>,
+        reactive: Option<&ProtocolObject<dyn MTLTexture>>,
         output: &ProtocolObject<dyn MTLTexture>,
         jitter_px: [f32; 2],
         depth_reversed: bool,
@@ -114,9 +144,15 @@ impl TemporalScaler {
             let _: () = msg_send![&*self.raw, setColorTexture: color];
             let _: () = msg_send![&*self.raw, setDepthTexture: depth];
             let _: () = msg_send![&*self.raw, setMotionTexture: motion];
+            if self.reactive_enabled {
+                if let Some(r_tex) = reactive {
+                    let _: () = msg_send![&*self.raw, setReactiveMaskTexture: r_tex];
+                }
+            }
             let _: () = msg_send![&*self.raw, setOutputTexture: output];
             let _: () = msg_send![&*self.raw, setInputContentWidth: input_size[0] as usize];
             let _: () = msg_send![&*self.raw, setInputContentHeight: input_size[1] as usize];
+            let _: () = msg_send![&*self.raw, setPreExposure: 1.0f32];
             let _: () = msg_send![&*self.raw, setJitterOffsetX: jitter_px[0]];
             let _: () = msg_send![&*self.raw, setJitterOffsetY: jitter_px[1]];
             let _: () = msg_send![&*self.raw, setMotionVectorScaleX: 1.0f32];

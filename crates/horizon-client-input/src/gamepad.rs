@@ -466,6 +466,8 @@ pub struct PadSettings {
     pub lightbar: Lightbar,
     /// 0..1; 0.5 is the default speed, 1 twice that.
     pub look_sensitivity: f32,
+    /// Touch-screen camera drag sensitivity (0..1; 0.5 = 100%, independent of hardware mouse).
+    pub touch_sensitivity: f32,
     pub invert_x: bool,
     pub invert_y: bool,
     pub move_deadzone: f32,
@@ -496,6 +498,7 @@ impl Default for PadSettings {
             adaptive_triggers: true,
             lightbar: Lightbar::Health,
             look_sensitivity: 0.5,
+            touch_sensitivity: 0.5,
             invert_x: false,
             invert_y: false,
             move_deadzone: 0.15,
@@ -562,6 +565,7 @@ impl PadSettings {
                 "adaptiveTriggers" => s.adaptive_triggers = flag(s.adaptive_triggers),
                 "lightbar" => s.lightbar = Lightbar::parse(value),
                 "lookSensitivity" => s.look_sensitivity = unit(s.look_sensitivity),
+                "touchSensitivity" => s.touch_sensitivity = unit(s.touch_sensitivity),
                 "invertX" => s.invert_x = flag(s.invert_x),
                 "invertY" => s.invert_y = flag(s.invert_y),
                 "moveDeadzone" => s.move_deadzone = unit(s.move_deadzone).min(0.9),
@@ -595,12 +599,13 @@ impl PadSettings {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "enabled:{}\nvibration:{}\nadaptiveTriggers:{}\nlightbar:{}\nlookSensitivity:{}\ninvertX:{}\ninvertY:{}\nmoveDeadzone:{}\nlookDeadzone:{}\ntriggerThreshold:{}\ntoggleSneak:{}\nglyphs:{}\nnintendoLetters:{}\nkeyboard:{}\n",
+            "enabled:{}\nvibration:{}\nadaptiveTriggers:{}\nlightbar:{}\nlookSensitivity:{}\ntouchSensitivity:{}\ninvertX:{}\ninvertY:{}\nmoveDeadzone:{}\nlookDeadzone:{}\ntriggerThreshold:{}\ntoggleSneak:{}\nglyphs:{}\nnintendoLetters:{}\nkeyboard:{}\n",
             bool_text(self.enabled),
             bool_text(self.vibration),
             bool_text(self.adaptive_triggers),
             self.lightbar.name(),
             self.look_sensitivity,
+            self.touch_sensitivity,
             bool_text(self.invert_x),
             bool_text(self.invert_y),
             self.move_deadzone,

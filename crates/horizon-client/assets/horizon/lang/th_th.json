@@ -4,6 +4,7 @@
   "horizon.options.adaptive_triggers": "ทริกเกอร์แบบปรับตัว",
   "horizon.options.lightbar": "แถบไฟ",
   "horizon.options.look_sensitivity": "ความไวในการมอง",
+  "horizon.options.touch_sensitivity": "ความไวการแตะหน้าจอ",
   "horizon.options.invert_x": "กลับแกน X การมอง",
   "horizon.options.invert_y": "กลับแกน Y การมอง",
   "horizon.options.sneak_button": "ปุ่มย่อง",
@@ -561,5 +562,6 @@
   "horizon.touch.zoom": "ซูมกล้อง",
   "horizon.touch.swap_offhand": "สลับมือซ้าย",
   "horizon.touch.mouse": "เมาส์",
-  "horizon.touch.shift": "Shift"
+  "horizon.touch.shift": "Shift",
+  "How fast dragging the touch screen turns the view.": "ความเร็วในการหันมุมกล้องเมื่อลากนิ้วบนหน้าจอ (แยกจากเมาส์)"
 }

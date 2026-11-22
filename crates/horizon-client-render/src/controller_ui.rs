@@ -110,6 +110,10 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "How fast the right stick turns the view.",
                         ),
                         option(
+                            Opt::TouchSensitivity,
+                            "How fast dragging the touch screen turns the view.",
+                        ),
+                        option(
                             Opt::PadInvertX,
                             "Turn the view the other way, left and right.",
                         ),

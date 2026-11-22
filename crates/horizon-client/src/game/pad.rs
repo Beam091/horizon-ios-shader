@@ -60,8 +60,14 @@ pub(super) struct Pads {
     pub(super) touch_menu_shift_applied: bool,
     /// Whether an iOS/iPadOS hardware keyboard or mouse (`GCKeyboard`/`GCMouse`) is active.
     pub(super) ios_hw_active: bool,
+    pub(super) ios_hw_mouse_connected: bool,
+    pub(super) ios_hw_was_playing: bool,
     pub(super) ios_hw_keys: Vec<KeyCode>,
     pub(super) ios_hw_mouse_buttons: [bool; 3],
+    pub(super) ios_hw_scroll_accum: f32,
+    pub(super) ios_hw_last_scroll_step: Option<Instant>,
+    pub(super) ios_hw_last_scroll_event: Option<Instant>,
+    pub(super) ios_hw_hover_pos: Option<(f32, f32)>,
     /// Whether a real physical game controller (not virtual touch controls) is active.
     pub(super) hw_pad_active: bool,
     hw_pad_activity: gamepad::Activity,

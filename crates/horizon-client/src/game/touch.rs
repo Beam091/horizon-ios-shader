@@ -110,16 +110,20 @@ impl Game<'_> {
         let active = in_container && self.touch_shift_active();
         if active != self.pad.touch_menu_shift_applied {
             self.pad.touch_menu_shift_applied = active;
-            horizon_client_input::modifiers::set_key(
-                &mut self.modifiers,
-                &mut self.physical_keys,
-                KeyCode::ShiftLeft,
-                active,
-            );
-            if active {
-                self.keys.insert(KeyCode::ShiftLeft);
-            } else {
-                self.keys.remove(&KeyCode::ShiftLeft);
+            // Don't release ShiftLeft if a physical hardware keyboard is currently holding it.
+            let hw_shift = self.pad.ios_hw_keys.contains(&KeyCode::ShiftLeft);
+            if active || !hw_shift {
+                horizon_client_input::modifiers::set_key(
+                    &mut self.modifiers,
+                    &mut self.physical_keys,
+                    KeyCode::ShiftLeft,
+                    active,
+                );
+                if active {
+                    self.keys.insert(KeyCode::ShiftLeft);
+                } else {
+                    self.keys.remove(&KeyCode::ShiftLeft);
+                }
             }
         }
     }
@@ -148,9 +152,10 @@ impl Game<'_> {
     }
 
     /// The Mouse toggle button next to Esc when a menu is open: switches between
-    /// direct touch and virtual trackpad mouse mode.
+    /// direct touch and virtual trackpad mouse mode. Hidden when a real hardware
+    /// mouse is connected so the virtual cursor never fights the native iPadOS pointer.
     fn touch_mouse_button(&self, batch: &HudBatch) -> Option<Area> {
-        if !self.pad_in_menu() {
+        if !self.pad_in_menu() || self.pad.ios_hw_mouse_connected {
             return None;
         }
         let esc = self.touch_close_button(batch)?;
@@ -168,16 +173,19 @@ impl Game<'_> {
         if self.title.is_some() || !matches!(self.screen, Screen::Inventory | Screen::Creative) {
             return None;
         }
-        let mouse_btn = self.touch_mouse_button(batch)?;
+        let anchor = self
+            .touch_mouse_button(batch)
+            .or_else(|| self.touch_close_button(batch))?;
         Some(Area {
-            x: mouse_btn.x + mouse_btn.w + 4.0,
-            y: mouse_btn.y,
+            x: anchor.x + anchor.w + 4.0,
+            y: anchor.y,
             w: 34.0,
-            h: mouse_btn.h,
+            h: anchor.h,
         })
     }
 
-    /// The Esc, Mouse, and Shift buttons at the top-left, plus the virtual mouse cursor when active.
+    /// The Esc, Mouse, and Shift buttons at the top-left, plus the virtual mouse cursor
+    /// (ONLY in touch-screen trackpad mode — never over a physical iPadOS mouse pointer).
     pub(super) fn draw_touch_close(&self, batch: &mut HudBatch) {
         let atlas = &self.gui.atlas;
         if let Some(a) = self.touch_close_button(batch) {
@@ -209,7 +217,8 @@ impl Game<'_> {
         }
         if TOUCH_CONTROLS
             && self.pad_in_menu()
-            && (self.pad.touch_mouse.trackpad || self.pad.ios_hw_active)
+            && self.pad.touch_mouse.trackpad
+            && !self.pad.ios_hw_mouse_connected
         {
             draw_virtual_cursor(batch, atlas, self.cursor);
         }
@@ -224,10 +233,25 @@ impl Game<'_> {
     /// came down while a menu was open. A finger on the controls gives none.
     pub(super) fn touch_event(&mut self, touch: Touch) -> Vec<WindowEvent> {
         self.touch_load();
+        // Identify indirect pointer clicks from a connected iPadOS hardware mouse so they never
+        // re-enable the on-screen touch HUD or trigger virtual touch buttons during gameplay.
+        #[cfg(target_os = "ios")]
+        let is_hw_mouse_touch = self.pad.ios_hw_mouse_connected
+            && (horizon_client_input::ios_controllers::is_hardware_mouse_button_down()
+                || self.pad.ios_hw_hover_pos.is_some_and(|(hx, hy)| {
+                    let dx = touch.location.x - f64::from(hx);
+                    let dy = touch.location.y - f64::from(hy);
+                    dx * dx + dy * dy <= 32.0 * 32.0
+                }));
+        #[cfg(not(target_os = "ios"))]
+        let is_hw_mouse_touch = false;
+
+        if is_hw_mouse_touch && self.touch_playing() {
+            // While in-world, GCMouse handles all hardware mouse buttons directly.
+            return Vec::new();
+        }
         // A direct finger touch on the screen brings touch controls back if hardware input hid them.
-        if touch.phase == TouchPhase::Started
-            && !self.pad.ios_hw_mouse_buttons.iter().any(|&b| b)
-        {
+        if touch.phase == TouchPhase::Started && !is_hw_mouse_touch {
             self.pad.ios_hw_active = false;
             self.pad.hw_pad_active = false;
         }
@@ -445,7 +469,7 @@ impl Game<'_> {
         }
         self.pad.touch_state = state;
         if frame.look != (0.0, 0.0) {
-            let sens = self.ios_look_sensitivity();
+            let sens = self.ios_touch_sensitivity();
             self.look_turn(
                 f64::from(frame.look.0) * LOOK_SPEED * sens,
                 f64::from(frame.look.1) * LOOK_SPEED * sens,
@@ -458,11 +482,20 @@ impl Game<'_> {
         }
     }
 
-    /// Vanilla `MouseHandler.turnPlayer` sensitivity multiplier: 1.0 at default 100% (0.5),
-    /// up to ~4.1x at 200% (1.0), so Mouse Sensitivity controls both touch and iPadOS hardware mouse.
-    fn ios_look_sensitivity(&self) -> f64 {
-        let ss = f64::from(self.settings.sensitivity) * 0.6 + 0.2;
+    /// Vanilla `MouseHandler.turnPlayer` sensitivity curve: 1.0 at 100% (0.5), up to ~4.1x at 200% (1.0).
+    fn sensitivity_curve(raw: f32) -> f64 {
+        let ss = f64::from(raw.clamp(0.0, 1.0)) * 0.6 + 0.2;
         ss * ss * ss * 8.0
+    }
+
+    /// Separate touch-screen camera drag sensitivity (`Options -> Mouse / Controller -> Touch Sensitivity`).
+    fn ios_touch_sensitivity(&self) -> f64 {
+        Self::sensitivity_curve(self.settings.controller.touch_sensitivity)
+    }
+
+    /// Hardware mouse camera sensitivity (`Options -> Controls -> Mouse Settings -> Sensitivity`).
+    fn ios_mouse_sensitivity(&self) -> f64 {
+        Self::sensitivity_curve(self.settings.sensitivity)
     }
 
     /// Moves what was drawn into `batch` since `from` (a vertex count) by the
@@ -788,28 +821,79 @@ fn draw_virtual_cursor(batch: &mut HudBatch, atlas: &HudAtlas, (cx, cy): (f32, f
 
 #[cfg(target_os = "ios")]
 impl Game<'_> {
-    /// Polls `GCKeyboard` and `GCMouse` on iOS/iPadOS, automatically hiding on-screen touch
-    /// buttons while hardware peripherals are used and driving movement, camera look, clicks,
-    /// and scrolling 100% natively.
+    /// Polls `GCKeyboard`, `GCMouse`, and `UIHoverGestureRecognizer` on iOS/iPadOS:
+    /// - In-world: locks & hides the iPadOS pointer (`prefersPointerLocked`), drives 360° camera
+    ///   look with Hardware Mouse Sensitivity, buttons, and crisp 1-notch hotbar scrolling.
+    /// - In menus: unlocks the real iPadOS cursor, tracks it 1:1 via `UIHoverGestureRecognizer`
+    ///   (never drawing a competing virtual cursor), lets UIKit handle Left-click/drag cleanly
+    ///   without double-firing, and drives Right/Middle clicks & smooth menu scrolling via `GCMouse`.
     pub(super) fn poll_ios_hardware_keyboard_mouse(
         &mut self,
         event_loop: &dyn super::event_loop::EventLoopCtl,
     ) {
-        // Lock and hide the iPadOS/iOS hardware mouse pointer whenever in-world so the system
-        // arrow cursor never floats over gameplay and 360-degree turning never hits screen edges.
-        horizon_client_input::ios_controllers::set_pointer_locked(self.touch_playing());
+        let playing = self.touch_playing();
+        horizon_client_input::ios_controllers::set_pointer_locked(playing);
+
+        let id = self.window.as_ref().map(|w| w.id());
+        let buttons = [
+            winit::event::MouseButton::Left,
+            winit::event::MouseButton::Right,
+            winit::event::MouseButton::Middle,
+        ];
+
+        // Flush stale deltas and release any held in-world mouse buttons when crossing between
+        // gameplay and UI menus so the camera never jumps and buttons never get stuck.
+        if self.pad.ios_hw_was_playing != playing {
+            let was_playing = self.pad.ios_hw_was_playing;
+            self.pad.ios_hw_was_playing = playing;
+            horizon_client_input::ios_controllers::flush_hardware_mouse_deltas();
+            self.pad.ios_hw_scroll_accum = 0.0;
+            self.pad.ios_hw_last_scroll_step = None;
+            if was_playing && !playing {
+                if let Some(id) = id {
+                    for (i, &button) in buttons.iter().enumerate() {
+                        if std::mem::replace(&mut self.pad.ios_hw_mouse_buttons[i], false) {
+                            self.handle_window_event(
+                                event_loop,
+                                id,
+                                WindowEvent::MouseInput {
+                                    device_id: winit::event::DeviceId::dummy(),
+                                    state: winit::event::ElementState::Released,
+                                    button,
+                                },
+                                super::input_trace::InputOrigin::User,
+                            );
+                        }
+                    }
+                } else {
+                    self.pad.ios_hw_mouse_buttons = [false; 3];
+                }
+            }
+        }
 
         let hw = horizon_client_input::ios_controllers::poll_hardware_input();
+        self.pad.ios_hw_mouse_connected = hw.mouse_connected;
+        if hw.mouse_connected {
+            // Never allow virtual trackpad mode to fight a connected physical mouse.
+            self.pad.touch_mouse.trackpad = false;
+        } else {
+            self.pad.ios_hw_hover_pos = None;
+        }
+        if let Some(pos) = hw.hover_pos {
+            self.pad.ios_hw_hover_pos = Some(pos);
+        }
+
         let any_activity = !hw.keys.is_empty()
             || hw.mouse_buttons.iter().any(|&b| b)
             || hw.mouse_delta != (0.0, 0.0)
-            || hw.mouse_scroll != (0.0, 0.0);
+            || hw.mouse_scroll != (0.0, 0.0)
+            || hw.hover_pos.is_some();
         if any_activity {
             self.pad.ios_hw_active = true;
         } else if !hw.keyboard_connected && !hw.mouse_connected {
             self.pad.ios_hw_active = false;
         }
-        let Some(id) = self.window.as_ref().map(|w| w.id()) else {
+        let Some(id) = id else {
             return;
         };
 
@@ -841,45 +925,77 @@ impl Game<'_> {
             }
         }
 
-        // 2. Hardware mouse movement (`GCMouseInput.mouseMovedHandler`).
+        // 2. Hardware mouse movement:
+        // - In-world: locked relative deltas from `GCMouseInput` drive camera look.
+        // - In menus: exact native coordinates from `UIHoverGestureRecognizer` track the real
+        //   iPadOS pointer 1:1 across X and Y without fighting UIKit or drifting.
         let (dx, dy) = hw.mouse_delta;
-        if dx != 0.0 || dy != 0.0 {
-            self.last_input = Instant::now();
-            if self.touch_playing() {
-                let sens = self.ios_look_sensitivity();
+        if playing {
+            if dx != 0.0 || dy != 0.0 {
+                self.last_input = Instant::now();
+                let sens = self.ios_mouse_sensitivity();
                 let x = if self.settings.invert_x { -dx } else { dx };
                 let y = if self.settings.invert_y { -dy } else { dy };
                 self.look_turn(f64::from(x) * 2.5 * sens, f64::from(y) * 2.5 * sens);
-            } else if let Some(batch) = self.gui_scale() {
-                let scale = batch.scale;
-                let nx = (self.cursor.0 * scale + dx).clamp(0.0, batch.width * scale);
-                let ny = (self.cursor.1 * scale + dy).clamp(0.0, batch.height * scale);
-                let position = winit::dpi::PhysicalPosition::new(f64::from(nx), f64::from(ny));
-                self.pad.touch_mouse.cursor = Some(position);
-                self.handle_window_event(
-                    event_loop,
-                    id,
-                    WindowEvent::CursorMoved {
-                        device_id: winit::event::DeviceId::dummy(),
-                        position,
-                    },
-                    super::input_trace::InputOrigin::User,
-                );
             }
+        } else if let Some((hx, hy)) = hw.hover_pos
+            && let Some(batch) = self.gui_scale()
+        {
+            self.last_input = Instant::now();
+            let max_x = f64::from(batch.width * batch.scale).max(1.0);
+            let max_y = f64::from(batch.height * batch.scale).max(1.0);
+            let position = winit::dpi::PhysicalPosition::new(
+                f64::from(hx).clamp(0.0, max_x),
+                f64::from(hy).clamp(0.0, max_y),
+            );
+            self.pad.touch_mouse.cursor = Some(position);
+            self.handle_window_event(
+                event_loop,
+                id,
+                WindowEvent::CursorMoved {
+                    device_id: winit::event::DeviceId::dummy(),
+                    position,
+                },
+                super::input_trace::InputOrigin::User,
+            );
+        } else if (hw.mouse_buttons[1] || hw.mouse_buttons[2])
+            && (dx != 0.0 || dy != 0.0)
+            && let Some(batch) = self.gui_scale()
+        {
+            // Fallback during right/middle-button drag (e.g. inventory stack split) if iPadOS pauses
+            // UIHoverGestureRecognizer while a secondary button is held.
+            self.last_input = Instant::now();
+            let scale = batch.scale;
+            let nx = (self.cursor.0 * scale + dx).clamp(0.0, batch.width * scale);
+            let ny = (self.cursor.1 * scale + dy).clamp(0.0, batch.height * scale);
+            let position = winit::dpi::PhysicalPosition::new(f64::from(nx), f64::from(ny));
+            self.pad.touch_mouse.cursor = Some(position);
+            self.handle_window_event(
+                event_loop,
+                id,
+                WindowEvent::CursorMoved {
+                    device_id: winit::event::DeviceId::dummy(),
+                    position,
+                },
+                super::input_trace::InputOrigin::User,
+            );
         }
 
         // 3. Hardware mouse buttons (`leftButton`, `rightButton`, `middleButton`).
-        let old_btns = std::mem::replace(&mut self.pad.ios_hw_mouse_buttons, hw.mouse_buttons);
-        let buttons = [
-            winit::event::MouseButton::Left,
-            winit::event::MouseButton::Right,
-            winit::event::MouseButton::Middle,
-        ];
+        // In menus, UIKit (`UIApplicationSupportsIndirectInputEvents`) already delivers Left-click
+        // and Left-drag at the exact native pointer location via `WindowEvent::Touch`, so only emit
+        // `GCMouse` Left button while in-world (avoiding double-click / drag conflicts in UI).
+        // Right and Middle buttons are not delivered as touches by winit, so always emit them here.
+        let mut effective_buttons = hw.mouse_buttons;
+        if !playing {
+            effective_buttons[0] = false;
+        }
+        let old_btns = std::mem::replace(&mut self.pad.ios_hw_mouse_buttons, effective_buttons);
         for (i, &button) in buttons.iter().enumerate() {
-            if hw.mouse_buttons[i] != old_btns[i] {
-                let pressed = hw.mouse_buttons[i];
+            if effective_buttons[i] != old_btns[i] {
+                let pressed = effective_buttons[i];
                 self.last_input = Instant::now();
-                if self.touch_playing() {
+                if playing {
                     self.captured = true;
                 }
                 let state = if pressed {
@@ -900,25 +1016,65 @@ impl Game<'_> {
             }
         }
 
-        // 4. Hardware mouse scroll wheel (`GCMouseInput.scroll`).
+        // 4. Hardware mouse scroll wheel (`GCMouseInput.scroll.valueChangedHandler`).
         let (sx, sy) = hw.mouse_scroll;
         if sx != 0.0 || sy != 0.0 {
-            self.last_input = Instant::now();
-            self.handle_window_event(
-                event_loop,
-                id,
-                WindowEvent::MouseWheel {
-                    device_id: winit::event::DeviceId::dummy(),
-                    delta: winit::event::MouseScrollDelta::PixelDelta(
-                        winit::dpi::PhysicalPosition::new(
-                            f64::from(sx) * 24.0,
-                            f64::from(sy) * 24.0,
+            let now = Instant::now();
+            self.last_input = now;
+            if playing {
+                if sy != 0.0 {
+                    // Reset accumulator after a brief pause or on scroll direction reversal so each
+                    // physical wheel notch reliably advances exactly one hotbar slot.
+                    if self
+                        .pad
+                        .ios_hw_last_scroll_event
+                        .is_some_and(|t| {
+                            now.duration_since(t) > std::time::Duration::from_millis(180)
+                        })
+                        || (self.pad.ios_hw_scroll_accum != 0.0
+                            && self.pad.ios_hw_scroll_accum.signum() != sy.signum())
+                    {
+                        self.pad.ios_hw_scroll_accum = 0.0;
+                    }
+                    self.pad.ios_hw_last_scroll_event = Some(now);
+                    // Clamp each frame's contribution so a burst of callbacks doesn't leap across slots.
+                    self.pad.ios_hw_scroll_accum += sy.clamp(-1.0, 1.0);
+                    let step_ready = self.pad.ios_hw_last_scroll_step.is_none_or(|t| {
+                        now.duration_since(t) >= std::time::Duration::from_millis(70)
+                    });
+                    if self.pad.ios_hw_scroll_accum.abs() >= 0.5 && step_ready {
+                        let dir = self.pad.ios_hw_scroll_accum.signum();
+                        self.pad.ios_hw_scroll_accum = 0.0;
+                        self.pad.ios_hw_last_scroll_step = Some(now);
+                        self.handle_window_event(
+                            event_loop,
+                            id,
+                            WindowEvent::MouseWheel {
+                                device_id: winit::event::DeviceId::dummy(),
+                                delta: winit::event::MouseScrollDelta::LineDelta(0.0, dir),
+                                phase: TouchPhase::Moved,
+                            },
+                            super::input_trace::InputOrigin::User,
+                        );
+                    }
+                }
+            } else {
+                // Smooth, controlled vertical & horizontal UI list / creative inventory scrolling.
+                let mx = sx.clamp(-3.0, 3.0) * 14.0;
+                let my = sy.clamp(-3.0, 3.0) * 14.0;
+                self.handle_window_event(
+                    event_loop,
+                    id,
+                    WindowEvent::MouseWheel {
+                        device_id: winit::event::DeviceId::dummy(),
+                        delta: winit::event::MouseScrollDelta::PixelDelta(
+                            winit::dpi::PhysicalPosition::new(f64::from(mx), f64::from(my)),
                         ),
-                    ),
-                    phase: TouchPhase::Moved,
-                },
-                super::input_trace::InputOrigin::User,
-            );
+                        phase: TouchPhase::Moved,
+                    },
+                    super::input_trace::InputOrigin::User,
+                );
+            }
         }
     }
 }
