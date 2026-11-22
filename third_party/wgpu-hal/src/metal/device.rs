@@ -348,7 +348,12 @@ impl super::Device {
 
                 let options = MTLCompileOptions::new();
                 options.setLanguageVersion(self.shared.private_caps.msl_version);
-                options.setFastMathEnabled(true);
+                if available!(macos = 15.0, ios = 18.0, tvos = 18.0, visionos = 2.0) {
+                    options.setMathMode(objc2_metal::MTLMathMode::Fast);
+                } else {
+                    #[allow(deprecated)]
+                    options.setFastMathEnabled(true);
+                }
 
                 // https://developer.apple.com/documentation/metal/mtlcompileoptions/preserveinvariance
                 if !cfg!(target_os = "ios")

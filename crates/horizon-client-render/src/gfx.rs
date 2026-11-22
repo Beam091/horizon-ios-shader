@@ -2509,12 +2509,12 @@ impl Renderer {
             let caps = surface.get_capabilities(&adapter);
             config.format = surface_format(&caps.formats, config.format);
             config.view_formats = vec![config.format.remove_srgb_suffix()];
-            // Screenshots copy the presented frame back from the swapchain, frame
-            // generation's present thread copies its frames in.
+            // Screenshots copy the presented frame back from the swapchain; desktop frame
+            // generation's present thread copies its frames in (iOS uses a blit pass instead).
             if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
                 config.usage |= wgpu::TextureUsages::COPY_SRC;
             }
-            if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
+            if !cfg!(target_os = "ios") && caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
                 config.usage |= wgpu::TextureUsages::COPY_DST;
             }
             config.present_mode = previous
@@ -6370,6 +6370,38 @@ impl Renderer {
             && self.metalfx.frame_gen_supported(&self.device)
             && self.hdr.is_none()
     }
+
+    /// True when the next `render()` call will take the Odd Frame Generation fast path (blitting
+    /// cached `N-0.5` + overlays/HUD only), allowing `Game::render` to skip 3D CPU geometry builds.
+    pub fn will_present_odd_frame_gen_tick(&self, title: bool, menu_blur: bool) -> bool {
+        !title
+            && !menu_blur
+            && self.ios_frame_gen_active()
+            && self.frame_format == self.config.format.remove_srgb_suffix()
+            && self.native.as_ref().is_none_or(|n| n.post.is_none())
+            && self.screenshot.is_none()
+            && self.surface.is_some()
+            && !self.surface_unconfigured
+            && self.metalfx.fg_should_present_odd_tick()
+    }
+
+    /// Drains pending GPU work and resets Frame Generation caches when the app enters iOS
+    /// background (`suspended`) so no Metal command buffers execute in the background.
+    pub fn on_suspend(&mut self) {
+        self.frame_gen.stop();
+        self.frame_gen.reset_object_motion();
+        self.metalfx.reset_frame_gen();
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    /// Releases transient renderer caches on iOS low-memory warnings to help avoid Jetsam kills.
+    pub fn release_memory(&mut self) {
+        if let Some(blur) = &mut self.menu_blur {
+            blur.release();
+        }
+        self.metalfx.release_unused(self.ios_frame_gen_active());
+        self.frame_gen.release_motion();
+    }
     /// Frame generation mode (FSR 3.1 on desktop, MetalFX Frame Interpolation on iOS 26+).
     pub fn set_frame_generation(&mut self, mode: crate::graphics::FrameGeneration) {
         let (on, metalfx) = match mode {
@@ -6409,6 +6441,12 @@ impl Renderer {
     /// Reloads the active shader pack immediately when toggled.
     pub fn set_shader_half_buffers(&mut self, on: bool) {
         if pack_post::set_shader_half_buffers(on) {
+            self.pack_post = None;
+        }
+    }
+    /// Caps shader pack `shadowMapResolution` (e.g. 1024 on iOS) to reduce shadow fillrate & VRAM.
+    pub fn set_shadow_resolution_cap(&mut self, cap: crate::graphics::ShadowResolutionCap) {
+        if pack_post::set_shadow_resolution_cap(cap.max_pixels()) {
             self.pack_post = None;
         }
     }
@@ -7198,7 +7236,7 @@ impl Renderer {
         self.last_wait = landed + queued + acquire.elapsed();
         // Inside the acquire's time already.
         self.queue.take_waited();
-        let (mut surface_frame, reconfigure) = match acquired {
+        let (mut surface_frame, mut reconfigure) = match acquired {
             None => (None, false),
             Some(wgpu::CurrentSurfaceTexture::Success(f)) => (Some(f), false),
             Some(wgpu::CurrentSurfaceTexture::Suboptimal(f)) => (Some(f), true),
@@ -7230,6 +7268,17 @@ impl Renderer {
                 return Ok(false);
             }
         };
+        #[cfg(target_os = "ios")]
+        {
+            // Pipelined Frame Gen presents in <0.5ms on the swapchain drawable (3D Step B runs
+            // offscreen), so double buffering (`maximumDrawableCount = 2`, latency = 1) cuts
+            // ~16.7ms of display queue latency with zero FPS penalty.
+            let wanted_latency = if mfx_fg_active { 1 } else { 2 };
+            if self.config.desired_maximum_frame_latency != wanted_latency {
+                self.config.desired_maximum_frame_latency = wanted_latency;
+                reconfigure = true;
+            }
+        }
         if surface_frame.is_some() {
             self.acquire_validation_failures = 0;
             self.frame_gen.paused = false;
@@ -7269,8 +7318,8 @@ impl Renderer {
                 })
         });
         // Pipelined GPU Frame Generation — Odd Display Tick:
-        // Present the interpolated halfway frame `N-0.5` with fresh 60/120Hz HUD on the main
-        // thread, skipping 100% of 3D world and Shader Pack rendering.
+        // Present the interpolated halfway frame `N-0.5` with fresh 60/120Hz screen effects,
+        // 3D debug crosshair, and HUD on the main thread, skipping 100% of 3D world rendering.
         if mfx_fg_active
             && self.metalfx.fg_should_present_odd_tick()
             && self.screenshot.is_none()
@@ -7281,23 +7330,12 @@ impl Renderer {
                 format: Some(self.frame_format),
                 ..Default::default()
             });
-            if self.metalfx.blit_pipelined_interp(&mut encoder, &view_target) {
-                self.hud.prepare(
-                    &self.device,
-                    &mut self.uploads,
-                    &mut encoder,
-                    frame.hud,
-                    [self.config.width, self.config.height],
-                );
-                self.hud.draw_range(
-                    &mut encoder,
-                    &view_target,
-                    &self.depth,
-                    frame.hud,
-                    [self.config.width, self.config.height],
-                    0..frame.hud.vertices.len() as u32,
-                    None,
-                );
+            self.prepare_pipelined_overlay(&mut encoder, frame);
+            if self
+                .metalfx
+                .blit_pipelined_interp(&mut encoder, &view_target, None)
+            {
+                self.draw_pipelined_overlay(&mut encoder, &view_target, frame, false);
                 self.uploads.finish(&encoder);
                 if has_section_copies {
                     self.section_copy_bytes = 0;
@@ -7315,13 +7353,25 @@ impl Renderer {
                 self.last_encode = started.elapsed().saturating_sub(self.last_wait);
                 return Ok(true);
             }
+            self.uploads.finish(&encoder);
             self.queue.present(sf);
             return Ok(false);
         }
+        // Horizon's own passes are timed like a shader pack's, from the frame's first pass
+        // (including Even Step A's present + overlay so F3 stays live under pipelined Frame Gen).
+        if self.own_timing.is_some() != self.pass_timing {
+            self.own_timing = self
+                .pass_timing
+                .then(|| pack_timing::PassTiming::new(&self.device, &self.queue))
+                .flatten();
+        }
+        if let Some(t) = &mut self.own_timing {
+            t.begin(&self.device, &self.queue);
+        }
         // Pipelined GPU Frame Generation — Even Display Tick Step A:
-        // Present the cached real world frame `N-1` + fresh HUD IMMEDIATELY (<0.5 ms GPU) so the
-        // current 60/120Hz VSync lands on time, BEFORE Step B renders real frame `N` + `N-0.5`
-        // offscreen across the next two VSync slots (enables true 30 real -> 60 display FPS!).
+        // Present the cached real world frame `N-1` + fresh overlays/HUD IMMEDIATELY (<0.5 ms GPU)
+        // so the current 60/120Hz VSync lands on time, BEFORE Step B renders real frame `N` +
+        // `N-0.5` offscreen across the next two VSync slots (enables true 30 real -> 60 display FPS!).
         let mut pipelined_offscreen = false;
         if mfx_fg_active
             && self.metalfx.fg_has_pipelined_real()
@@ -7338,23 +7388,13 @@ impl Renderer {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("Horizon FG even present"),
                     });
-            if self.metalfx.blit_pipelined_real(&mut present_enc, &present_view) {
-                self.hud.prepare(
-                    &self.device,
-                    &mut self.uploads,
-                    &mut present_enc,
-                    frame.hud,
-                    [self.config.width, self.config.height],
-                );
-                self.hud.draw_range(
-                    &mut present_enc,
-                    &present_view,
-                    &self.depth,
-                    frame.hud,
-                    [self.config.width, self.config.height],
-                    0..frame.hud.vertices.len() as u32,
-                    None,
-                );
+            self.prepare_pipelined_overlay(&mut present_enc, frame);
+            if self.metalfx.blit_pipelined_real(
+                &mut present_enc,
+                &present_view,
+                self.own_timing.as_mut(),
+            ) {
+                self.draw_pipelined_overlay(&mut present_enc, &present_view, frame, true);
                 self.uploads.finish(&present_enc);
                 let _ = self.queue.submit([present_enc.finish()]);
                 if self.config.present_mode == wgpu::PresentMode::Fifo {
@@ -7364,18 +7404,9 @@ impl Renderer {
                 pipelined_offscreen = true;
             } else {
                 // Rare resize race: put drawable back and run synchronously.
+                self.uploads.finish(&present_enc);
                 surface_frame = Some(sf);
             }
-        }
-        // Horizon's own passes are timed like a shader pack's, from the frame's first pass.
-        if self.own_timing.is_some() != self.pass_timing {
-            self.own_timing = self
-                .pass_timing
-                .then(|| pack_timing::PassTiming::new(&self.device, &self.queue))
-                .flatten();
-        }
-        if let Some(t) = &mut self.own_timing {
-            t.begin(&self.device, &self.queue);
         }
         if self.animated_textures {
             self.hud
@@ -7414,6 +7445,7 @@ impl Renderer {
             window_size,
             mfx_active || mfx_fg_active,
             mfx_active && !has_pack,
+            frame.first_person,
             mfx_view_proj,
             frame.camera,
         );
@@ -8637,15 +8669,20 @@ impl Renderer {
         if fg || mfx_fg_active {
             self.frame_gen
                 .halfway_hand(frame.hand, hand_view, &mut self.entity_batch.combined);
-            if fg {
-                self.frame_gen.track_entities(
-                    &self.device,
-                    &self.entity_atlas,
-                    frame.entities,
-                    frame.entity_motion,
-                    frame.camera,
-                );
+        }
+        let mfx_tracks_motion = mfx_fg_active
+            || (mfx_active && self.metalfx.mode == crate::graphics::MetalFxMode::Temporal);
+        if fg || mfx_tracks_motion {
+            if !fg && self.metalfx.history_reset() {
+                self.frame_gen.reset_object_motion();
             }
+            self.frame_gen.track_entities(
+                &self.device,
+                &self.entity_atlas,
+                frame.entities,
+                frame.entity_motion,
+                frame.camera,
+            );
         }
         let all_entities = &self.entity_batch.combined;
         let hand_quads = (frame.hand.len() / 4) as u32;
@@ -10613,6 +10650,21 @@ impl Renderer {
                     self.section_uploads.finish(&encoder);
                     has_section_copies = false;
                 }
+                let obj_motion = (mfx_tracks_motion && !self.metalfx.history_reset())
+                    .then(|| {
+                        self.frame_gen.draw_object_motion(
+                            &self.device,
+                            &self.queue,
+                            &mut encoder,
+                            &pack_depth,
+                            size,
+                            mfx_view_proj,
+                            mfx_view_proj,
+                            self.metalfx.reproject_matrix() * mfx_view_proj,
+                            true,
+                        )
+                    })
+                    .flatten();
                 let fg_params = mfx_fg_active.then(|| metalfx::FrameGenParams {
                     delta_time: self.frame_gen.interval_secs(),
                     near: NEAR_PLANE,
@@ -10625,13 +10677,15 @@ impl Renderer {
                     &self.queue,
                     &mut encoder,
                     &mut pending_cmds,
-                    &picture,
+                    Some(&picture),
                     &pack_depth,
                     opaque_depth.as_ref(),
+                    obj_motion.as_ref(),
                     (!pipelined_offscreen).then_some(&view_target),
                     fg_params,
                     [self.config.width, self.config.height],
                     true,
+                    self.own_timing.as_mut(),
                 );
             }
             self.pack_post = Some((dimension, Some(post)));
@@ -10706,6 +10760,21 @@ impl Renderer {
                     .world_post
                     .size()
                     .unwrap_or([self.config.width, self.config.height]);
+                let obj_motion = (mfx_tracks_motion && !self.metalfx.history_reset())
+                    .then(|| {
+                        self.frame_gen.draw_object_motion(
+                            &self.device,
+                            &self.queue,
+                            &mut encoder,
+                            depth,
+                            render_size,
+                            jittered,
+                            view_proj,
+                            self.metalfx.reproject_matrix() * view_proj,
+                            false,
+                        )
+                    })
+                    .flatten();
                 let fg_params = mfx_fg_active.then(|| metalfx::FrameGenParams {
                     delta_time: self.frame_gen.interval_secs(),
                     near: NEAR_PLANE,
@@ -10713,18 +10782,38 @@ impl Renderer {
                     fov_degrees: frame.fov_degrees,
                     render_size,
                 });
+                // When Frame Gen is ON without MetalFX Upscaling in Vanilla, run `world_post.finish`
+                // directly into `real_cache[curr_idx]` so TAA and FXAA stay 100% functional (A4).
+                let src_color = if mfx_fg_active && !mfx_active {
+                    let real_target = self.metalfx.begin_frame_gen_real_target(
+                        &self.device,
+                        render_size,
+                        [self.config.width, self.config.height],
+                    );
+                    self.world_post.finish(
+                        &self.queue,
+                        &mut encoder,
+                        &real_target,
+                        self.own_timing.as_mut(),
+                    );
+                    None
+                } else {
+                    Some(color)
+                };
                 fg_made = self.metalfx.finish_with_frame_gen(
                     &self.device,
                     &self.queue,
                     &mut encoder,
                     &mut pending_cmds,
-                    color,
+                    src_color,
                     depth,
                     None,
+                    obj_motion.as_ref(),
                     (!pipelined_offscreen).then_some(&view_target),
                     fg_params,
                     [self.config.width, self.config.height],
                     false,
+                    self.own_timing.as_mut(),
                 );
             } else {
                 self.world_post.finish(
@@ -10775,8 +10864,9 @@ impl Renderer {
         let real_hand_vertex = ((world_quads + additive_quads) * 4) as i32;
         if mfx_interpolated {
             if real_hand_quads > 0
-                && let Some((interp_view, real_display_view)) =
-                    self.metalfx.prepare_vanilla_hand_targets(&mut encoder)
+                && let Some((interp_view, real_display_view)) = self
+                    .metalfx
+                    .prepare_vanilla_hand_targets(&self.device, &mut encoder)
             {
                 let stamp_hand = |encoder: &mut wgpu::CommandEncoder,
                                   target: &wgpu::TextureView,
@@ -10829,6 +10919,26 @@ impl Renderer {
             }
         }
         let readback = if pipelined_offscreen {
+            // Blit glowing entity outlines onto both cached offscreen targets so Spectral outlines
+            // stay visible under pipelined Frame Generation (A3).
+            if let Some((real_view, interp_view)) = self.metalfx.offscreen_world_targets() {
+                self.entity_outline.draw(
+                    &mut encoder,
+                    &real_view,
+                    &self.entity_group,
+                    &self.indices,
+                    &self.entity_buffer,
+                    self.own_timing.as_mut(),
+                );
+                self.entity_outline.draw(
+                    &mut encoder,
+                    &interp_view,
+                    &self.entity_group,
+                    &self.indices,
+                    &self.entity_buffer,
+                    None,
+                );
+            }
             None
         } else {
             let overlay = Overlay {
@@ -10925,6 +11035,10 @@ impl Renderer {
             && !first_frame
             && !reconfigure
             && self.hdr_marker.is_none()
+            && !self
+                .own_timing
+                .as_ref()
+                .is_some_and(pack_timing::PassTiming::recording)
             && (surface_frame.is_none() || self.config.present_mode != wgpu::PresentMode::Fifo)
         {
             let offscreen = surface_frame.is_none();
@@ -11301,6 +11415,11 @@ impl Renderer {
         // GameRenderer.render3dHud: the debug crosshair after the hand and
         // the screen effects.
         if overlay.crosshair > 0 {
+            if let Some(t) = timing.as_mut()
+                && t.recording()
+            {
+                t.mark(&self.device, encoder, (view_target, self.frame_format));
+            }
             let attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: view_target,
                 resolve_target: None,
@@ -11346,9 +11465,9 @@ impl Renderer {
         if let Some(radius) = menu_blur {
             let format = self.frame_format;
             let device = &self.device;
-            let software = is_software(self.info.device_type);
+            let half = is_software(self.info.device_type) || cfg!(target_os = "ios");
             self.menu_blur
-                .get_or_insert_with(|| crate::menu_blur::MenuBlur::new(device, format, software))
+                .get_or_insert_with(|| crate::menu_blur::MenuBlur::new(device, format, half))
                 .apply(
                     &self.device,
                     &self.queue,
@@ -11375,6 +11494,164 @@ impl Renderer {
             self.own_timing = timing;
         }
         readback
+    }
+
+    /// Uploads overlay buffers (screen effects, 3D F3 crosshair, HUD) before the blit pass on
+    /// Frame Generation Odd Tick and Even Tick Step A so all copies land before the first pass.
+    fn prepare_pipelined_overlay(&mut self, encoder: &mut wgpu::CommandEncoder, frame: &Frame<'_>) {
+        if frame.menu_blur.is_none()
+            && let Some(blur) = &mut self.menu_blur
+        {
+            blur.release();
+        }
+        if !frame.screen.is_empty() {
+            let vertices: Vec<crate::screen_effects::ScreenVertex> =
+                frame.screen.iter().flat_map(|q| q.vertices).collect();
+            if vertices.len() as u64 > self.screen_capacity {
+                self.screen_capacity = (vertices.len() as u64).next_power_of_two();
+                self.screen_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Screen effect vertices"),
+                    size: self.screen_capacity
+                        * std::mem::size_of::<crate::screen_effects::ScreenVertex>() as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            self.uploads.buffer(
+                encoder,
+                &self.screen_buffer,
+                0,
+                bytemuck::cast_slice(&vertices),
+            );
+        }
+        if !frame.debug_crosshair.is_empty() {
+            let needed = frame.debug_crosshair.len() as u64;
+            if needed > self.debug_line_capacity {
+                self.debug_line_capacity = needed.next_power_of_two();
+                self.debug_line_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Debug lines"),
+                    size: 32 * self.debug_line_capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            self.uploads.buffer(
+                encoder,
+                &self.debug_line_buffer,
+                0,
+                bytemuck::cast_slice(frame.debug_crosshair),
+            );
+            let view = self.views(frame).primary().view;
+            let hand_projection = Mat4::from_cols_array(&crate::camera::hand_projection(
+                frame.hand_fov_degrees,
+                self.config.width as f32,
+                self.config.height.max(1) as f32,
+                frame.depth_far,
+            ));
+            let crosshair_globals = Globals {
+                view_proj: (hand_projection * view).to_cols_array_2d(),
+                outline_params: outline_params(self.config.width, self.config.height),
+                ..bytemuck::Zeroable::zeroed()
+            };
+            self.uploads.buffer(
+                encoder,
+                &self.crosshair_globals,
+                0,
+                bytemuck::bytes_of(&crosshair_globals),
+            );
+        }
+        self.hud.prepare(
+            &self.device,
+            &mut self.uploads,
+            encoder,
+            frame.hud,
+            [self.config.width, self.config.height],
+        );
+    }
+
+    /// Draws screen effects (spyglass, fire, underwater tint, pumpkin, portal, vignette),
+    /// 3D F3 crosshair, and HUD onto `view_target` for Frame Generation Odd Tick & Even Step A.
+    fn draw_pipelined_overlay(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view_target: &wgpu::TextureView,
+        frame: &Frame<'_>,
+        record_timing: bool,
+    ) {
+        let mut timing = if record_timing {
+            self.own_timing.take()
+        } else {
+            None
+        };
+        if !frame.screen.is_empty() {
+            let attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: view_target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Screen effects"),
+                timestamp_writes: timing.as_mut().and_then(|t| t.writes("Screen effects")),
+                color_attachments: &attachments,
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &self.entity_group, &[]);
+            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.screen_buffer.slice(..));
+            for (i, quad) in frame.screen.iter().enumerate() {
+                let blend = match quad.blend {
+                    crate::screen_effects::Blend::Alpha => 0,
+                    crate::screen_effects::Blend::Vignette => 4,
+                };
+                pass.set_pipeline(&self.screen_pipelines[blend + (quad.sampling & 3) as usize]);
+                pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
+            }
+        }
+        if !frame.debug_crosshair.is_empty() {
+            let attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: view_target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("3d crosshair"),
+                timestamp_writes: timing.as_mut().and_then(|t| t.writes("Crosshair")),
+                color_attachments: &attachments,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.debug_lines_on_top);
+            pass.set_bind_group(0, &self.crosshair_group, &[]);
+            pass.set_vertex_buffer(0, self.debug_line_buffer.slice(..));
+            pass.draw(0..4, 0..frame.debug_crosshair.len() as u32);
+        }
+        self.hud.draw_range(
+            encoder,
+            view_target,
+            &self.depth,
+            frame.hud,
+            [self.config.width, self.config.height],
+            0..frame.hud.vertices.len() as u32,
+            timing.as_mut(),
+        );
+        if record_timing {
+            self.own_timing = timing;
+        }
     }
 }
 /// Out-of-memory and validation error scopes, popped together: the first error either caught.

@@ -16,6 +16,8 @@ const REPORT: usize = 30;
 const CAPACITY: u32 = 64;
 /// Timed frames each pass's median is taken over.
 const WINDOW: usize = 15;
+/// Timed frames without running before a pass is dropped from F3 (long enough for 5 Hz shadow cache).
+const STALE_AFTER: usize = 8;
 
 enum Stage {
     /// The next frame is timed.
@@ -36,8 +38,8 @@ pub struct PassTiming {
     stage: Stage,
     /// The passes of the timed frame, in order.
     names: Vec<String>,
-    /// Each pass's last `WINDOW` times, in milliseconds.
-    samples: Vec<(String, VecDeque<f32>)>,
+    /// Each pass's last `WINDOW` times in milliseconds, and the report index it last ran on.
+    samples: Vec<(String, VecDeque<f32>, usize)>,
     /// Log the medians every `REPORT` timed frames.
     log: bool,
     /// `mark`'s pipeline, for the target format it was made for.
@@ -225,6 +227,8 @@ impl PassTiming {
         drop(data);
         self.read.unmap();
         let times = pass_times(&stamps, self.period_ns);
+        self.reports += 1;
+        let report = self.reports;
         for (name, ms) in self.names.iter().zip(times) {
             let Some(ms) = ms.filter(|_| !name.is_empty()) else {
                 continue;
@@ -232,17 +236,19 @@ impl PassTiming {
             let i = match self.samples.iter().position(|s| s.0 == *name) {
                 Some(i) => i,
                 None => {
-                    self.samples.push((name.clone(), VecDeque::new()));
+                    self.samples.push((name.clone(), VecDeque::new(), report));
                     self.samples.len() - 1
                 }
             };
-            let window = &mut self.samples[i].1;
+            let (_, window, last_seen) = &mut self.samples[i];
             if window.len() == WINDOW {
                 window.pop_front();
             }
             window.push_back(ms);
+            *last_seen = report;
         }
-        self.reports += 1;
+        self.samples
+            .retain(|(_, _, last_seen)| report.saturating_sub(*last_seen) < STALE_AFTER);
         if self.log && self.reports.is_multiple_of(REPORT) {
             let medians = self.medians();
             let total: f32 = medians.iter().map(|m| m.1).sum();
@@ -263,7 +269,7 @@ impl PassTiming {
         self.samples
             .iter()
             .filter(|s| !s.1.is_empty())
-            .map(|(name, v)| {
+            .map(|(name, v, _)| {
                 let mut v: Vec<f32> = v.iter().copied().collect();
                 v.sort_by(f32::total_cmp);
                 (name.clone(), v[v.len() / 2])
@@ -312,12 +318,19 @@ fn pass_times(stamps: &[u64], period_ns: f32) -> Vec<Option<f32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::pass_times;
+    use super::{STALE_AFTER, pass_times};
 
     #[test]
     fn overlapping_passes_cost_from_the_previous_end() {
         // Pass 2 begins before pass 1 ends; pass 3 was never stamped.
         let stamps = [1_000_000, 3_000_000, 2_000_000, 5_000_000, 0, 0];
         assert_eq!(pass_times(&stamps, 1.0), [Some(2.0), Some(2.0), None]);
+    }
+
+    #[test]
+    fn stale_threshold_keeps_low_rate_shadow_passes_and_drops_closed_menu_blur() {
+        // 5 Hz shadow cache runs at least once every 4-6 timed frames, so STALE_AFTER must be
+        // larger than 4 while still expiring closed Menu blur promptly.
+        assert!(STALE_AFTER >= 6 && STALE_AFTER <= 12);
     }
 }

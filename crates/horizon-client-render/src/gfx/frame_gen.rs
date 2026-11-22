@@ -197,6 +197,52 @@ impl FrameGen {
             .track(entities, spans, camera);
     }
 
+    /// Draw per-entity motion vectors for tracked entities (players, mobs, items) when any matched
+    /// last frame. Returns `None` when no tracked entities matched so callers can skip the pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_object_motion(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        depth: &wgpu::TextureView,
+        size: [u32; 2],
+        jittered: Mat4,
+        current: Mat4,
+        previous: Mat4,
+        gl_depth_flipped: bool,
+    ) -> Option<wgpu::TextureView> {
+        let motion = self.motion.as_mut()?;
+        if !motion.has_staged() {
+            return None;
+        }
+        Some(motion.draw_with_depth_mode(
+            device,
+            queue,
+            encoder,
+            depth,
+            size,
+            jittered,
+            current,
+            previous,
+            gl_depth_flipped,
+        ))
+    }
+
+    /// Forget tracked entity vertices (e.g. on camera cut or suspend).
+    pub fn reset_object_motion(&mut self) {
+        if let Some(motion) = &mut self.motion {
+            motion.reset();
+        }
+    }
+
+    /// Release transient motion buffers on low-memory warning.
+    pub fn release_motion(&mut self) {
+        if let Some(motion) = &mut self.motion {
+            motion.release();
+        }
+    }
+
     /// This frame's unjittered clip space to the last frame's, from their `view_proj`s
     /// (relative to `camera`); `None` on the first frame.
     pub fn camera_motion(&mut self, view_proj: Mat4, camera: DVec3) -> Option<Mat4> {

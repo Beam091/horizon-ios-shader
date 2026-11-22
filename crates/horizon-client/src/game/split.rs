@@ -858,6 +858,24 @@ impl ApplicationHandler for Split<'_> {
         }
     }
 
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        for i in (0..self.players()).rev() {
+            if let Some((player, _)) = self.player(i) {
+                player.suspended(event_loop);
+            }
+        }
+        self.turn(0);
+    }
+
+    fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
+        for i in 0..self.players() {
+            if let Some((player, _)) = self.player(i) {
+                player.memory_warning(event_loop);
+            }
+        }
+        self.turn(0);
+    }
+
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         for i in (0..self.players()).rev() {
             if let Some((player, _)) = self.player(i) {

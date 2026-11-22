@@ -690,6 +690,15 @@ pub(super) fn set_shader_half_buffers(on: bool) -> bool {
     SHADER_HALF_BUFFERS.swap(on, std::sync::atomic::Ordering::Relaxed) != on
 }
 
+/// Optional upper cap on shader pack `shadowMapResolution` (0 = native pack resolution).
+static SHADOW_RESOLUTION_CAP: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(if cfg!(target_os = "ios") { 1024 } else { 0 });
+
+pub(super) fn set_shadow_resolution_cap(cap: Option<u32>) -> bool {
+    let v = cap.unwrap_or(0);
+    SHADOW_RESOLUTION_CAP.swap(v, std::sync::atomic::Ordering::Relaxed) != v
+}
+
 /// The wgpu format of a pack format (6.7), the nearest one wgpu can render to.
 fn texture_format(f: Format, features: wgpu::Features) -> wgpu::TextureFormat {
     use wgpu::TextureFormat as T;
@@ -2078,7 +2087,11 @@ impl PackPost {
             notes.push("size.buffer.colortex0: colortex0 keeps the render size".into());
         }
         let textures = pack_textures::upload(device, queue, post.textures, &mut notes);
-        let shadow_config = post.config.shadow.clone();
+        let mut shadow_config = post.config.shadow.clone();
+        let shadow_cap = SHADOW_RESOLUTION_CAP.load(std::sync::atomic::Ordering::Relaxed);
+        if shadow_cap > 0 && shadow_config.resolution > shadow_cap {
+            shadow_config.resolution = shadow_cap;
+        }
         // shadowcolor2 to 7 only for a pack that names `HIGHER_SHADOWCOLOR`.
         let shadow_colors = (1u16 << post.shadow_colors) - 1;
         let mut custom = post.custom;
@@ -4339,7 +4352,7 @@ impl PackPost {
             .is_some_and(|entities| entities.geometry.draws.iter().any(|draw| draw.shadow));
         let allow_entity_reuse = cfg!(target_os = "ios") || divisor >= 2;
         let cache_hit = (!has_shadow_entities || allow_entity_reuse)
-            && self.images.is_empty()
+            && !self.shadow_touches_images()
             && self.shadow_cache.key == Some(cache_key)
             && self.shadow_targets.is_some();
         if cache_hit {
@@ -4349,6 +4362,28 @@ impl PackPost {
         }
         self.draw_shadow_pass(device, queue, encoder, terrain);
         self.shadow_cache.key = self.shadow_targets.is_some().then_some(cache_key);
+    }
+
+    /// True only when a shadow pass (`shadow`, `shadow_water`, `shadowcomp`, or shadow entities)
+    /// actually binds or snapshots a custom shader-pack image, allowing Shadow Cache and Shadow
+    /// Update Rate to work on modern packs whose custom images live in composite/deferred passes.
+    fn shadow_touches_images(&self) -> bool {
+        if self.images.is_empty() {
+            return false;
+        }
+        fn touches(pass: &Pass) -> bool {
+            !pass.images.is_empty()
+                || pass.image_copies != 0
+                || pass.snapshots != 0
+                || pass.compute.iter().any(touches)
+        }
+        self.shadow_terrain.as_ref().is_some_and(touches)
+            || self.shadow_water.as_ref().is_some_and(touches)
+            || self.shadow_comp.iter().any(touches)
+            || self
+                .entities
+                .as_ref()
+                .is_some_and(|e| e.shadow.iter().flatten().any(touches))
     }
 
     /// The shadow pass body: terrain, entities, clears, and `shadowcomp`.

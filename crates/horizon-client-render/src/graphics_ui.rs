@@ -8,7 +8,7 @@ use crate::{
     graphics::{
         EntityCullingMode, FarDetail, FrameGeneration, GraphicsApi, LeafCullingMode, MetalFxFactor,
         MetalFxMode, MetalFxPreset, Overlay, OverlayCorner, Pacing, ParticleCullingMode,
-        PresentMode, Preset, ShadowUpdateRate, Upscaling,
+        PresentMode, Preset, ShadowResolutionCap, ShadowUpdateRate, Upscaling,
     },
     graphics_style::{self as style, Cost},
     hud::{HudAtlas, HudBatch},
@@ -106,6 +106,7 @@ pub enum H {
     MetalFxPreset,
     ShaderHalfBuffers,
     ShadowUpdateRate,
+    ShadowResolutionCap,
     ScreenshotQuality,
     FrameGeneration,
     Hdr,
@@ -549,6 +550,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         "How often shader shadows redraw (20/10/5 Hz saves GPU time).",
                     ),
                     h(
+                        H::ShadowResolutionCap,
+                        Saves,
+                        "Caps shader shadow map size (1024 cuts GPU load 2-3x on mobile).",
+                    ),
+                    h(
                         H::ShaderHalfBuffers,
                         Saves,
                         "Uses 16-bit shader buffers instead of 32-bit for faster GPUs.",
@@ -960,6 +966,9 @@ impl H {
             ),
             H::ShaderHalfBuffers => labelled("16-bit Shader Buffers", on_off(g.shader_half_buffers)),
             H::ShadowUpdateRate => labelled("Shadow Update Rate", g.shadow_update_rate.label()),
+            H::ShadowResolutionCap => {
+                labelled("Shadow Resolution Cap", g.shadow_resolution_cap.label())
+            }
             H::ScreenshotQuality => {
                 labelled("Screenshot Quality", format!("{}x", g.screenshot_quality))
             }
@@ -1167,6 +1176,10 @@ impl H {
                 if g.shadow_update_rate != ShadowUpdateRate::EveryFrame {
                     g.shadow_cache = true;
                 }
+            }
+            H::ShadowResolutionCap => {
+                g.shadow_resolution_cap =
+                    step(&ShadowResolutionCap::ALL, g.shadow_resolution_cap, back);
             }
             H::ScreenshotQuality => {
                 g.screenshot_quality = step(
@@ -1408,6 +1421,7 @@ impl Item {
                         | H::BatteryMode
                         | H::ShadowCache
                         | H::ShadowUpdateRate
+                        | H::ShadowResolutionCap
                         | H::ShaderHalfBuffers
                         | H::MetalFxSpatial
                         | H::MetalFxTemporal

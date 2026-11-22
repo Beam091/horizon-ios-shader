@@ -16,6 +16,7 @@ struct Params {
     jittered: [[f32; 4]; 4],
     current: [[f32; 4]; 4],
     previous: [[f32; 4]; 4],
+    flags: [f32; 4],
 }
 
 /// A vertex this frame and where it was last frame, both relative to this frame's camera.
@@ -145,6 +146,18 @@ impl ObjectMotion {
         self.camera = camera;
     }
 
+    /// Whether any entity vertices matched last frame and are ready to draw.
+    pub fn has_staged(&self) -> bool {
+        !self.staged.is_empty()
+    }
+
+    /// Release cached render target and tracked entity state (e.g. on memory warning).
+    pub fn release(&mut self) {
+        self.target = None;
+        self.tracked.clear();
+        self.staged.clear();
+    }
+
     /// Draw the matched entities' motion vectors at `size` (the world's render size),
     /// where `depth` (the world's) shows them; the rest of the texture is 0.
     #[allow(clippy::too_many_arguments)]
@@ -158,6 +171,26 @@ impl ObjectMotion {
         jittered: Mat4,
         current: Mat4,
         previous: Mat4,
+    ) -> wgpu::TextureView {
+        self.draw_with_depth_mode(
+            device, queue, encoder, depth, size, jittered, current, previous, false,
+        )
+    }
+
+    /// Draw the matched entities' motion vectors at `size`, supporting either Vanilla reverse-Z
+    /// (`gl_depth_flipped = false`) or Shader Pack bottom-up GL depth (`gl_depth_flipped = true`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_with_depth_mode(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        depth: &wgpu::TextureView,
+        size: [u32; 2],
+        jittered: Mat4,
+        current: Mat4,
+        previous: Mat4,
+        gl_depth_flipped: bool,
     ) -> wgpu::TextureView {
         if self.target.as_ref().is_none_or(|t| t.0 != size) {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -190,6 +223,7 @@ impl ObjectMotion {
             jittered: jittered.to_cols_array_2d(),
             current: current.to_cols_array_2d(),
             previous: previous.to_cols_array_2d(),
+            flags: [if gl_depth_flipped { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {

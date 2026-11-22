@@ -541,6 +541,7 @@ impl Game<'_> {
                 s.horizon.metalfx_factor,
             );
             r.set_shader_half_buffers(s.horizon.shader_half_buffers);
+            r.set_shadow_resolution_cap(s.horizon.shadow_resolution_cap);
             r.set_frame_generation(s.horizon.frame_generation);
             r.set_hdr_lighting(s.horizon.hdr_lighting);
             // Where it is offered (`Renderer::gpu_culling_offer`); unchanged, it does nothing.

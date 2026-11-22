@@ -839,6 +839,55 @@ impl ShadowUpdateRate {
     }
 }
 
+/// Upper resolution cap for shader pack shadow maps (`shadowMapResolution`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShadowResolutionCap {
+    #[default]
+    Native,
+    R1024,
+    R768,
+    R512,
+}
+impl ShadowResolutionCap {
+    pub const ALL: [ShadowResolutionCap; 4] = [
+        ShadowResolutionCap::Native,
+        ShadowResolutionCap::R1024,
+        ShadowResolutionCap::R768,
+        ShadowResolutionCap::R512,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            ShadowResolutionCap::Native => "native",
+            ShadowResolutionCap::R1024 => "1024",
+            ShadowResolutionCap::R768 => "768",
+            ShadowResolutionCap::R512 => "512",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ShadowResolutionCap::Native => "Native",
+            ShadowResolutionCap::R1024 => "1024",
+            ShadowResolutionCap::R768 => "768",
+            ShadowResolutionCap::R512 => "512",
+        }
+    }
+    /// Maximum shadow map side length in pixels, or `None` for the pack's native resolution.
+    pub fn max_pixels(self) -> Option<u32> {
+        match self {
+            ShadowResolutionCap::Native => None,
+            ShadowResolutionCap::R1024 => Some(1024),
+            ShadowResolutionCap::R768 => Some(768),
+            ShadowResolutionCap::R512 => Some(512),
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|r| r.name() == s)
+            .unwrap_or_default()
+    }
+}
+
 static REDUCED_SUGGESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DISPLAY_HEIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Records the display's native vertical pixel height for MetalFX preset clamping.
@@ -1103,6 +1152,8 @@ pub struct Graphics {
     pub shader_half_buffers: bool,
     /// Shader pack shadow map update cadence (`EveryFrame`, `Hz20`, `Hz10`, `Hz5`).
     pub shadow_update_rate: ShadowUpdateRate,
+    /// Upper cap on shader pack shadow map resolution (`Native`, `1024`, `768`, `512`).
+    pub shadow_resolution_cap: ShadowResolutionCap,
     /// F2 screenshots at this many times the game's resolution: 1, 2, 4 or 8.
     pub screenshot_quality: u32,
     /// Frame generation (Horizon setting), off by default.
@@ -1213,6 +1264,11 @@ impl Default for Graphics {
                 ShadowUpdateRate::Hz20
             } else {
                 ShadowUpdateRate::EveryFrame
+            },
+            shadow_resolution_cap: if cfg!(target_os = "ios") {
+                ShadowResolutionCap::R1024
+            } else {
+                ShadowResolutionCap::Native
             },
             screenshot_quality: 1,
             frame_generation: FrameGeneration::Off,
@@ -1367,6 +1423,9 @@ impl Graphics {
                 "metalfxFactor" => g.metalfx_factor = MetalFxFactor::parse(value),
                 "shaderHalfBuffers" => g.shader_half_buffers = flag(g.shader_half_buffers),
                 "shadowUpdateRate" => g.shadow_update_rate = ShadowUpdateRate::parse(value),
+                "shadowResolutionCap" => {
+                    g.shadow_resolution_cap = ShadowResolutionCap::parse(value)
+                }
                 "screenshotQuality" => {
                     g.screenshot_quality = Some(number(0))
                         .filter(|q| SCREENSHOT_QUALITIES.contains(q))
@@ -1477,12 +1536,13 @@ impl Graphics {
             bool_text(self.gpu_culling),
         );
         text += &format!(
-            "metalfxMode:{}\nmetalfxPreset:{}\nmetalfxFactor:{}\nshaderHalfBuffers:{}\nshadowUpdateRate:{}\noverlayCorner:{}\noverlayScale:{}\n",
+            "metalfxMode:{}\nmetalfxPreset:{}\nmetalfxFactor:{}\nshaderHalfBuffers:{}\nshadowUpdateRate:{}\nshadowResolutionCap:{}\noverlayCorner:{}\noverlayScale:{}\n",
             self.metalfx_mode.name(),
             self.metalfx_preset.name(),
             self.metalfx_factor.name(),
             bool_text(self.shader_half_buffers),
             self.shadow_update_rate.name(),
+            self.shadow_resolution_cap.name(),
             self.overlay_corner.name(),
             self.overlay_scale,
         );
@@ -1658,6 +1718,7 @@ mod tests {
             metalfx_factor: MetalFxFactor::X3,
             shader_half_buffers: true,
             shadow_update_rate: ShadowUpdateRate::Hz10,
+            shadow_resolution_cap: ShadowResolutionCap::R768,
             screenshot_quality: 4,
             frame_generation: FrameGeneration::Fsr31,
             hdr: true,
@@ -2064,8 +2125,13 @@ mod tests {
             metalfx_preset: MetalFxPreset::P540,
             shader_half_buffers: true,
             shadow_update_rate: ShadowUpdateRate::Hz10,
+            shadow_resolution_cap: ShadowResolutionCap::R1024,
             ..Graphics::default()
         };
         assert_eq!(Graphics::parse(&g.serialize()), g);
+        assert_eq!(ShadowResolutionCap::Native.max_pixels(), None);
+        assert_eq!(ShadowResolutionCap::R1024.max_pixels(), Some(1024));
+        assert_eq!(ShadowResolutionCap::R768.max_pixels(), Some(768));
+        assert_eq!(ShadowResolutionCap::R512.max_pixels(), Some(512));
     }
 }

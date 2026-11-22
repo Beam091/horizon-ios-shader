@@ -3121,6 +3121,9 @@ struct Game<'a> {
     options_to_world_options: bool,
     /// HDR's settings opened with their key from the game: Done returns to the game.
     options_to_game: bool,
+    /// True while iOS has backgrounded the app (`ApplicationHandler::suspended`): halts redraws
+    /// and GPU command submission until `resumed`.
+    suspended: bool,
     command_block_screen: Option<command_blocks::CommandBlockScreen>,
     block_editor: Option<block_editor::BlockEditScreen>,
     /// `StructureTemplateManager.structureRepository`: the templates in memory
@@ -11354,7 +11357,15 @@ impl Game<'_> {
         // In first person only a shader pack's shadow pass draws the player.
         self.mark_player(out.len(), !self.own_body_in_view());
         let player_start = out.len();
+        if self.own_body_in_view() {
+            // Stable motion ID distinct from world entity IDs so Frame Generation tracks the
+            // local player's body and limbs in 3rd-person back/front view without snapping.
+            self.mark_motion(player_start, u64::MAX - 1);
+        }
         self.player_model_geometry(camera, self.clock.camera_fraction(), &mut out);
+        if self.own_body_in_view() {
+            self.mark_motion(out.len(), 0);
+        }
         // A native pack has no per-entity draws to hide it with: its shadow pass alone gets
         // the first-person model.
         if self.pack_ids.is_none() && !self.own_body_in_view() {
@@ -16429,11 +16440,23 @@ impl Game<'_> {
         self.resolve_inline_profiles(&hud.inline_profiles);
         self.locator_camera =
             (!title).then_some((camera.to_array(), view_yaw, view_pitch, fov_degrees));
-        let requested_post_effects = self.requested_post_effects();
-        self.view_frustum = self
+        let menu_blur = self.menu_blur();
+        let odd_fg_tick = self
             .renderer
             .as_ref()
-            .map(|r| r.camera_frustum(fov_degrees, yaw, pitch, bob * spin, depth_far));
+            .is_some_and(|r| r.will_present_odd_frame_gen_tick(title, menu_blur.is_some()));
+        let skip_3d = title || odd_fg_tick;
+        let requested_post_effects = if odd_fg_tick {
+            Vec::new()
+        } else {
+            self.requested_post_effects()
+        };
+        if !odd_fg_tick {
+            self.view_frustum = self
+                .renderer
+                .as_ref()
+                .map(|r| r.camera_frustum(fov_degrees, yaw, pitch, bob * spin, depth_far));
+        }
         // Keep the buffer local while builders need mutable access to the game.
         let mut entities = std::mem::take(&mut self.entity_vertices);
         entities.clear();
@@ -16443,7 +16466,7 @@ impl Game<'_> {
         self.see_through_vertices.clear();
         self.glowing_vertices.get_mut().clear();
         self.shadow_only_vertices.get_mut().clear();
-        if !title {
+        if !skip_3d {
             let (built, static_sections, visible_static_sections, static_stats) =
                 spans::time("entity_geometry", || {
                     self.entity_geometry(camera, alpha, fov_degrees, entities)
@@ -16452,14 +16475,14 @@ impl Game<'_> {
             static_block_entities = static_sections;
             visible_static_block_entity_sections = visible_static_sections;
             static_block_entity_stats = static_stats;
-        } else {
+        } else if title {
             // No level behind the panorama, so no entity either: the GPU path's
             // draws are started by `begin_skinning`, which only `entity_geometry`
             // runs, and would otherwise stay those of the last world frame and
             // be drawn over the title (#8192). Its models stay stored.
             self.skin_frame.get_mut().clear_draws();
         }
-        let bolts = if title {
+        let bolts = if skip_3d {
             Vec::new()
         } else {
             self.bolt_instances(camera)
@@ -16467,13 +16490,13 @@ impl Game<'_> {
         let mut additive = Vec::new();
         // The dragon is drawn in every dimension, as any entity: a dragon
         // summoned outside the End (the server's AddEntity) is shown too.
-        if !title {
+        if !skip_3d {
             let mut dragon = Vec::new();
             self.dragon_geometry(camera, alpha, &mut dragon, &mut additive);
             self.dragon_fireball_geometry(camera, alpha, &mut dragon);
             entities.extend(dragon);
         }
-        let (celestial, stars) = if title {
+        let (celestial, stars) = if skip_3d {
             (Vec::new(), None)
         } else if self.dim == Dim::Overworld
             && self.potions.effects.get("darkness").is_none()
@@ -16486,14 +16509,14 @@ impl Game<'_> {
         } else {
             (Vec::new(), None)
         };
-        let (mut hand, hand_items) = if title || self.scoping() {
+        let (mut hand, hand_items) = if skip_3d || self.scoping() {
             Default::default()
         } else {
             self.hand_geometry(camera_alpha)
         };
         // GameRenderer.render3dHud: the screen effects after the hand, in
         // its pass (the hand pass draws with `bob * view`).
-        if !title {
+        if !skip_3d {
             let view = bob * horizon_client::camera::view_matrix(yaw, pitch);
             let aspect = size[0] as f32 / size[1].max(1) as f32;
             self.item_activation_geometry(camera_alpha as f32, view, aspect, &mut hand);
@@ -16508,25 +16531,25 @@ impl Game<'_> {
                 .unwrap_or(1.0) as f32;
             self.screen_quads(alpha as f32, size, scale)
         };
-        if !title {
+        if !skip_3d {
             self.end_geometry(camera, &mut entities);
+            self.outline_fill(&outline, camera, &mut entities);
         }
-        self.outline_fill(&outline, camera, &mut entities);
-        let weather = if !title && self.can_have_weather() && self.settings.horizon.weather {
+        let weather = if !skip_3d && self.can_have_weather() && self.settings.horizon.weather {
             horizon_client::spans::time("weather", || self.weather_geometry(camera, alpha))
         } else {
             Vec::new()
         };
-        let border = (!title)
+        let border = (!skip_3d)
             .then(|| self.border_draw(camera.to_array(), alpha as f32))
             .flatten();
         let see_through = std::mem::take(&mut self.see_through_vertices);
         if title {
             self.dynamic_lights.clear();
-        } else {
+        } else if !odd_fg_tick {
             self.gather_dynamic_lights(camera, alpha);
         }
-        let pack_inputs = if title {
+        let pack_inputs = if skip_3d {
             Default::default()
         } else {
             self.shader_pack_inputs(camera, alpha as f32, &sky)
@@ -16561,7 +16584,7 @@ impl Game<'_> {
             detail_distance: (self.streaming.radius * 16) as f32,
             depth_far,
             underwater,
-            water_plane: if title
+            water_plane: if skip_3d
                 || underwater
                 || !self
                     .renderer
@@ -16607,7 +16630,7 @@ impl Game<'_> {
             hud: &hud,
             glint_alpha: self.glint_frame.alpha,
             glint_ticks: self.glint_frame.scroll_ticks(),
-            clouds: (!title
+            clouds: (!skip_3d
                 && self.dim == Dim::Overworld
                 && horizon_client::clouds::visible(&self.settings.clouds, sky.cloud_color[3]))
             .then(|| self.gui.atlas.sprites.get("horizon/white"))
@@ -16628,7 +16651,7 @@ impl Game<'_> {
             static_block_entity_stats,
             entity_motion: &entity_motion,
             entity_spans: &entity_spans,
-            skin: skin.pending().then_some(&skin),
+            skin: (!odd_fg_tick && skin.pending()).then_some(&skin),
             glowing: &glowing,
             dynamic_lights: &self.dynamic_lights,
             colored_lights: &colored_lights,
@@ -16675,7 +16698,7 @@ impl Game<'_> {
             boss_darken: self
                 .boss_overlay
                 .darken_amount(self.clock.fraction() as f32),
-            menu_blur: self.menu_blur(),
+            menu_blur,
             post_effects: horizon_client::post_chain::Request {
                 effects: &requested_post_effects,
                 root: &self.options.resources,
@@ -16716,11 +16739,12 @@ impl Game<'_> {
         let mut skin = skin;
         // The renderer took the new models when its store grew by them; otherwise they stay
         // pending, or the stores restart (`SkinModels::begin`).
-        if self
-            .renderer
-            .as_ref()
-            .and_then(|r| r.skinned_models())
-            .is_some_and(|stored| stored == skin.base + skin.new_model.len() as u32)
+        if !odd_fg_tick
+            && self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.skinned_models())
+                .is_some_and(|stored| stored == skin.base + skin.new_model.len() as u32)
         {
             skin.handed();
         }
@@ -17594,7 +17618,9 @@ fn autosave_interval(rate: f32) -> i64 {
 }
 impl ApplicationHandler for Game<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        self.suspended = false;
+        if let Some(window) = &self.window {
+            window.request_redraw();
             return;
         }
         // The Window constructor: created fullscreen when options.txt or --fullscreen says so.
@@ -17700,8 +17726,33 @@ impl ApplicationHandler for Game<'_> {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.suspended {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         follow_window_size(self.window.as_deref(), self.renderer.as_mut());
         self.idle(event_loop);
+    }
+    /// The application entered background (iOS): stop GPU submissions immediately to prevent
+    /// `kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted`, drain in-flight Metal
+    /// work, reset Frame Generation, and pause singleplayer so the integrated server autosaves.
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        self.suspended = true;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.on_suspend();
+        }
+        if let Some(server) = &self.integrated {
+            server.set_paused(true);
+        }
+        if self.screen == Screen::Playing && self.title.is_none() && self.integrated.is_some() {
+            self.screen = Screen::Paused;
+        }
+        event_loop.set_control_flow(ControlFlow::Wait);
+    }
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.release_memory();
+        }
     }
     /// The application is ending. On macOS, Quit (Cmd+Q) ends it through
     /// applicationWillTerminate without a CloseRequested; vanilla's GLFW
@@ -18988,6 +19039,9 @@ impl Game<'_> {
                     self.mapped_key_event(key, event.state == ElementState::Pressed, event.repeat)?;
                 }
                 WindowEvent::RedrawRequested => {
+                    if self.suspended {
+                        return Ok(());
+                    }
                     horizon_client::spans::time("recover_device", || self.recover_device())?;
                     self.observe_fullscreen();
                     self.sync_ime();
@@ -19832,6 +19886,7 @@ impl<'a> Game<'a> {
             world_options: None,
             options_to_world_options: false,
             options_to_game: false,
+            suspended: false,
             command_block_screen: None,
             block_editor: None,
             structure_templates: HashMap::new(),
@@ -22122,15 +22177,23 @@ impl ApplicationHandler for App {
             }
         }
     }
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        if let App::Ready(game) = self {
+            game.suspended(event_loop);
+        }
+    }
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         if let App::Ready(game) = self {
             game.exiting(event_loop);
         }
     }
-    /// iOS's low-memory notification: hand every free page the allocators hold back to the
-    /// system now, before jetsam ends the app.
-    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+    /// iOS's low-memory notification: release transient renderer caches and hand every free page
+    /// the allocators hold back to the system now, before jetsam ends the app.
+    fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
         log::warn!("Horizon: the system is low on memory; releasing free memory");
+        if let App::Ready(game) = self {
+            game.memory_warning(event_loop);
+        }
         horizon_threads::release_free_memory();
     }
 }

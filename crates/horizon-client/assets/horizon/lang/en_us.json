@@ -501,6 +501,8 @@
   "Shadow Update Rate": "Shadow Update Rate",
   "Every Frame": "Every Frame",
   "How often shader shadows redraw (20/10/5 Hz saves GPU time).": "How often shader shadows redraw (20/10/5 Hz saves GPU time).",
+  "Shadow Resolution Cap": "Shadow Resolution Cap",
+  "Caps shader shadow map size (1024 cuts GPU load 2-3x on mobile).": "Caps shader shadow map size (1024 cuts GPU load 2-3x on mobile).",
   "FPS Only": "FPS Only",
   "Overlay Corner": "Overlay Corner",
   "Which corner of the screen shows the FPS overlay.": "Which corner of the screen shows the FPS overlay.",

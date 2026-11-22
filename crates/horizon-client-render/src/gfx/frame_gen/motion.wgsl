@@ -9,6 +9,8 @@ struct Params {
     jittered: mat4x4<f32>,
     current: mat4x4<f32>,
     previous: mat4x4<f32>,
+    // x: 1.0 when `depth` is Shader Pack bottom-up GL forward-Z (`depthtex0`), 0.0 for Vanilla reverse-Z.
+    flags: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -38,8 +40,13 @@ struct Out {
 
 // xy: the motion vector in UV (to where the pixel was last frame, FSR's convention), z: 1.
 @fragment fn fs_motion(in: Out) -> @location(0) vec4<f32> {
-    let stored = textureLoad(depth, vec2<i32>(in.clip.xy), 0);
-    let tolerance = stored * 1e-3 + 1e-7;
+    let dim = vec2<i32>(textureDimensions(depth));
+    let px = clamp(vec2<i32>(in.clip.xy), vec2<i32>(0), dim - vec2<i32>(1));
+    let gl_mode = params.flags.x > 0.5;
+    let sample_p = select(px, vec2<i32>(px.x, dim.y - 1 - px.y), gl_mode);
+    let raw_stored = textureLoad(depth, sample_p, 0);
+    let stored = select(raw_stored, 1.0 - raw_stored, gl_mode);
+    let tolerance = select(stored * 1e-3 + 1e-7, stored * 4e-3 + 2e-5, gl_mode);
     // Not what the world shows here: a transparent texel, or behind something.
     if in.translucent != 0u {
         let alpha = textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0).a;

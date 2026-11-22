@@ -93,21 +93,20 @@ struct FrameGenTargets {
     real_cache: [wgpu::Texture; 2],
     real_cache_views: [wgpu::TextureView; 2],
     real_cache_blit_groups: [wgpu::BindGroup; 2],
-    /// Optional Vanilla display buffer when first-person hand is stamped over `real_cache`.
-    real_display: wgpu::Texture,
-    real_display_view: wgpu::TextureView,
-    real_display_blit_group: wgpu::BindGroup,
+    /// Lazily allocated Vanilla display buffer when first-person hand is stamped over `real_cache`.
+    real_display: Option<(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
     has_real_display: bool,
     /// Full-window interpolated halfway frame `N-0.5` (`self.format`).
     interp_cache: wgpu::Texture,
     interp_cache_view: wgpu::TextureView,
     interp_cache_blit_group: wgpu::BindGroup,
-    /// Pre-built `fs_fg_interp` bind groups for `[curr_idx = 0, curr_idx = 1]` (zero per-frame allocs!).
+    /// Pre-built `fs_fg_interp` bind groups for `[curr_idx = 0, curr_idx = 1]` using FG's own motion.
     interp_groups: [wgpu::BindGroup; 2],
+    /// Cached `fs_fg_interp` bind groups sharing `targets.motion` + `targets.reactive` when
+    /// MetalFX Temporal Upscaling + Frame Gen are both active (avoids duplicate `fs_motion`).
+    temporal_interp_groups: Option<([u32; 2], [wgpu::BindGroup; 2])>,
     motion: wgpu::Texture,
     motion_view: wgpu::TextureView,
-    depth_r32: wgpu::Texture,
-    depth_r32_view: wgpu::TextureView,
     reactive: wgpu::Texture,
     reactive_view: wgpu::TextureView,
     /// Index in `real_cache` holding the most recently rendered real frame `N`.
@@ -121,9 +120,11 @@ pub struct MetalFx {
     pub factor: MetalFxFactor,
     format: wgpu::TextureFormat,
     motion_pipeline: wgpu::RenderPipeline,
+    fg_motion_pipeline: wgpu::RenderPipeline,
     motion_layout: wgpu::BindGroupLayout,
     motion_uniform: wgpu::Buffer,
     fg_motion_uniform: wgpu::Buffer,
+    dummy_obj_motion_view: wgpu::TextureView,
     fg_interp_pipeline: wgpu::RenderPipeline,
     fg_interp_layout: wgpu::BindGroupLayout,
     fg_interp_uniform: wgpu::Buffer,
@@ -141,7 +142,7 @@ pub struct MetalFx {
     fi_shown_since: std::time::Instant,
     fi_made_share: Option<f32>,
     frame_index: u32,
-    previous_camera: Option<(DMat4, DVec3, bool)>,
+    previous_camera: Option<(DMat4, DVec3, bool, bool)>,
     jitter_px: [f32; 2],
     reproject: Mat4,
     reproject_sky: Mat4,
@@ -182,6 +183,16 @@ impl MetalFx {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -231,6 +242,53 @@ impl MetalFx {
             multiview_mask: None,
             cache: None,
         });
+        let fg_motion_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("MetalFX FG motion"),
+            layout: Some(&motion_pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_screen"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_fg_motion"),
+                compilation_options: Default::default(),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rg16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let dummy_obj_motion = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MetalFX dummy object motion"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_obj_motion_view = dummy_obj_motion.create_view(&Default::default());
 
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("MetalFX blit bindings"),
@@ -393,9 +451,11 @@ impl MetalFx {
             factor: MetalFxFactor::X2,
             format: screen_format,
             motion_pipeline,
+            fg_motion_pipeline,
             motion_layout,
             motion_uniform,
             fg_motion_uniform,
+            dummy_obj_motion_view,
             fg_interp_pipeline,
             fg_interp_layout,
             fg_interp_uniform,
@@ -423,6 +483,31 @@ impl MetalFx {
 
     pub fn active(&self) -> bool {
         self.mode != MetalFxMode::Off
+    }
+
+    /// Reprojection matrix from current unjittered clip space to previous frame's clip space.
+    pub fn reproject_matrix(&self) -> Mat4 {
+        self.reproject
+    }
+
+    /// Whether camera history was reset on this frame (teleport, F5 cut, mode switch).
+    pub fn history_reset(&self) -> bool {
+        self.reset_history
+    }
+
+    /// Releases GPU targets not currently needed (e.g. on iOS low-memory warning).
+    pub fn release_unused(&mut self, fg_active: bool) {
+        if !self.active() {
+            self.targets = None;
+        }
+        if !fg_active {
+            self.fg_targets = None;
+            self.fg_state = FgState::Empty;
+        } else if let Some(fg) = &mut self.fg_targets
+            && !fg.has_real_display
+        {
+            fg.real_display = None;
+        }
     }
 
     /// Fast ~1ms WGSL bidirectional motion-compensated Frame Generation is supported on all
@@ -461,18 +546,67 @@ impl MetalFx {
         self.fg_targets.as_ref().map(|fg| fg.interp_cache_view.clone())
     }
 
-    /// Copies the latest `real_cache[prev_idx]` into `real_display` and returns
+    /// Returns `(real_display_or_cache_view, interp_cache_view)` for offscreen post-world overlays
+    /// such as `entity_outline` in Step B.
+    pub fn offscreen_world_targets(&self) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
+        let fg = self.fg_targets.as_ref()?;
+        let real = if fg.has_real_display
+            && let Some((_, view, _)) = &fg.real_display
+        {
+            view.clone()
+        } else {
+            fg.real_cache_views[fg.prev_idx].clone()
+        };
+        Some((real, fg.interp_cache_view.clone()))
+    }
+
+    /// Lazily allocates `real_display`, copies `real_cache[prev_idx]` into it, and returns
     /// `(interp_cache_view, real_display_view)` so Vanilla first-person hand can be stamped onto
     /// both without polluting the hand-free `real_cache` used for the next frame's interpolation.
     pub fn prepare_vanilla_hand_targets(
         &mut self,
+        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
         let fg = self.fg_targets.as_mut()?;
+        if fg.real_display.is_none() {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("MetalFX FG real display"),
+                size: wgpu::Extent3d {
+                    width: fg.window_size[0].max(1),
+                    height: fg.window_size[1].max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let blit_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("MetalFX FG real display blit"),
+                layout: &self.blit_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.linear),
+                    },
+                ],
+            });
+            fg.real_display = Some((tex, view, blit_group));
+        }
+        let (_, real_display_view, _) = fg.real_display.as_ref().expect("allocated above");
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("MetalFX FG real display copy"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &fg.real_display_view,
+                view: real_display_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -487,7 +621,7 @@ impl MetalFx {
         rp.draw(0..3, 0..1);
         drop(rp);
         fg.has_real_display = true;
-        Some((fg.interp_cache_view.clone(), fg.real_display_view.clone()))
+        Some((fg.interp_cache_view.clone(), real_display_view.clone()))
     }
 
     /// Clears `has_real_display` when Shader Packs draw the hand (or hand is hidden), so Step A
@@ -495,6 +629,7 @@ impl MetalFx {
     pub fn clear_vanilla_hand_display(&mut self) {
         if let Some(fg) = &mut self.fg_targets {
             fg.has_real_display = false;
+            fg.real_display = None;
         }
     }
 
@@ -509,6 +644,7 @@ impl MetalFx {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
+        timing: Option<&mut super::pack_timing::PassTiming>,
     ) -> bool {
         if self.fg_state != FgState::ReadyInterp {
             return false;
@@ -519,6 +655,7 @@ impl MetalFx {
         };
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("MetalFX FG odd present"),
+            timestamp_writes: timing.and_then(|t| t.writes("Frame Gen present")),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: screen,
                 depth_slice: None,
@@ -544,6 +681,7 @@ impl MetalFx {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
+        timing: Option<&mut super::pack_timing::PassTiming>,
     ) -> bool {
         if self.fg_state != FgState::ReadyReal {
             return false;
@@ -552,13 +690,16 @@ impl MetalFx {
             self.fg_state = FgState::Empty;
             return false;
         };
-        let group = if fg.has_real_display {
-            &fg.real_display_blit_group
+        let group = if fg.has_real_display
+            && let Some((_, _, bg)) = &fg.real_display
+        {
+            bg
         } else {
             &fg.real_cache_blit_groups[fg.prev_idx]
         };
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("MetalFX FG even real present"),
+            timestamp_writes: timing.and_then(|t| t.writes("Frame Gen present")),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: screen,
                 depth_slice: None,
@@ -601,13 +742,14 @@ impl MetalFx {
     }
 
     /// Sub-pixel jitter matrix (Halton 2, 3) for `MetalFxMode::Temporal` and camera reprojection
-    /// (shared with `MTLFXFrameInterpolator`). Returns `Mat4::IDENTITY` when not Temporal, on the
+    /// (shared with Frame Generation). Returns `Mat4::IDENTITY` when not Temporal, on the
     /// title screen, or when `apply_jitter` is false (shader packs supply their own projection).
     pub fn begin_frame(
         &mut self,
         window: [u32; 2],
         world_active: bool,
         apply_jitter: bool,
+        first_person: bool,
         view_proj: Mat4,
         camera: DVec3,
     ) -> Mat4 {
@@ -622,20 +764,20 @@ impl MetalFx {
         let has_pack = !apply_jitter;
         let current = view_proj.as_dmat4();
         let (reproject, reproject_sky, reset) = match self.previous_camera {
-            Some((prev_vp, prev_cam, prev_pack)) => {
+            Some((prev_vp, prev_cam, prev_pack, prev_fp)) => {
                 let delta = camera - prev_cam;
                 let moved = delta.length_squared() > 100.0;
-                if moved || prev_pack != has_pack {
+                if moved || prev_pack != has_pack || prev_fp != first_person {
                     (DMat4::IDENTITY, DMat4::IDENTITY, true)
                 } else {
                     let current_inv = current.inverse();
                     let reproj_sky = prev_vp * current_inv;
-                    // Detect abrupt camera cuts (e.g., F5 perspective flip) where screen center
-                    // jumps far off-axis in a single frame.
+                    // Detect abrupt camera cuts (e.g., 3rd-person back -> front F5 180° flip)
+                    // where screen center jumps far off-axis in a single frame.
                     let center_prev = reproj_sky * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
                     let cut = center_prev.w <= 1e-4
-                        || (center_prev.x / center_prev.w).abs() > 1.5
-                        || (center_prev.y / center_prev.w).abs() > 1.5;
+                        || (center_prev.x / center_prev.w).abs() > 1.25
+                        || (center_prev.y / center_prev.w).abs() > 1.25;
                     if cut {
                         (DMat4::IDENTITY, DMat4::IDENTITY, true)
                     } else {
@@ -646,7 +788,7 @@ impl MetalFx {
             }
             None => (DMat4::IDENTITY, DMat4::IDENTITY, true),
         };
-        self.previous_camera = Some((current, camera, has_pack));
+        self.previous_camera = Some((current, camera, has_pack, first_person));
         self.reproject = reproject.as_mat4();
         self.reproject_sky = reproject_sky.as_mat4();
         self.reset_history = reset;
@@ -668,18 +810,6 @@ impl MetalFx {
             -offset.y * 2.0 / render_size[1].max(1) as f32,
         );
         Mat4::from_translation(clip_jitter.extend(0.0))
-    }
-
-    /// Ensures internal textures and native MetalFX scaler exist for `(render_size, output_size)`,
-    /// returning the `input_color_view` for the caller (e.g., `pack_post` final pass) to render into.
-    pub fn ensure_input_target(
-        &mut self,
-        device: &wgpu::Device,
-        window: [u32; 2],
-    ) -> &wgpu::TextureView {
-        let (input_size, output_size) = self.sizes(window);
-        self.ensure_targets(device, input_size, output_size);
-        &self.targets.as_ref().expect("targets").input_color_view
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, input_size: [u32; 2], output_size: [u32; 2]) {
@@ -704,6 +834,9 @@ impl MetalFx {
         }
         // Drop old scaler/textures first to keep peak GPU memory low on mobile.
         self.targets = None;
+        if let Some(fg) = &mut self.fg_targets {
+            fg.temporal_interp_groups = None;
+        }
         let tex = |label, size: [u32; 2], format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -862,8 +995,10 @@ impl MetalFx {
     /// Runs MetalFX (Temporal or Spatial, or WGSL CAS fallback) from `src_color` (or internal
     /// `input_color` when `src_color` is `None`) and `depth_view` onto `screen`.
     /// `opaque_depth`: optional Shader Pack `depthtex1` (pre-translucent depth) for water detection.
+    /// `object_motion`: optional per-entity motion vectors (`ObjectMotion`) for 3rd-person player/mobs.
     /// `gl_depth_flipped`: `true` for Shader Pack `depthtex0` (GL bottom-up forward-Z),
     /// `false` for Vanilla `world_depth` (top-down reverse-Z).
+    /// Returns `true` when Temporal `fs_motion` populated `targets.motion_view` & `targets.reactive_view`.
     #[allow(clippy::too_many_arguments, unused_variables)]
     pub fn finish(
         &mut self,
@@ -874,10 +1009,12 @@ impl MetalFx {
         src_color: Option<&wgpu::TextureView>,
         depth_view: &wgpu::TextureView,
         opaque_depth: Option<&wgpu::TextureView>,
+        object_motion: Option<&wgpu::TextureView>,
         screen: &wgpu::TextureView,
         window: [u32; 2],
         gl_depth_flipped: bool,
-    ) {
+        mut timing: Option<&mut super::pack_timing::PassTiming>,
+    ) -> bool {
         let (input_size, output_size) = self.sizes(window);
         self.ensure_targets(device, input_size, output_size);
         let targets = self.targets.as_mut().expect("targets");
@@ -906,6 +1043,7 @@ impl MetalFx {
             };
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX input"),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &targets.input_color_view,
                     depth_slice: None,
@@ -927,11 +1065,16 @@ impl MetalFx {
         let mut used_native = false;
         #[cfg(not(any(target_os = "ios", target_os = "macos")))]
         let used_native = false;
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        let mut ran_temporal_motion = false;
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        let ran_temporal_motion = false;
 
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         if let Some(scaler) = &targets.scaler {
             if matches!(scaler, NativeScaler::Temporal(_)) {
                 let has_opaque = opaque_depth.is_some();
+                let has_obj = object_motion.is_some();
                 let u = MotionUniform {
                     reproject: self.reproject.to_cols_array_2d(),
                     reproject_sky: self.reproject_sky.to_cols_array_2d(),
@@ -940,7 +1083,7 @@ impl MetalFx {
                     flags: [
                         if gl_depth_flipped { 1.0 } else { 0.0 },
                         if has_opaque { 1.0 } else { 0.0 },
-                        0.0,
+                        if has_obj { 1.0 } else { 0.0 },
                         0.0,
                     ],
                 };
@@ -963,6 +1106,12 @@ impl MetalFx {
                                 opaque_depth.unwrap_or(depth_view),
                             ),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(
+                                object_motion.unwrap_or(&self.dummy_obj_motion_view),
+                            ),
+                        },
                     ],
                 });
                 let clear = wgpu::Operations {
@@ -971,6 +1120,7 @@ impl MetalFx {
                 };
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("MetalFX motion"),
+                    timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
                     color_attachments: &[
                         Some(wgpu::RenderPassColorAttachment {
                             view: &targets.motion_view,
@@ -996,6 +1146,7 @@ impl MetalFx {
                 rp.set_pipeline(&self.motion_pipeline);
                 rp.set_bind_group(0, &motion_group, &[]);
                 rp.draw(0..3, 0..1);
+                ran_temporal_motion = true;
             }
 
             // wgpu-core forbids mixing wgpu render passes and `as_hal_mut` on the same
@@ -1075,6 +1226,7 @@ impl MetalFx {
         if used_native {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX present"),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: screen,
                     depth_slice: None,
@@ -1108,6 +1260,7 @@ impl MetalFx {
             });
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX CAS fallback"),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: screen,
                     depth_slice: None,
@@ -1123,6 +1276,7 @@ impl MetalFx {
             rp.set_bind_group(0, &group, &[]);
             rp.draw(0..3, 0..1);
         }
+        ran_temporal_motion
     }
 
     fn ensure_frame_gen_targets(
@@ -1184,11 +1338,6 @@ impl MetalFx {
         let rc0_blit = make_blit_group("MetalFX FG real 0 blit", &rc0_view);
         let rc1_blit = make_blit_group("MetalFX FG real 1 blit", &rc1_view);
 
-        let real_display = tex("MetalFX FG real display", window, self.format, rt_usage);
-        let real_display_view = real_display.create_view(&Default::default());
-        let real_display_blit_group =
-            make_blit_group("MetalFX FG real display blit", &real_display_view);
-
         let interp_cache = tex("MetalFX FG interp", window, self.format, rt_usage);
         let interp_cache_view = interp_cache.create_view(&Default::default());
         let interp_cache_blit_group =
@@ -1201,13 +1350,6 @@ impl MetalFx {
             rt_usage,
         );
         let motion_view = motion.create_view(&Default::default());
-        let depth_r32 = tex(
-            "MetalFX FG depth",
-            fg_size,
-            wgpu::TextureFormat::R32Float,
-            rt_usage,
-        );
-        let depth_r32_view = depth_r32.create_view(&Default::default());
         let reactive = tex(
             "MetalFX FG reactive",
             fg_size,
@@ -1216,7 +1358,11 @@ impl MetalFx {
         );
         let reactive_view = reactive.create_view(&Default::default());
 
-        let make_interp_group = |label, curr: &wgpu::TextureView, prev: &wgpu::TextureView| {
+        let make_interp_group = |label,
+                                 curr: &wgpu::TextureView,
+                                 prev: &wgpu::TextureView,
+                                 m_view: &wgpu::TextureView,
+                                 r_view: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &self.fg_interp_layout,
@@ -1231,11 +1377,11 @@ impl MetalFx {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&motion_view),
+                        resource: wgpu::BindingResource::TextureView(m_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&reactive_view),
+                        resource: wgpu::BindingResource::TextureView(r_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -1248,8 +1394,20 @@ impl MetalFx {
                 ],
             })
         };
-        let interp_group_0 = make_interp_group("MetalFX FG interp curr=0", &rc0_view, &rc1_view);
-        let interp_group_1 = make_interp_group("MetalFX FG interp curr=1", &rc1_view, &rc0_view);
+        let interp_group_0 = make_interp_group(
+            "MetalFX FG interp curr=0",
+            &rc0_view,
+            &rc1_view,
+            &motion_view,
+            &reactive_view,
+        );
+        let interp_group_1 = make_interp_group(
+            "MetalFX FG interp curr=1",
+            &rc1_view,
+            &rc0_view,
+            &motion_view,
+            &reactive_view,
+        );
 
         log::info!(
             "Horizon: pipelined GPU Frame Generation active (motion {}x{}, display {}x{})",
@@ -1265,34 +1423,48 @@ impl MetalFx {
             real_cache: [rc0, rc1],
             real_cache_views: [rc0_view, rc1_view],
             real_cache_blit_groups: [rc0_blit, rc1_blit],
-            real_display,
-            real_display_view,
-            real_display_blit_group,
+            real_display: None,
             has_real_display: false,
             interp_cache,
             interp_cache_view,
             interp_cache_blit_group,
             interp_groups: [interp_group_0, interp_group_1],
+            temporal_interp_groups: None,
             motion,
             motion_view,
-            depth_r32,
-            depth_r32_view,
             reactive,
             reactive_view,
             prev_idx: 0,
         });
     }
 
+    /// Ensures Frame Generation targets exist and returns the destination `real_cache[curr_idx]`
+    /// view so Vanilla `world_post.finish` (TAA/FXAA) can render directly into it with zero extra
+    /// blit when MetalFX Upscaling is OFF and Frame Generation is ON.
+    pub fn begin_frame_gen_real_target(
+        &mut self,
+        device: &wgpu::Device,
+        render_size: [u32; 2],
+        window: [u32; 2],
+    ) -> wgpu::TextureView {
+        self.ensure_frame_gen_targets(device, render_size, window);
+        let curr_idx = if self.fg_state == FgState::Empty {
+            0
+        } else {
+            1 - self.fg_targets.as_ref().expect("fg_targets").prev_idx
+        };
+        self.fg_targets
+            .as_ref()
+            .expect("fg_targets")
+            .real_cache_views[curr_idx]
+            .clone()
+    }
+
     /// Runs MetalFX Upscaling (if enabled) and pipelined ~1ms WGSL motion-compensated Frame
     /// Generation (no background `Presenter` thread and no slow 18ms neural FI):
-    /// - Warmup Frame 0 (`Empty`, `screen = Some`): writes Frame 0 into `real_cache[0]` and blits
-    ///   it to `screen` -> `Primed`.
-    /// - Warmup Frame 1 (`Primed`, `screen = Some`): writes Frame 1 into `real_cache[1]`, generates
-    ///   Frame 0.5 into `interp_cache`, blits 0.5 to `screen` -> `ReadyReal`.
-    /// - Steady-state Even Tick Step B (`ReadyReal`, `screen = None` because Step A already
-    ///   presented Frame `N-1`): writes Frame `N` into `real_cache[1 - prev_idx]` and generates
-    ///   Frame `N-0.5` into `interp_cache` offscreen -> `ReadyInterp` (presented on Odd Tick!).
-    /// Returns `true` when `interp_cache` holds a newly generated halfway frame `N-0.5`.
+    /// - When `src_color` is `None` and MetalFX Upscaling is OFF, caller already rendered the
+    ///   resolved real frame into `begin_frame_gen_real_target(...)` (Vanilla TAA/FXAA path).
+    /// - Returns `true` when `interp_cache` holds a newly generated halfway frame `N-0.5`.
     #[allow(clippy::too_many_arguments, unused_variables)]
     pub fn finish_with_frame_gen(
         &mut self,
@@ -1300,13 +1472,15 @@ impl MetalFx {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         pending_cmds: &mut Vec<wgpu::CommandBuffer>,
-        src_color: &wgpu::TextureView,
+        src_color: Option<&wgpu::TextureView>,
         depth_view: &wgpu::TextureView,
         opaque_depth: Option<&wgpu::TextureView>,
+        object_motion: Option<&wgpu::TextureView>,
         screen: Option<&wgpu::TextureView>,
         fg_params: Option<FrameGenParams>,
         window: [u32; 2],
         gl_depth_flipped: bool,
+        mut timing: Option<&mut super::pack_timing::PassTiming>,
     ) -> bool {
         let upscale_on = self.active();
         let Some(fg_p) = fg_params else {
@@ -1317,12 +1491,14 @@ impl MetalFx {
                     queue,
                     encoder,
                     pending_cmds,
-                    Some(src_color),
+                    src_color,
                     depth_view,
                     opaque_depth,
+                    object_motion,
                     screen,
                     window,
                     gl_depth_flipped,
+                    timing,
                 );
             }
             return false;
@@ -1342,24 +1518,27 @@ impl MetalFx {
             .expect("fg_targets")
             .real_cache_views[curr_idx]
             .clone();
+        let mut ran_temporal_motion = false;
         if upscale_on {
-            self.finish(
+            ran_temporal_motion = self.finish(
                 device,
                 queue,
                 encoder,
                 pending_cmds,
-                Some(src_color),
+                src_color,
                 depth_view,
                 opaque_depth,
+                object_motion,
                 &real_view,
                 window,
                 gl_depth_flipped,
+                timing.as_deref_mut(),
             );
-        } else {
+        } else if let Some(src) = src_color {
             self.blit_view(
                 device,
                 encoder,
-                src_color,
+                src,
                 &real_view,
                 "MetalFX FG real cache",
             );
@@ -1373,6 +1552,7 @@ impl MetalFx {
             if let Some(screen) = screen {
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("MetalFX FG prime present"),
+                    timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("Frame Gen")),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: screen,
                         depth_slice: None,
@@ -1393,43 +1573,109 @@ impl MetalFx {
             return false;
         }
 
-        // 2. Build screen-space camera motion vectors & reactive mask at `fg.size` (~0.4 ms).
-        let fg_size = self.fg_targets.as_ref().expect("fg_targets").size;
-        let has_opaque = opaque_depth.is_some();
-        let u = MotionUniform {
-            reproject: self.reproject.to_cols_array_2d(),
-            reproject_sky: self.reproject_sky.to_cols_array_2d(),
-            size: [fg_size[0] as f32, fg_size[1] as f32],
-            jitter_px: self.jitter_px,
-            flags: [
-                if gl_depth_flipped { 1.0 } else { 0.0 },
-                if has_opaque { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
-            ],
-        };
-        queue.write_buffer(&self.fg_motion_uniform, 0, bytemuck::bytes_of(&u));
-        let motion_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MetalFX FG motion"),
-            layout: &self.motion_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.fg_motion_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(
-                        opaque_depth.unwrap_or(depth_view),
-                    ),
-                },
-            ],
-        });
-        {
+        // 2. Build screen-space camera + per-entity motion vectors & reactive mask (~0.3 ms).
+        // When MetalFX Temporal already ran `fs_motion` this frame, reuse its `motion_view` and
+        // `reactive_view` directly and skip running a duplicate motion pass!
+        let use_temporal_motion = ran_temporal_motion && self.targets.is_some();
+        let motion_size = if use_temporal_motion {
+            let targets = self.targets.as_ref().expect("targets");
+            let t_size = targets.input_size;
+            let fg = self.fg_targets.as_mut().expect("fg_targets");
+            if fg
+                .temporal_interp_groups
+                .as_ref()
+                .is_none_or(|(s, _)| *s != t_size)
+            {
+                let make_group = |label, curr: &wgpu::TextureView, prev: &wgpu::TextureView| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout: &self.fg_interp_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(curr),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(prev),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&targets.motion_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &targets.reactive_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::Sampler(&self.linear),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: self.fg_interp_uniform.as_entire_binding(),
+                            },
+                        ],
+                    })
+                };
+                let g0 = make_group(
+                    "MetalFX FG temporal interp curr=0",
+                    &fg.real_cache_views[0],
+                    &fg.real_cache_views[1],
+                );
+                let g1 = make_group(
+                    "MetalFX FG temporal interp curr=1",
+                    &fg.real_cache_views[1],
+                    &fg.real_cache_views[0],
+                );
+                fg.temporal_interp_groups = Some((t_size, [g0, g1]));
+            }
+            t_size
+        } else {
+            let fg_size = self.fg_targets.as_ref().expect("fg_targets").size;
+            let has_opaque = opaque_depth.is_some();
+            let has_obj = object_motion.is_some();
+            let u = MotionUniform {
+                reproject: self.reproject.to_cols_array_2d(),
+                reproject_sky: self.reproject_sky.to_cols_array_2d(),
+                size: [fg_size[0] as f32, fg_size[1] as f32],
+                jitter_px: self.jitter_px,
+                flags: [
+                    if gl_depth_flipped { 1.0 } else { 0.0 },
+                    if has_opaque { 1.0 } else { 0.0 },
+                    if has_obj { 1.0 } else { 0.0 },
+                    0.0,
+                ],
+            };
+            queue.write_buffer(&self.fg_motion_uniform, 0, bytemuck::bytes_of(&u));
+            let motion_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("MetalFX FG motion"),
+                layout: &self.motion_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.fg_motion_uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            opaque_depth.unwrap_or(depth_view),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            object_motion.unwrap_or(&self.dummy_obj_motion_view),
+                        ),
+                    },
+                ],
+            });
             let fg = self.fg_targets.as_ref().expect("fg_targets");
             let clear = wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1437,15 +1683,10 @@ impl MetalFx {
             };
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FG motion"),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("Frame Gen")),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
                         view: &fg.motion_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: clear,
-                    }),
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &fg.depth_r32_view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: clear,
@@ -1459,16 +1700,17 @@ impl MetalFx {
                 ],
                 ..Default::default()
             });
-            rp.set_pipeline(&self.motion_pipeline);
+            rp.set_pipeline(&self.fg_motion_pipeline);
             rp.set_bind_group(0, &motion_group, &[]);
             rp.draw(0..3, 0..1);
-        }
+            fg_size
+        };
 
         // 3. Single-pass bidirectional motion-compensated interpolation -> `interp_cache` (~0.6 ms).
         let interp_u = FgInterpUniform {
             params: [
-                1.0 / fg_size[0].max(1) as f32,
-                1.0 / fg_size[1].max(1) as f32,
+                1.0 / motion_size[0].max(1) as f32,
+                1.0 / motion_size[1].max(1) as f32,
                 if self.reset_history { 1.0 } else { 0.0 },
                 0.0,
             ],
@@ -1476,8 +1718,16 @@ impl MetalFx {
         queue.write_buffer(&self.fg_interp_uniform, 0, bytemuck::bytes_of(&interp_u));
         {
             let fg = self.fg_targets.as_ref().expect("fg_targets");
+            let interp_group = if use_temporal_motion
+                && let Some((_, groups)) = &fg.temporal_interp_groups
+            {
+                &groups[curr_idx]
+            } else {
+                &fg.interp_groups[curr_idx]
+            };
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FG interpolate"),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("Frame Gen")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &fg.interp_cache_view,
                     depth_slice: None,
@@ -1490,7 +1740,7 @@ impl MetalFx {
                 ..Default::default()
             });
             rp.set_pipeline(&self.fg_interp_pipeline);
-            rp.set_bind_group(0, &fg.interp_groups[curr_idx], &[]);
+            rp.set_bind_group(0, interp_group, &[]);
             rp.draw(0..3, 0..1);
         }
 
@@ -1503,6 +1753,7 @@ impl MetalFx {
             // next tick enters pipelined steady state (`ReadyReal`).
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FG sync present"),
+                timestamp_writes: timing.and_then(|t| t.writes("Frame Gen")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: screen,
                     depth_slice: None,

@@ -58,3 +58,46 @@ pub fn open_url(uri: &str) {
         }
     }
 }
+
+/// Open a local folder in the iOS Files app via `shareddocuments://`.
+pub fn open_folder(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(path) = std::path::absolute(dir) else {
+        return;
+    };
+    let Some(path_str) = path.to_str() else {
+        return;
+    };
+    let ns_path = NSString::from_str(path_str);
+    // SAFETY: Standard Foundation/UIKit calls to convert a local directory path to a properly
+    // percent-encoded `file://` URL string, swap the scheme to `shareddocuments://`, and ask
+    // UIApplication to open it in the Files app.
+    unsafe {
+        let file_url: Option<Retained<AnyObject>> =
+            msg_send![class!(NSURL), fileURLWithPath: &*ns_path, isDirectory: true];
+        let Some(file_url) = file_url else {
+            return;
+        };
+        let abs: Option<Retained<NSString>> = msg_send![&*file_url, absoluteString];
+        let Some(abs) = abs else {
+            return;
+        };
+        let abs_str = abs.to_string();
+        let Some(rest) = abs_str.strip_prefix("file://") else {
+            return;
+        };
+        let shared = NSString::from_str(&format!("shareddocuments://{rest}"));
+        let url: Option<Retained<AnyObject>> = msg_send![class!(NSURL), URLWithString: &*shared];
+        let app: Option<Retained<AnyObject>> =
+            msg_send![class!(UIApplication), sharedApplication];
+        let opts: Option<Retained<AnyObject>> = msg_send![class!(NSDictionary), dictionary];
+        if let (Some(url), Some(app), Some(opts)) = (url, app, opts) {
+            let () = msg_send![
+                &*app,
+                openURL: &*url,
+                options: &*opts,
+                completionHandler: std::ptr::null::<std::ffi::c_void>(),
+            ];
+        }
+    }
+}

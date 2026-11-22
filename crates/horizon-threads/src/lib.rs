@@ -154,7 +154,16 @@ fn behind() -> bool {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "ios")]
+fn behind() -> bool {
+    // On iOS (Apple Silicon A14/A16: 2 P-cores + 4 E-cores), helper workers (chunk meshing,
+    // worldgen, lighting) should run on E-cores at QOS_CLASS_UTILITY so the main render
+    // thread and integrated server keep both P-cores free for smooth 60 FPS frame pacing.
+    // SAFETY: sets the calling thread's own QoS class; no pointers.
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) == 0 }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
 fn behind() -> bool {
     false
 }

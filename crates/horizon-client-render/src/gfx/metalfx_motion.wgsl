@@ -25,13 +25,15 @@ struct MotionUniform {
     jitter_px: vec2<f32>,
     // x: 1.0 for Shader Pack GL bottom-up forward-Z depth, 0.0 for Vanilla top-down reverse-Z.
     // y: 1.0 when `opaque_depth_in` carries Shader Pack `depthtex1` (opaque-only depth for water detection).
-    // z, w: reserved.
+    // z: 1.0 when `obj_motion_in` carries per-entity ObjectMotion vectors (3rd-person player, mobs, items).
+    // w: reserved.
     flags: vec4<f32>,
 }
 
 @group(0) @binding(0) var depth_in: texture_depth_2d;
 @group(0) @binding(1) var<uniform> motion_u: MotionUniform;
 @group(0) @binding(2) var opaque_depth_in: texture_depth_2d;
+@group(0) @binding(3) var obj_motion_in: texture_2d<f32>;
 
 struct MotionOut {
     @location(0) motion: vec2<f32>,
@@ -41,6 +43,11 @@ struct MotionOut {
     @location(2) reactive: f32,
 }
 
+struct FgMotionOut {
+    @location(0) motion: vec2<f32>,
+    @location(1) reactive: f32,
+}
+
 fn load_rev_depth(tex: texture_depth_2d, p: vec2<i32>, dim: vec2<i32>, gl_mode: bool) -> f32 {
     let clamped = clamp(p, vec2<i32>(0), dim - vec2<i32>(1));
     let sample_p = select(clamped, vec2<i32>(clamped.x, dim.y - 1 - clamped.y), gl_mode);
@@ -48,13 +55,13 @@ fn load_rev_depth(tex: texture_depth_2d, p: vec2<i32>, dim: vec2<i32>, gl_mode: 
     return select(d, 1.0 - d, gl_mode);
 }
 
-@fragment
-fn fs_motion(v: Full) -> MotionOut {
+fn compute_motion(v: Full) -> MotionOut {
     let dim = vec2<i32>(textureDimensions(depth_in));
     let out_uv = v.position.xy / max(motion_u.size, vec2<f32>(1.0));
     let p = clamp(vec2<i32>(out_uv * vec2<f32>(dim)), vec2<i32>(0), dim - vec2<i32>(1));
     let gl_mode = motion_u.flags.x > 0.5;
     let has_opaque = motion_u.flags.y > 0.5;
+    let has_obj_motion = motion_u.flags.z > 0.5;
 
     let sample_p = select(p, vec2<i32>(p.x, dim.y - 1 - p.y), gl_mode);
     let d_raw = textureLoad(depth_in, sample_p, 0);
@@ -84,6 +91,19 @@ fn fs_motion(v: Full) -> MotionOut {
                 best_z = zq;
                 best_p = q;
             }
+        }
+    }
+
+    // Per-entity motion vectors (3rd-person player, mobs, dropped items) override static-world
+    // camera reprojection so moving entities interpolate smoothly without backward snapping.
+    if has_obj_motion {
+        let obj_dim = vec2<i32>(textureDimensions(obj_motion_in));
+        let obj_uv = (vec2<f32>(best_p) + 0.5) / vec2<f32>(dim);
+        let obj_p = clamp(vec2<i32>(obj_uv * vec2<f32>(obj_dim)), vec2<i32>(0), obj_dim - vec2<i32>(1));
+        let obj = textureLoad(obj_motion_in, obj_p, 0);
+        if obj.z > 0.5 {
+            let obj_mv = clamp(obj.xy * motion_u.size, vec2<f32>(-4096.0), vec2<f32>(4096.0));
+            return MotionOut(obj_mv, z_center, 0.05);
         }
     }
 
@@ -131,6 +151,18 @@ fn fs_motion(v: Full) -> MotionOut {
     }
 
     return MotionOut(mv, z_center, reactive);
+}
+
+@fragment
+fn fs_motion(v: Full) -> MotionOut {
+    return compute_motion(v);
+}
+
+// 2-target variant for WGSL Frame Generation (omits unused `depth_r32` to save ~3.7 MB VRAM & bandwidth).
+@fragment
+fn fs_fg_motion(v: Full) -> FgMotionOut {
+    let out = compute_motion(v);
+    return FgMotionOut(out.motion, out.reactive);
 }
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;

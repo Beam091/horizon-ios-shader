@@ -30,10 +30,16 @@ pub fn packs_dir() -> PathBuf {
         .unwrap_or_default()
         .join("resourcepacks")
 }
+#[cfg(not(target_os = "ios"))]
 mod folder;
 
 /// `Util.getPlatform().openPath`: the system file manager on the folder.
 pub fn open_folder(dir: &Path) {
+    #[cfg(target_os = "ios")]
+    {
+        horizon_client_input::ios_files::open_folder(dir);
+    }
+    #[cfg(not(target_os = "ios"))]
     if let Err(e) = folder::command(dir).and_then(|mut command| command.spawn()) {
         log::warn!("Horizon: could not open {}: {e}", dir.display());
     }

@@ -470,10 +470,13 @@ pub fn poll_hardware_input() -> HardwareInput {
         && let Some(input) = get!(kb, keyboardInput)
     {
         out.keyboard_connected = true;
-        for &(usage, code) in GC_KEY_MAP {
-            let button: Option<Obj> = unsafe { msg_send![&*input, buttonForKeyCode: usage] };
-            if pressed(button) {
-                out.keys.push(code);
+        let any_pressed: bool = unsafe { msg_send![&*input, isAnyKeyPressed] };
+        if any_pressed {
+            for &(usage, code) in GC_KEY_MAP {
+                let button: Option<Obj> = unsafe { msg_send![&*input, buttonForKeyCode: usage] };
+                if pressed(button) {
+                    out.keys.push(code);
+                }
             }
         }
     }
@@ -568,6 +571,9 @@ unsafe fn root_view_controller() -> Option<Obj> {
 /// `UIHoverGestureRecognizer` for exact 1:1 cursor tracking in menus.
 pub fn set_pointer_locked(locked: bool) {
     let prev = POINTER_LOCKED.swap(locked, Ordering::Relaxed);
+    if prev == locked && POINTER_LOCK_INSTALLED_CLS.load(Ordering::Relaxed) != 0 {
+        return;
+    }
     unsafe {
         let Some(vc) = root_view_controller() else {
             return;

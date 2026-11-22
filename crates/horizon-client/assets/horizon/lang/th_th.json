@@ -461,6 +461,8 @@
   "Shadow Update Rate": "ความถี่อัปเดตเงา",
   "Every Frame": "ทุกเฟรม",
   "How often shader shadows redraw (20/10/5 Hz saves GPU time).": "ความถี่ในการวาดเงาเชเดอร์ใหม่ (20/10/5 Hz ช่วยประหยัด GPU)",
+  "Shadow Resolution Cap": "จำกัดความละเอียดเงา",
+  "Caps shader shadow map size (1024 cuts GPU load 2-3x on mobile).": "จำกัดขนาดเงาเชเดอร์ (1024 ลดภาระ GPU 2-3 เท่าบนมือถือ)",
   "FPS Only": "FPS อย่างเดียว",
   "Overlay Corner": "มุมแสดงผล FPS",
   "Which corner of the screen shows the FPS overlay.": "เลือกมุมหน้าจอสำหรับแสดงตัวเลข FPS (4 มุม)",
