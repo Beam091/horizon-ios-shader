@@ -8,6 +8,8 @@ use std::{collections::VecDeque, fs, path::Path};
 pub const FILE: &str = "horizon-extras.txt";
 /// The name the options screen uses while the sort key waits for a key.
 pub const SORT_KEY: &str = "horizon.sort";
+/// The name the options screen uses while the zoom key waits for a key.
+pub const ZOOM_KEY: &str = "horizon.zoom";
 /// The 3D skin layers line, here and in the `options.txt` that held it first.
 const SKIN_LAYERS_KEY: &str = "threeDSkinLayers";
 
@@ -193,8 +195,13 @@ impl Default for Extras {
             pregen: false,
             fullbright: false,
             dynamic_lights: false,
-            zoom: false,
-            zoom_key: "key.keyboard.z".into(),
+            zoom: cfg!(target_os = "ios"),
+            zoom_key: if cfg!(target_os = "ios") {
+                "key.keyboard.c"
+            } else {
+                "key.keyboard.z"
+            }
+            .into(),
             zoom_level: 4,
             zoom_smooth: true,
             zoom_sensitivity: true,
@@ -447,11 +454,12 @@ impl Extras {
             self.three_d_skin_layers = value == "true";
         }
     }
-    /// Binds the extra key `name` (`SORT_KEY`); false for
+    /// Binds the extra key `name` (`SORT_KEY`, `ZOOM_KEY`); false for
     /// another name (a vanilla mapping).
     pub fn set_key(&mut self, name: &str, value: String) -> bool {
         match name {
             SORT_KEY => self.sort_key = value,
+            ZOOM_KEY => self.zoom_key = value,
             _ => return false,
         }
         true
@@ -566,6 +574,9 @@ pub const SPLIT_THREE: [&str; 3] = ["One wide on top", "One tall on the left", "
 /// The settings the Extras page shows, one per row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
+    Zoom,
+    ZoomKey,
+    ZoomLevel,
     Fullbright,
     DynamicLights,
     OwnNameTag,
@@ -611,6 +622,10 @@ pub fn rows() -> Vec<Result<Item, &'static str>> {
     // Fullbright, Dynamic lights and Hide block-break particles change the picture: they
     // are on the graphics screen's Quality page (`graphics_ui::rows`), not here.
     let mut rows = vec![
+        Err("horizon.extras.header.zoom"),
+        Ok(Zoom),
+        Ok(ZoomKey),
+        Ok(ZoomLevel),
         Err("horizon.extras.header.third_person"),
         Ok(OwnNameTag),
         Err("horizon.extras.header.inventory"),
@@ -649,6 +664,9 @@ impl Item {
     /// The language key of the caption (`horizon.*`, assets/horizon/lang).
     pub fn caption_key(self) -> &'static str {
         match self {
+            Item::Zoom => "horizon.extras.zoom",
+            Item::ZoomKey => "horizon.extras.zoom_key",
+            Item::ZoomLevel => "horizon.extras.zoom_level",
             Item::Fullbright => "horizon.extras.fullbright",
             Item::DynamicLights => "horizon.extras.dynamic_lights",
             Item::OwnNameTag => "horizon.extras.own_name_tag",
@@ -682,6 +700,9 @@ impl Item {
     /// The language key of the description shown as the row's tooltip.
     pub fn description_key(self) -> &'static str {
         match self {
+            Item::Zoom => "horizon.extras.zoom.tooltip",
+            Item::ZoomKey => "horizon.extras.zoom_key.tooltip",
+            Item::ZoomLevel => "horizon.extras.zoom_level.tooltip",
             Item::Fullbright => "horizon.extras.fullbright.tooltip",
             Item::DynamicLights => "horizon.extras.dynamic_lights.tooltip",
             Item::OwnNameTag => "horizon.extras.own_name_tag.tooltip",
@@ -724,6 +745,9 @@ impl Item {
     /// `horizon.extras.*` in en_us.json.
     pub fn caption(self) -> &'static str {
         match self {
+            Item::Zoom => "Zoom",
+            Item::ZoomKey => "Zoom key",
+            Item::ZoomLevel => "Zoom level",
             Item::Fullbright => "Fullbright",
             Item::DynamicLights => "Dynamic lights",
             Item::OwnNameTag => "Own name tag",
@@ -759,15 +783,16 @@ impl Item {
         use Item::*;
         Some(match self {
             UiSoundReserve => return None,
+            ZoomKey | ZoomLevel => Zoom,
             MouseTweaksWheel => MouseTweaks,
             SortKey => Sort,
             ChatIndicator => ChatAnimation,
             Pvp(o) => return o.parent().map(Pvp),
-            Fullbright | DynamicLights | OwnNameTag | HideBlockParticles | MouseTweaks | Sort
-            | AutoReconnect | NoAi | AgentControl | ReproKeys | DiscordPresence | Splitscreen
-            | ChatAnimation | WheelCyclesSettings | MusicPage | PackBrowser | CosmeticsMine
-            | CosmeticsOthers | CosmeticsAuras | CosmeticsSolo | HorizonMarks | HorizonMe
-            | Pregen => {
+            Zoom | Fullbright | DynamicLights | OwnNameTag | HideBlockParticles | MouseTweaks
+            | Sort | AutoReconnect | NoAi | AgentControl | ReproKeys | DiscordPresence
+            | Splitscreen | ChatAnimation | WheelCyclesSettings | MusicPage | PackBrowser
+            | CosmeticsMine | CosmeticsOthers | CosmeticsAuras | CosmeticsSolo | HorizonMarks
+            | HorizonMe | Pregen => {
                 return None;
             }
         })
@@ -775,6 +800,15 @@ impl Item {
     /// The English description: the fallback of [`Item::description_text`].
     pub fn description(self) -> &'static str {
         match self {
+            Item::Zoom => {
+                "Hold the zoom key to zoom the camera smoothly. Scroll the mouse wheel while holding it to zoom closer or wider."
+            }
+            Item::ZoomKey => {
+                "Hold this key to zoom in. Click, then press any keyboard key or mouse button; Escape unbinds it."
+            }
+            Item::ZoomLevel => {
+                "Starting magnification when holding the zoom key (2x to 10x)."
+            }
             Item::Pregen => {
                 "Enables /pregen in your single-player and LAN worlds. With cheats enabled, use /pregen start to generate an area before exploring it. Does not enable the command on servers you join."
             }
@@ -857,6 +891,7 @@ impl Item {
     pub fn cost(self) -> Option<crate::graphics_style::Cost> {
         use crate::graphics_style::Cost;
         match self {
+            Item::Zoom => Some(Cost::None),
             Item::Fullbright => Some(Cost::None),
             Item::UiSoundReserve => Some(Cost::None),
             Item::MusicPage => Some(Cost::None),
@@ -882,6 +917,7 @@ impl Item {
     /// On/off items and their value.
     pub fn switch(self, e: &Extras) -> Option<bool> {
         Some(match self {
+            Item::Zoom => e.zoom,
             Item::Fullbright => e.fullbright,
             Item::DynamicLights => e.dynamic_lights,
             Item::OwnNameTag => e.own_name_tag,
@@ -913,6 +949,8 @@ impl Item {
     /// The value of the other items, as their button shows it.
     pub fn value(self, e: &Extras) -> String {
         match self {
+            Item::ZoomKey => crate::keybinds::display_name(&e.zoom_key).plain(),
+            Item::ZoomLevel => format!("{}x", e.zoom_level.clamp(2, 10)),
             Item::SortKey => crate::keybinds::display_name(&e.sort_key).plain(),
             Item::Pvp(o) if o.switch(&e.pvp).is_none() => o.value(&e.pvp).unwrap_or_default(),
             Item::CosmeticsMine => match e.cosmetics_mine {
@@ -937,10 +975,24 @@ impl Item {
             },
         }
     }
-    /// A click (`back` for the right button: it turns the three-way cosmetics button the other
-    /// way; every other item left is a switch, so both flip it). The sort key binds instead.
+    /// A click (`back` for the right button: it turns multi-value buttons the other
+    /// way; every other item left is a switch, so both flip it). Key items bind instead.
     pub fn cycle(self, e: &mut Extras, back: bool) {
         match self {
+            Item::Zoom => e.zoom = !e.zoom,
+            Item::ZoomLevel => {
+                const LEVELS: [u8; 5] = [2, 4, 6, 8, 10];
+                let idx = LEVELS
+                    .iter()
+                    .position(|&l| l == e.zoom_level)
+                    .unwrap_or(1);
+                let next = if back {
+                    (idx + LEVELS.len() - 1) % LEVELS.len()
+                } else {
+                    (idx + 1) % LEVELS.len()
+                };
+                e.zoom_level = LEVELS[next];
+            }
             Item::Fullbright => e.fullbright = !e.fullbright,
             Item::DynamicLights => e.dynamic_lights = !e.dynamic_lights,
             Item::OwnNameTag => e.own_name_tag = !e.own_name_tag,
@@ -972,13 +1024,14 @@ impl Item {
             Item::HorizonMarks => e.horizon_marks = !e.horizon_marks,
             Item::HorizonMe => e.horizon_listed = !e.horizon_listed,
             Item::Pvp(o) => o.cycle(&mut e.pvp, back),
-            Item::SortKey => {}
+            Item::SortKey | Item::ZoomKey => {}
         }
     }
     /// The key name the options screen waits on for a key item.
     pub fn key_name(self) -> Option<&'static str> {
         match self {
             Item::SortKey => Some(SORT_KEY),
+            Item::ZoomKey => Some(ZOOM_KEY),
             _ => None,
         }
     }

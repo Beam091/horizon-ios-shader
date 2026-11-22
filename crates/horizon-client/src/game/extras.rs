@@ -26,6 +26,8 @@ pub(super) struct ExtrasState {
     minimap_dim: Option<Dim>,
     /// Auto-reconnect's attempts at the current server.
     reconnect: Tracker,
+    /// Extra zoom magnification offset applied by scrolling while holding the zoom key.
+    zoom_scroll: f32,
 }
 /// CPU time the minimap's tiles may take per frame.
 const MINIMAP_BUDGET: Duration = Duration::from_micros(300);
@@ -56,6 +58,9 @@ impl Game<'_> {
         let playing = self.screen == Screen::Playing && self.title.is_none() && focused;
         if !playing {
             self.extras.mouse = [false; 2];
+        }
+        if !self.keyboard_zoom_held() {
+            self.extras.zoom_scroll = 0.0;
         }
         self.update_minimap();
         // For mods (`render.frame-stats`, `native_frame_rate`).
@@ -209,13 +214,57 @@ impl Game<'_> {
             rgba: self.extras.minimap.image.clone(),
         });
     }
-    /// A mod's zoom in effect (`native_zoom`), or the touch Zoom button:
+    /// Whether the built-in keyboard/mouse zoom key (`Options -> Horizon -> Extras -> Zoom`) is held.
+    pub(super) fn keyboard_zoom_held(&self) -> bool {
+        let e = &self.settings.extras;
+        if !e.zoom
+            || e.zoom_key == "key.keyboard.unknown"
+            || self.screen != Screen::Playing
+            || self.title.is_some()
+            || self.screen_over_playing()
+            || self.sleeping.is_some()
+            || self.player.is_none()
+            || self.ime_allowed
+        {
+            return false;
+        }
+        let target = e.zoom_key.as_str();
+        self.physical_keys
+            .iter()
+            .any(|&k| horizon_client::keybinds::key_name(k) == Some(target))
+            || self
+                .physical_buttons
+                .iter()
+                .any(|&b| horizon_client::keybinds::mouse_name(b) == target)
+    }
+    /// Adjusts zoom magnification when scrolling the mouse wheel while holding the zoom key.
+    pub(super) fn extras_zoom_scroll(&mut self, delta_y: f32) -> bool {
+        if !self.keyboard_zoom_held() || delta_y == 0.0 {
+            return false;
+        }
+        let base = f32::from(self.settings.extras.zoom_level.clamp(2, 10));
+        let next = (base + self.extras.zoom_scroll + delta_y.signum()).clamp(2.0, 16.0);
+        self.extras.zoom_scroll = next - base;
+        true
+    }
+    /// A mod's zoom in effect (`native_zoom`), the built-in keyboard zoom, or the touch Zoom button:
     /// (factor, smooth, turning scale); none is 1.
     fn zoom_now(&self) -> (f32, bool, f64) {
+        let e = &self.settings.extras;
         if let Some(z) = self.native_zoom_now() {
             (z.factor, z.smooth, f64::from(z.turn))
+        } else if self.keyboard_zoom_held() {
+            let factor = (f32::from(e.zoom_level.clamp(2, 10)) + self.extras.zoom_scroll)
+                .clamp(2.0, 16.0);
+            let turn = if e.zoom_sensitivity {
+                (1.0 / f64::from(factor)).clamp(0.08, 1.0)
+            } else {
+                1.0
+            };
+            (factor, e.zoom_smooth, turn)
         } else if self.pad.touch_zoom {
-            (4.0, true, 0.25)
+            let factor = f32::from(e.zoom_level.clamp(2, 10));
+            (factor, e.zoom_smooth, (1.0 / f64::from(factor)).clamp(0.1, 1.0))
         } else {
             (1.0, true, 1.0)
         }

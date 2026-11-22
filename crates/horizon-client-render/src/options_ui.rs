@@ -6342,7 +6342,10 @@ mod tests {
                     WKind::Button {
                         act: Act::Extra(item),
                         ..
-                    } if !matches!(item, crate::extras::Item::SortKey)
+                    } if !matches!(
+                        item,
+                        crate::extras::Item::SortKey | crate::extras::Item::ZoomKey
+                    )
                 )
             })
             .unwrap();

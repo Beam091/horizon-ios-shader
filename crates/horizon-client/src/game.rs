@@ -18314,6 +18314,7 @@ impl Game<'_> {
                         && !self.screen_over_playing()
                         && self.sleeping.is_none()
                         && self.player.is_some()
+                        && !self.extras_zoom_scroll(d)
                         && !self.native_wheel_event(d)
                         && let Some((wheel, (horizontal_steps, vertical_steps))) = self
                             .mouse

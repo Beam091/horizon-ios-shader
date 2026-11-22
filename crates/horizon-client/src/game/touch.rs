@@ -918,6 +918,10 @@ impl Game<'_> {
                     continue;
                 }
                 if !ime_typing {
+                    if self.screen == Screen::Options {
+                        let _ = self.options_key(key, None);
+                        continue;
+                    }
                     if !self.debug_key(key, horizon_client::debug_keys::KeyAction::Press) {
                         let _ = self.mapped_key_event(key, true, false);
                     }
