@@ -1035,43 +1035,45 @@ impl Game<'_> {
             self.last_input = now;
             if playing {
                 if sy != 0.0 {
-                    // Reset accumulator after a brief pause or on scroll direction reversal so each
-                    // physical wheel notch reliably advances the hotbar cleanly.
-                    if self
-                        .pad
-                        .ios_hw_last_scroll_event
-                        .is_some_and(|t| {
-                            now.duration_since(t) > std::time::Duration::from_millis(160)
-                        })
-                        || (self.pad.ios_hw_scroll_accum != 0.0
-                            && self.pad.ios_hw_scroll_accum.signum() != sy.signum())
-                    {
-                        self.pad.ios_hw_scroll_accum = 0.0;
-                    }
-                    self.pad.ios_hw_last_scroll_event = Some(now);
-                    // Clamp each frame's contribution so a burst of callbacks doesn't leap across slots.
-                    self.pad.ios_hw_scroll_accum += sy.clamp(-1.0, 1.0);
                     // Scale the anti-bounce interval with Mouse Settings -> Scroll Sensitivity
-                    // (1.00 -> 35ms for snappy 1-notch stepping; higher = faster, lower = slower).
-                    let wheel_sens = self.settings.mouse_wheel_sensitivity.clamp(0.35, 3.0);
-                    let min_interval_ms = (35.0 / wheel_sens).round() as u64;
+                    // (1.00 -> 28ms for crisp 1-notch stepping; higher = faster, lower = slower).
+                    let wheel_sens = self.settings.mouse_wheel_sensitivity.clamp(0.4, 2.5);
+                    let min_interval_ms = (28.0 / wheel_sens).round() as u64;
                     let step_ready = self.pad.ios_hw_last_scroll_step.is_none_or(|t| {
                         now.duration_since(t) >= std::time::Duration::from_millis(min_interval_ms)
                     });
-                    if self.pad.ios_hw_scroll_accum.abs() >= 0.25 && step_ready {
-                        let dir = self.pad.ios_hw_scroll_accum.signum();
-                        self.pad.ios_hw_scroll_accum = 0.0;
-                        self.pad.ios_hw_last_scroll_step = Some(now);
-                        self.handle_window_event(
-                            event_loop,
-                            id,
-                            WindowEvent::MouseWheel {
-                                device_id: winit::event::DeviceId::dummy(),
-                                delta: winit::event::MouseScrollDelta::LineDelta(0.0, dir),
-                                phase: TouchPhase::Moved,
-                            },
-                            super::input_trace::InputOrigin::User,
-                        );
+                    if step_ready {
+                        // Reset accumulator after a brief pause or on scroll direction reversal so
+                        // each physical wheel notch reliably advances the hotbar cleanly.
+                        if self
+                            .pad
+                            .ios_hw_last_scroll_event
+                            .is_some_and(|t| {
+                                now.duration_since(t) > std::time::Duration::from_millis(160)
+                            })
+                            || (self.pad.ios_hw_scroll_accum != 0.0
+                                && self.pad.ios_hw_scroll_accum.signum() != sy.signum())
+                        {
+                            self.pad.ios_hw_scroll_accum = 0.0;
+                        }
+                        self.pad.ios_hw_last_scroll_event = Some(now);
+                        // Clamp each frame's contribution so a burst of callbacks doesn't leap across slots.
+                        self.pad.ios_hw_scroll_accum += sy.clamp(-1.0, 1.0);
+                        if self.pad.ios_hw_scroll_accum.abs() >= 0.20 {
+                            let dir = self.pad.ios_hw_scroll_accum.signum();
+                            self.pad.ios_hw_scroll_accum = 0.0;
+                            self.pad.ios_hw_last_scroll_step = Some(now);
+                            self.handle_window_event(
+                                event_loop,
+                                id,
+                                WindowEvent::MouseWheel {
+                                    device_id: winit::event::DeviceId::dummy(),
+                                    delta: winit::event::MouseScrollDelta::LineDelta(0.0, dir),
+                                    phase: TouchPhase::Moved,
+                                },
+                                super::input_trace::InputOrigin::User,
+                            );
+                        }
                     }
                 }
             } else {

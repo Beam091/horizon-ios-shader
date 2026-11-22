@@ -18348,12 +18348,22 @@ impl Game<'_> {
                                 );
                             }
                         } else {
-                            self.selected =
-                                horizon_client::mouse::ScrollWheelHandler::next_selection(
-                                    f64::from(wheel),
-                                    self.selected as i32,
-                                    9,
-                                ) as usize;
+                            #[cfg(target_os = "ios")]
+                            {
+                                // On iOS/iPadOS, let Mouse Settings -> Scroll Sensitivity scale
+                                // hotbar slot steps instead of clamping every scroll event to ±1.
+                                let steps = wheel.clamp(-8, 8);
+                                self.selected = (self.selected as i32 - steps).rem_euclid(9) as usize;
+                            }
+                            #[cfg(not(target_os = "ios"))]
+                            {
+                                self.selected =
+                                    horizon_client::mouse::ScrollWheelHandler::next_selection(
+                                        f64::from(wheel),
+                                        self.selected as i32,
+                                        9,
+                                    ) as usize;
+                            }
                         }
                     }
                     if self.screen == Screen::Chat && d != 0.0 {
