@@ -677,7 +677,28 @@ impl Game<'_> {
         if self.options.frames.is_some() || self.options.paced_by_split {
             return;
         }
-        let limit = self.framerate_limit();
+        let mut limit = self.framerate_limit();
+        // When iOS pipelined 2x Frame Generation is active in-world, the user's Max Framerate
+        // represents the real rendered FPS (e.g. locking 30 FPS generates 60 displayed FPS).
+        if limit > 0
+            && limit < 260
+            && self.title.is_none()
+            && self.screen == super::Screen::Playing
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| r.ios_frame_gen_active())
+        {
+            limit = limit.saturating_mul(2).min(260);
+        }
+        #[cfg(target_os = "ios")]
+        {
+            // Never busy-spin on UIKit's main thread; sleep-on-grid keeps touch/UI responsive.
+            let mut clock = horizon_client::window::SleepingClock(self.frame_clock);
+            horizon_client::window::end_frame_on_grid(&mut self.limiter, limit, &mut clock);
+            return;
+        }
+        #[cfg(not(target_os = "ios"))]
         match self.settings.horizon.pacing {
             horizon_client::graphics::Pacing::Precise => {
                 horizon_client::window::end_frame(&mut self.limiter, limit, &mut self.frame_clock)

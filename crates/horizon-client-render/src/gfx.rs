@@ -6361,6 +6361,15 @@ impl Renderer {
             self.frame_gen.made_share
         }
     }
+
+    /// True when iOS/Metal pipelined 2x Frame Generation is enabled and supported, so the
+    /// client frame limiter paces display output at 2x the user's real-FPS target (e.g. 30 -> 60).
+    pub fn ios_frame_gen_active(&self) -> bool {
+        self.frame_gen.on
+            && self.frame_gen.metalfx
+            && self.metalfx.frame_gen_supported(&self.device)
+            && self.hdr.is_none()
+    }
     /// Frame generation mode (FSR 3.1 on desktop, MetalFX Frame Interpolation on iOS 26+).
     pub fn set_frame_generation(&mut self, mode: crate::graphics::FrameGeneration) {
         let (on, metalfx) = match mode {
@@ -7189,7 +7198,7 @@ impl Renderer {
         self.last_wait = landed + queued + acquire.elapsed();
         // Inside the acquire's time already.
         self.queue.take_waited();
-        let (surface_frame, reconfigure) = match acquired {
+        let (mut surface_frame, reconfigure) = match acquired {
             None => (None, false),
             Some(wgpu::CurrentSurfaceTexture::Success(f)) => (Some(f), false),
             Some(wgpu::CurrentSurfaceTexture::Suboptimal(f)) => (Some(f), true),
@@ -7259,18 +7268,20 @@ impl Renderer {
                     label: Some("Horizon frame"),
                 })
         });
-        // MetalFX Frame Interpolation odd display tick: present the cached real world frame `N`
-        // with fresh 60/120Hz HUD on the main thread, skipping all 3D world and shader pack work.
+        // Pipelined GPU Frame Generation — Odd Display Tick:
+        // Present the interpolated halfway frame `N-0.5` with fresh 60/120Hz HUD on the main
+        // thread, skipping 100% of 3D world and Shader Pack rendering.
         if mfx_fg_active
-            && self.metalfx.has_cached_real()
+            && self.metalfx.fg_should_present_odd_tick()
             && self.screenshot.is_none()
-            && let Some(surface_frame) = surface_frame
+            && surface_frame.is_some()
         {
+            let sf = surface_frame.take().expect("surface_frame");
             let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(self.frame_format),
                 ..Default::default()
             });
-            if self.metalfx.blit_cached_real(&mut encoder, &view_target) {
+            if self.metalfx.blit_pipelined_interp(&mut encoder, &view_target) {
                 self.hud.prepare(
                     &self.device,
                     &mut self.uploads,
@@ -7297,16 +7308,64 @@ impl Renderer {
                 if self.config.present_mode == wgpu::PresentMode::Fifo {
                     self.window.pre_present_notify();
                 }
-                self.queue.present(surface_frame);
+                self.queue.present(sf);
                 if reconfigure {
                     self.configure_surface();
                 }
                 self.last_encode = started.elapsed().saturating_sub(self.last_wait);
                 return Ok(true);
             }
-            // Fall through if blit unexpectedly failed (rare resize race): drop surface safely.
-            self.queue.present(surface_frame);
+            self.queue.present(sf);
             return Ok(false);
+        }
+        // Pipelined GPU Frame Generation — Even Display Tick Step A:
+        // Present the cached real world frame `N-1` + fresh HUD IMMEDIATELY (<0.5 ms GPU) so the
+        // current 60/120Hz VSync lands on time, BEFORE Step B renders real frame `N` + `N-0.5`
+        // offscreen across the next two VSync slots (enables true 30 real -> 60 display FPS!).
+        let mut pipelined_offscreen = false;
+        if mfx_fg_active
+            && self.metalfx.fg_has_pipelined_real()
+            && self.screenshot.is_none()
+            && surface_frame.is_some()
+        {
+            let sf = surface_frame.take().expect("surface_frame");
+            let present_view = target_texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.frame_format),
+                ..Default::default()
+            });
+            let mut present_enc =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Horizon FG even present"),
+                    });
+            if self.metalfx.blit_pipelined_real(&mut present_enc, &present_view) {
+                self.hud.prepare(
+                    &self.device,
+                    &mut self.uploads,
+                    &mut present_enc,
+                    frame.hud,
+                    [self.config.width, self.config.height],
+                );
+                self.hud.draw_range(
+                    &mut present_enc,
+                    &present_view,
+                    &self.depth,
+                    frame.hud,
+                    [self.config.width, self.config.height],
+                    0..frame.hud.vertices.len() as u32,
+                    None,
+                );
+                self.uploads.finish(&present_enc);
+                let _ = self.queue.submit([present_enc.finish()]);
+                if self.config.present_mode == wgpu::PresentMode::Fifo {
+                    self.window.pre_present_notify();
+                }
+                self.queue.present(sf);
+                pipelined_offscreen = true;
+            } else {
+                // Rare resize race: put drawable back and run synchronously.
+                surface_frame = Some(sf);
+            }
         }
         // Horizon's own passes are timed like a shader pack's, from the frame's first pass.
         if self.own_timing.is_some() != self.pass_timing {
@@ -8855,13 +8914,15 @@ impl Renderer {
                 bytemuck::cast_slice(&vertices),
             );
         }
-        self.hud.prepare(
-            &self.device,
-            &mut self.uploads,
-            &mut encoder,
-            frame.hud,
-            [self.config.width, self.config.height],
-        );
+        if !pipelined_offscreen {
+            self.hud.prepare(
+                &self.device,
+                &mut self.uploads,
+                &mut encoder,
+                frame.hud,
+                [self.config.width, self.config.height],
+            );
+        }
         if culling && let Some(cull) = &mut self.cull {
             cull.upload(
                 &self.device,
@@ -8953,10 +9014,19 @@ impl Renderer {
                 bytemuck::cast_slice(&self.draws),
             );
         }
-        let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.frame_format),
-            ..Default::default()
-        });
+        let view_target = if pipelined_offscreen {
+            self.metalfx.fg_fallback_screen_view().unwrap_or_else(|| {
+                target_texture.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.frame_format),
+                    ..Default::default()
+                })
+            })
+        } else {
+            target_texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.frame_format),
+                ..Default::default()
+            })
+        };
         if let Some(timer) = &mut self.gpu_timer {
             timer.begin(&mut encoder);
         }
@@ -10558,7 +10628,7 @@ impl Renderer {
                     &picture,
                     &pack_depth,
                     opaque_depth.as_ref(),
-                    &view_target,
+                    (!pipelined_offscreen).then_some(&view_target),
                     fg_params,
                     [self.config.width, self.config.height],
                     true,
@@ -10651,7 +10721,7 @@ impl Renderer {
                     color,
                     depth,
                     None,
-                    &view_target,
+                    (!pipelined_offscreen).then_some(&view_target),
                     fg_params,
                     [self.config.width, self.config.height],
                     false,
@@ -10665,7 +10735,7 @@ impl Renderer {
                 );
             }
         }
-        if !frame.title {
+        if !frame.title && !pipelined_offscreen {
             let (depth, depth_size) = match &scaled {
                 Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
                 None => (&self.depth, size),
@@ -10697,60 +10767,86 @@ impl Renderer {
                 },
             });
         }
-        // Under MetalFX Frame Interpolation, `view_target` holds the interpolated frame `N-0.5`
-        // (gets halfway hand) while `real_cache` holds real frame `N` (stamp the real hand onto it
-        // now so the odd display tick shows both real world and real hand with zero world re-render).
+        // Under pipelined Frame Generation, stamp Vanilla first-person hand onto `real_display`
+        // (keeping `real_cache` hand-free for the next frame's interpolation) and onto `interp_cache`
+        // when rendering offscreen in Step B.
         let mfx_interpolated = mfx_fg_active && fg_made;
         let real_hand_quads = hand_quads * u32::from(!pack_draws_hand && !hand_in_world);
         let real_hand_vertex = ((world_quads + additive_quads) * 4) as i32;
-        if mfx_interpolated
-            && real_hand_quads > 0
-            && let Some(cached_real) = self.metalfx.cached_real_view().cloned()
-        {
-            let attachments = [Some(wgpu::RenderPassColorAttachment {
-                view: &cached_real,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MetalFX FI cached real hand"),
-                color_attachments: &attachments,
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.entity_pipeline);
-            pass.set_bind_group(0, &self.hand_group, &[]);
-            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
-            pass.draw_indexed(0..real_hand_quads * 6, real_hand_vertex, 0..1);
-        }
-        let overlay = Overlay {
-            hand_quads: real_hand_quads,
-            first_hand_vertex: if mfx_interpolated {
-                made_hand_vertex
+        if mfx_interpolated {
+            if real_hand_quads > 0
+                && let Some((interp_view, real_display_view)) =
+                    self.metalfx.prepare_vanilla_hand_targets(&mut encoder)
+            {
+                let stamp_hand = |encoder: &mut wgpu::CommandEncoder,
+                                  target: &wgpu::TextureView,
+                                  first_vertex: i32,
+                                  label: &str| {
+                    let attachments = [Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })];
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some(label),
+                        color_attachments: &attachments,
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(0.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.entity_pipeline);
+                    pass.set_bind_group(0, &self.hand_group, &[]);
+                    pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                    pass.draw_indexed(0..real_hand_quads * 6, first_vertex, 0..1);
+                };
+                stamp_hand(
+                    &mut encoder,
+                    &real_display_view,
+                    real_hand_vertex,
+                    "MetalFX FG real hand",
+                );
+                if pipelined_offscreen {
+                    stamp_hand(
+                        &mut encoder,
+                        &interp_view,
+                        made_hand_vertex,
+                        "MetalFX FG interp hand",
+                    );
+                }
             } else {
-                real_hand_vertex
-            },
-            crosshair,
-            first_crosshair: debug_depth + debug_top,
-            world_depth: scaled.is_none(),
-            real: !mfx_interpolated,
-            hand_drawn: !pack_draws_hand,
-            hand_view_proj,
+                self.metalfx.clear_vanilla_hand_display();
+            }
+        }
+        let readback = if pipelined_offscreen {
+            None
+        } else {
+            let overlay = Overlay {
+                hand_quads: real_hand_quads,
+                first_hand_vertex: if mfx_interpolated {
+                    made_hand_vertex
+                } else {
+                    real_hand_vertex
+                },
+                crosshair,
+                first_crosshair: debug_depth + debug_top,
+                world_depth: scaled.is_none(),
+                real: !mfx_interpolated,
+                hand_drawn: !pack_draws_hand,
+                hand_view_proj,
+            };
+            self.draw_overlay(&mut encoder, frame, &view_target, &target_texture, &overlay)
         };
-        let readback =
-            self.draw_overlay(&mut encoder, frame, &view_target, &target_texture, &overlay);
         if culling && let Some(cull) = &mut self.cull {
             cull.end(&self.device, &mut encoder);
         }
@@ -10758,7 +10854,7 @@ impl Renderer {
         if gpu_frame && let Some(gpu) = &mut self.gpu_culling {
             gpu.copy_stats(&mut encoder, serial, cpu);
         }
-        if let Some(timer) = &mut self.gpu_timer {
+        if !pipelined_offscreen && let Some(timer) = &mut self.gpu_timer {
             timer.end(
                 &self.device,
                 &mut encoder,
