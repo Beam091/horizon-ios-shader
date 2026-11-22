@@ -18439,7 +18439,15 @@ impl Game<'_> {
                 WindowEvent::MouseInput { .. } if self.screen == Screen::Win => {}
                 WindowEvent::MouseInput { state, button, .. } if self.screen == Screen::Options => {
                     if self.options_waiting_for_key() && state == ElementState::Pressed {
-                        self.options_bind_mouse(button)?;
+                        let left_bounce = button == MouseButton::Left
+                            && self
+                                .pad
+                                .options_bind_started_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_millis(250));
+                        if !left_bounce {
+                            self.options_bind_mouse(button)?;
+                            self.pad.options_bind_started_at = None;
+                        }
                     } else if matches!(button, MouseButton::Left | MouseButton::Right) {
                         self.options_mouse(
                             state == ElementState::Pressed,

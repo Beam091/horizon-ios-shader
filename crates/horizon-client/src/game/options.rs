@@ -250,6 +250,7 @@ impl Game<'_> {
         let framebuffer = self.renderer.as_ref().map_or([1280, 720], |r| {
             [r.config.width as i32, r.config.height as i32]
         });
+        let was_waiting = self.options_waiting_for_key();
         let mut ui = std::mem::take(&mut self.ui.options);
         ui.shift = self.modifiers.shift_key();
         let events = ui.click(
@@ -263,6 +264,11 @@ impl Game<'_> {
             right,
         );
         self.ui.options = ui;
+        if !was_waiting && self.options_waiting_for_key() {
+            self.pad.options_bind_started_at = Some(std::time::Instant::now());
+        } else if !self.options_waiting_for_key() {
+            self.pad.options_bind_started_at = None;
+        }
         self.handle_option_events(events)
     }
     pub(super) fn options_drag(&mut self) -> Result<()> {

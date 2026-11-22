@@ -913,6 +913,14 @@ impl Game<'_> {
                 self.last_input = Instant::now();
                 self.press_modifier_key(key, true);
                 self.physical_keys.insert(key);
+                if self.screen == Screen::Options
+                    && (self.options_waiting_for_key()
+                        || self.ui.options.selected_pad_action.is_some())
+                {
+                    let _ = self.options_key(key, None);
+                    self.pad.options_bind_started_at = None;
+                    continue;
+                }
                 if key == KeyCode::Escape && self.pad_in_menu() {
                     let _ = self.pad_back();
                     continue;
@@ -1028,12 +1036,12 @@ impl Game<'_> {
             if playing {
                 if sy != 0.0 {
                     // Reset accumulator after a brief pause or on scroll direction reversal so each
-                    // physical wheel notch reliably advances exactly one hotbar slot.
+                    // physical wheel notch reliably advances the hotbar cleanly.
                     if self
                         .pad
                         .ios_hw_last_scroll_event
                         .is_some_and(|t| {
-                            now.duration_since(t) > std::time::Duration::from_millis(180)
+                            now.duration_since(t) > std::time::Duration::from_millis(160)
                         })
                         || (self.pad.ios_hw_scroll_accum != 0.0
                             && self.pad.ios_hw_scroll_accum.signum() != sy.signum())
@@ -1043,10 +1051,14 @@ impl Game<'_> {
                     self.pad.ios_hw_last_scroll_event = Some(now);
                     // Clamp each frame's contribution so a burst of callbacks doesn't leap across slots.
                     self.pad.ios_hw_scroll_accum += sy.clamp(-1.0, 1.0);
+                    // Scale the anti-bounce interval with Mouse Settings -> Scroll Sensitivity
+                    // (1.00 -> 35ms for snappy 1-notch stepping; higher = faster, lower = slower).
+                    let wheel_sens = self.settings.mouse_wheel_sensitivity.clamp(0.35, 3.0);
+                    let min_interval_ms = (35.0 / wheel_sens).round() as u64;
                     let step_ready = self.pad.ios_hw_last_scroll_step.is_none_or(|t| {
-                        now.duration_since(t) >= std::time::Duration::from_millis(70)
+                        now.duration_since(t) >= std::time::Duration::from_millis(min_interval_ms)
                     });
-                    if self.pad.ios_hw_scroll_accum.abs() >= 0.5 && step_ready {
+                    if self.pad.ios_hw_scroll_accum.abs() >= 0.25 && step_ready {
                         let dir = self.pad.ios_hw_scroll_accum.signum();
                         self.pad.ios_hw_scroll_accum = 0.0;
                         self.pad.ios_hw_last_scroll_step = Some(now);
