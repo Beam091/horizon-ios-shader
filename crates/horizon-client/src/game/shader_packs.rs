@@ -23,6 +23,42 @@ fn chosen_shader_options(name: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Caps a shader pack's `shadowMapResolution` GLSL option (when declared) so shader math
+/// (`const int shadowMapResolution`) matches the capped shadow map texture resolution.
+fn cap_shadow_map_resolution_option(
+    pack: &Pack,
+    chosen: &mut BTreeMap<String, String>,
+    cap: u32,
+) {
+    let options = horizon_shaders::options(pack);
+    let Some(opt) = options.get("shadowMapResolution") else {
+        return;
+    };
+    let current = chosen
+        .get("shadowMapResolution")
+        .unwrap_or(&opt.default)
+        .trim()
+        .parse::<u32>()
+        .ok();
+    if current.is_some_and(|v| v <= cap) {
+        return;
+    }
+    if let Some((_, best)) = opt
+        .values
+        .iter()
+        .filter_map(|s| {
+            s.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&v| v <= cap)
+                .map(|v| (v, s))
+        })
+        .max_by_key(|&(v, _)| v)
+    {
+        chosen.insert("shadowMapResolution".to_owned(), best.clone());
+    }
+}
+
 /// Pack `name`'s options, screens and names in `language`, with the values the player chose.
 pub(super) fn read_shader_options(
     name: &str,
@@ -209,8 +245,15 @@ impl Game<'_> {
             let started = std::time::Instant::now();
             // A pack is not the game's own code: one that makes the shader compiler (or our
             // translation of it) panic is turned off instead of crashing every world load (#3525).
+            let shadow_cap = self.settings.horizon.shadow_resolution_cap.max_pixels();
             let loaded = horizon_client::crash::contain(|| {
-                match Pack::open(&path).map(|p| p.with_chosen(chosen_shader_options(name))) {
+                match Pack::open(&path).map(|p| {
+                    let mut chosen = chosen_shader_options(name);
+                    if let Some(cap) = shadow_cap {
+                        cap_shadow_map_resolution_option(&p, &mut chosen, cap);
+                    }
+                    p.with_chosen(chosen)
+                }) {
                     Ok(pack) => {
                         let mut macros = Macros::standard();
                         renderer.define_pack_macros(&mut macros);

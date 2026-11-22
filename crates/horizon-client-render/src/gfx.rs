@@ -7236,7 +7236,7 @@ impl Renderer {
         self.last_wait = landed + queued + acquire.elapsed();
         // Inside the acquire's time already.
         self.queue.take_waited();
-        let (mut surface_frame, mut reconfigure) = match acquired {
+        let (mut surface_frame, reconfigure) = match acquired {
             None => (None, false),
             Some(wgpu::CurrentSurfaceTexture::Success(f)) => (Some(f), false),
             Some(wgpu::CurrentSurfaceTexture::Suboptimal(f)) => (Some(f), true),
@@ -7268,17 +7268,6 @@ impl Renderer {
                 return Ok(false);
             }
         };
-        #[cfg(target_os = "ios")]
-        {
-            // Pipelined Frame Gen presents in <0.5ms on the swapchain drawable (3D Step B runs
-            // offscreen), so double buffering (`maximumDrawableCount = 2`, latency = 1) cuts
-            // ~16.7ms of display queue latency with zero FPS penalty.
-            let wanted_latency = if mfx_fg_active { 1 } else { 2 };
-            if self.config.desired_maximum_frame_latency != wanted_latency {
-                self.config.desired_maximum_frame_latency = wanted_latency;
-                reconfigure = true;
-            }
-        }
         if surface_frame.is_some() {
             self.acquire_validation_failures = 0;
             self.frame_gen.paused = false;
@@ -7331,11 +7320,25 @@ impl Renderer {
                 ..Default::default()
             });
             self.prepare_pipelined_overlay(&mut encoder, frame);
-            if self
-                .metalfx
-                .blit_pipelined_interp(&mut encoder, &view_target, None)
-            {
-                self.draw_pipelined_overlay(&mut encoder, &view_target, frame, false);
+            let blitted = {
+                let entity_group = &self.entity_group;
+                let indices = &self.indices;
+                let screen_buffer = &self.screen_buffer;
+                let screen_pipelines = &self.screen_pipelines;
+                self.metalfx
+                    .blit_pipelined_interp(&mut encoder, &view_target, |pass| {
+                        draw_screen_effects_in_pass(
+                            pass,
+                            entity_group,
+                            indices,
+                            screen_buffer,
+                            screen_pipelines,
+                            frame.screen,
+                        );
+                    })
+            };
+            if blitted {
+                self.draw_pipelined_overlay(&mut encoder, &view_target, frame);
                 self.uploads.finish(&encoder);
                 if has_section_copies {
                     self.section_copy_bytes = 0;
@@ -7357,21 +7360,13 @@ impl Renderer {
             self.queue.present(sf);
             return Ok(false);
         }
-        // Horizon's own passes are timed like a shader pack's, from the frame's first pass
-        // (including Even Step A's present + overlay so F3 stays live under pipelined Frame Gen).
-        if self.own_timing.is_some() != self.pass_timing {
-            self.own_timing = self
-                .pass_timing
-                .then(|| pack_timing::PassTiming::new(&self.device, &self.queue))
-                .flatten();
-        }
-        if let Some(t) = &mut self.own_timing {
-            t.begin(&self.device, &self.queue);
-        }
         // Pipelined GPU Frame Generation — Even Display Tick Step A:
         // Present the cached real world frame `N-1` + fresh overlays/HUD IMMEDIATELY (<0.5 ms GPU)
         // so the current 60/120Hz VSync lands on time, BEFORE Step B renders real frame `N` +
         // `N-0.5` offscreen across the next two VSync slots (enables true 30 real -> 60 display FPS!).
+        // Triple buffering (`desired_maximum_frame_latency = 2` -> `maximumDrawableCount = 3`) is
+        // required so Even Tick `N+1` overlaps CPU encoding with GPU Step B without stalling in
+        // `nextDrawable()`.
         let mut pipelined_offscreen = false;
         if mfx_fg_active
             && self.metalfx.fg_has_pipelined_real()
@@ -7389,12 +7384,25 @@ impl Renderer {
                         label: Some("Horizon FG even present"),
                     });
             self.prepare_pipelined_overlay(&mut present_enc, frame);
-            if self.metalfx.blit_pipelined_real(
-                &mut present_enc,
-                &present_view,
-                self.own_timing.as_mut(),
-            ) {
-                self.draw_pipelined_overlay(&mut present_enc, &present_view, frame, true);
+            let blitted = {
+                let entity_group = &self.entity_group;
+                let indices = &self.indices;
+                let screen_buffer = &self.screen_buffer;
+                let screen_pipelines = &self.screen_pipelines;
+                self.metalfx
+                    .blit_pipelined_real(&mut present_enc, &present_view, |pass| {
+                        draw_screen_effects_in_pass(
+                            pass,
+                            entity_group,
+                            indices,
+                            screen_buffer,
+                            screen_pipelines,
+                            frame.screen,
+                        );
+                    })
+            };
+            if blitted {
+                self.draw_pipelined_overlay(&mut present_enc, &present_view, frame);
                 self.uploads.finish(&present_enc);
                 let _ = self.queue.submit([present_enc.finish()]);
                 if self.config.present_mode == wgpu::PresentMode::Fifo {
@@ -7407,6 +7415,18 @@ impl Renderer {
                 self.uploads.finish(&present_enc);
                 surface_frame = Some(sf);
             }
+        }
+        // Horizon's own passes are timed like a shader pack's, from the frame's first Step B pass
+        // (kept strictly AFTER Even Step A so `resolve_query_set`/`map_async` never stalls present
+        // and one `QuerySet` is never split across two separate `queue.submit` calls).
+        if self.own_timing.is_some() != self.pass_timing {
+            self.own_timing = self
+                .pass_timing
+                .then(|| pack_timing::PassTiming::new(&self.device, &self.queue))
+                .flatten();
+        }
+        if let Some(t) = &mut self.own_timing {
+            t.begin(&self.device, &self.queue);
         }
         if self.animated_textures {
             self.hud
@@ -11569,48 +11589,15 @@ impl Renderer {
         );
     }
 
-    /// Draws screen effects (spyglass, fire, underwater tint, pumpkin, portal, vignette),
-    /// 3D F3 crosshair, and HUD onto `view_target` for Frame Generation Odd Tick & Even Step A.
+    /// Draws 3D F3 crosshair and HUD onto `view_target` for Frame Generation Odd Tick & Even Step A
+    /// (screen effects are merged directly into the preceding fullscreen blit pass to save a full-res
+    /// swapchain Load+Store on Apple Silicon TBDR GPUs).
     fn draw_pipelined_overlay(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         view_target: &wgpu::TextureView,
         frame: &Frame<'_>,
-        record_timing: bool,
     ) {
-        let mut timing = if record_timing {
-            self.own_timing.take()
-        } else {
-            None
-        };
-        if !frame.screen.is_empty() {
-            let attachments = [Some(wgpu::RenderPassColorAttachment {
-                view: view_target,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Screen effects"),
-                timestamp_writes: timing.as_mut().and_then(|t| t.writes("Screen effects")),
-                color_attachments: &attachments,
-                ..Default::default()
-            });
-            pass.set_bind_group(0, &self.entity_group, &[]);
-            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.set_vertex_buffer(0, self.screen_buffer.slice(..));
-            for (i, quad) in frame.screen.iter().enumerate() {
-                let blend = match quad.blend {
-                    crate::screen_effects::Blend::Alpha => 0,
-                    crate::screen_effects::Blend::Vignette => 4,
-                };
-                pass.set_pipeline(&self.screen_pipelines[blend + (quad.sampling & 3) as usize]);
-                pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
-            }
-        }
         if !frame.debug_crosshair.is_empty() {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: view_target,
@@ -11623,7 +11610,6 @@ impl Renderer {
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("3d crosshair"),
-                timestamp_writes: timing.as_mut().and_then(|t| t.writes("Crosshair")),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
@@ -11647,11 +11633,34 @@ impl Renderer {
             frame.hud,
             [self.config.width, self.config.height],
             0..frame.hud.vertices.len() as u32,
-            timing.as_mut(),
+            None,
         );
-        if record_timing {
-            self.own_timing = timing;
-        }
+    }
+}
+
+/// Draws fullscreen screen effects (vignette, underwater tint, fire, spyglass, pumpkin, portal)
+/// inside an already-open color-only render pass targeting `self.frame_format`.
+fn draw_screen_effects_in_pass(
+    pass: &mut wgpu::RenderPass<'_>,
+    entity_group: &wgpu::BindGroup,
+    indices: &wgpu::Buffer,
+    screen_buffer: &wgpu::Buffer,
+    screen_pipelines: &[wgpu::RenderPipeline],
+    screen: &[crate::screen_effects::ScreenQuad],
+) {
+    if screen.is_empty() {
+        return;
+    }
+    pass.set_bind_group(0, entity_group, &[]);
+    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+    pass.set_vertex_buffer(0, screen_buffer.slice(..));
+    for (i, quad) in screen.iter().enumerate() {
+        let blend = match quad.blend {
+            crate::screen_effects::Blend::Alpha => 0,
+            crate::screen_effects::Blend::Vignette => 4,
+        };
+        pass.set_pipeline(&screen_pipelines[blend + (quad.sampling & 3) as usize]);
+        pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
     }
 }
 /// Out-of-memory and validation error scopes, popped together: the first error either caught.

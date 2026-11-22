@@ -638,13 +638,15 @@ impl MetalFx {
         self.fi_made_share
     }
 
-    /// Odd Tick fast path: blits `interp_cache` (Frame `N-0.5`) onto `screen`, transitions
-    /// `ReadyInterp -> ReadyReal`, and records a generated tick.
+    /// Odd Tick fast path: blits `interp_cache` (Frame `N-0.5`) onto `screen`, runs optional
+    /// inline `after` draws (e.g. screen vignette/tint) inside the same TBDR render pass to avoid
+    /// an extra full-resolution swapchain Load+Store, transitions `ReadyInterp -> ReadyReal`, and
+    /// records a generated tick.
     pub fn blit_pipelined_interp(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
-        timing: Option<&mut super::pack_timing::PassTiming>,
+        after: impl FnOnce(&mut wgpu::RenderPass<'_>),
     ) -> bool {
         if self.fg_state != FgState::ReadyInterp {
             return false;
@@ -653,23 +655,25 @@ impl MetalFx {
             self.fg_state = FgState::Empty;
             return false;
         };
-        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("MetalFX FG odd present"),
-            timestamp_writes: timing.and_then(|t| t.writes("Frame Gen present")),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: screen,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        rp.set_pipeline(&self.blit_pipeline);
-        rp.set_bind_group(0, &fg.interp_cache_blit_group, &[]);
-        rp.draw(0..3, 0..1);
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FG odd present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: screen,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.blit_pipeline);
+            rp.set_bind_group(0, &fg.interp_cache_blit_group, &[]);
+            rp.draw(0..3, 0..1);
+            after(&mut rp);
+        }
         self.fg_state = FgState::ReadyReal;
         self.record_fi_tick(true);
         true
@@ -677,11 +681,12 @@ impl MetalFx {
 
     /// Even Tick Step A: blits cached real Frame `N-1` onto `screen` IMMEDIATELY (<0.5ms GPU) so
     /// the current VSync lands right on time before Step B renders Frame `N` + `interp(N-0.5)`.
+    /// Runs optional inline `after` draws (screen effects) in the same TBDR render pass.
     pub fn blit_pipelined_real(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
-        timing: Option<&mut super::pack_timing::PassTiming>,
+        after: impl FnOnce(&mut wgpu::RenderPass<'_>),
     ) -> bool {
         if self.fg_state != FgState::ReadyReal {
             return false;
@@ -697,23 +702,25 @@ impl MetalFx {
         } else {
             &fg.real_cache_blit_groups[fg.prev_idx]
         };
-        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("MetalFX FG even real present"),
-            timestamp_writes: timing.and_then(|t| t.writes("Frame Gen present")),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: screen,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        rp.set_pipeline(&self.blit_pipeline);
-        rp.set_bind_group(0, group, &[]);
-        rp.draw(0..3, 0..1);
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FG even real present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: screen,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.blit_pipeline);
+            rp.set_bind_group(0, group, &[]);
+            rp.draw(0..3, 0..1);
+            after(&mut rp);
+        }
         self.record_fi_tick(false);
         true
     }
@@ -773,11 +780,11 @@ impl MetalFx {
                     let current_inv = current.inverse();
                     let reproj_sky = prev_vp * current_inv;
                     // Detect abrupt camera cuts (e.g., 3rd-person back -> front F5 180° flip)
-                    // where screen center jumps far off-axis in a single frame.
+                    // without tripping on fast touchscreen camera swipes at 30 real FPS.
                     let center_prev = reproj_sky * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
                     let cut = center_prev.w <= 1e-4
-                        || (center_prev.x / center_prev.w).abs() > 1.25
-                        || (center_prev.y / center_prev.w).abs() > 1.25;
+                        || (center_prev.x / center_prev.w).abs() > 2.5
+                        || (center_prev.y / center_prev.w).abs() > 2.5;
                     if cut {
                         (DMat4::IDENTITY, DMat4::IDENTITY, true)
                     } else {
@@ -1043,7 +1050,7 @@ impl MetalFx {
             };
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX input"),
-                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX input")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &targets.input_color_view,
                     depth_slice: None,
@@ -1120,7 +1127,7 @@ impl MetalFx {
                 };
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("MetalFX motion"),
-                    timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
+                    timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX motion")),
                     color_attachments: &[
                         Some(wgpu::RenderPassColorAttachment {
                             view: &targets.motion_view,
@@ -1226,7 +1233,7 @@ impl MetalFx {
         if used_native {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX present"),
-                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX present")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: screen,
                     depth_slice: None,
@@ -1260,7 +1267,7 @@ impl MetalFx {
             });
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX CAS fallback"),
-                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX")),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("MetalFX CAS")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: screen,
                     depth_slice: None,
@@ -1552,7 +1559,7 @@ impl MetalFx {
             if let Some(screen) = screen {
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("MetalFX FG prime present"),
-                    timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("Frame Gen")),
+                    timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("FG prime")),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: screen,
                         depth_slice: None,
@@ -1683,7 +1690,7 @@ impl MetalFx {
             };
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FG motion"),
-                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("Frame Gen")),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("FG motion")),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
                         view: &fg.motion_view,
@@ -1727,7 +1734,7 @@ impl MetalFx {
             };
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FG interpolate"),
-                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("Frame Gen")),
+                timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes("FG interp")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &fg.interp_cache_view,
                     depth_slice: None,
@@ -1753,7 +1760,7 @@ impl MetalFx {
             // next tick enters pipelined steady state (`ReadyReal`).
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FG sync present"),
-                timestamp_writes: timing.and_then(|t| t.writes("Frame Gen")),
+                timestamp_writes: timing.and_then(|t| t.writes("FG present")),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: screen,
                     depth_slice: None,
