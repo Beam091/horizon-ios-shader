@@ -1176,7 +1176,7 @@ impl H {
                 )
             }
             H::FrameGeneration => {
-                g.frame_generation = step(&FrameGeneration::ALL, g.frame_generation, back)
+                g.frame_generation = step(FrameGeneration::available(), g.frame_generation, back)
             }
             H::Hdr => g.hdr = !g.hdr,
             H::HdrLighting => g.hdr_lighting = !g.hdr_lighting,
@@ -1486,12 +1486,9 @@ pub enum Target {
 type Line = shell::Line<Page, Setting>;
 
 /// Whether a setting is on the screen now: Upscaling only while TAA is (and not under a shader
-/// pack, which uses Resolution Scale / MetalFX), MetalFX Scale only while MetalFX is on,
-/// Overlay Corner/Size only while Overlay is on, and Frame Generation is desktop-only.
+/// pack, which uses Resolution Scale / MetalFX), MetalFX Scale only while MetalFX is on, and
+/// Overlay Corner/Size only while Overlay is on.
 fn shown(item: Item, s: &Settings) -> bool {
-    if cfg!(target_os = "ios") && item == Item::Horizon(H::FrameGeneration) {
-        return false;
-    }
     if matches!(item, Item::Horizon(H::MetalFxFactor | H::MetalFxPreset)) {
         return s.horizon.metalfx_mode != MetalFxMode::Off;
     }

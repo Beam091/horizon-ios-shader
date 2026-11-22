@@ -45,6 +45,8 @@ fn debug() -> Option<&'static str> {
 
 pub struct FrameGen {
     pub on: bool,
+    /// Use Apple's hardware `MTLFXFrameInterpolator` instead of the WGSL FSR 3.1 compute path.
+    pub metalfx: bool,
     /// The present thread failed to show a frame (or died): until the renderer has
     /// acquired a frame itself, the normal path runs and handles the surface.
     pub paused: bool,
@@ -104,6 +106,7 @@ impl FrameGen {
     pub fn new() -> Self {
         Self {
             on: false,
+            metalfx: false,
             paused: false,
             gpu: None,
             presenter: None,
@@ -119,6 +122,11 @@ impl FrameGen {
             shown_since: Instant::now(),
             made_share: None,
         }
+    }
+
+    /// Smoothed duration between real frames in seconds, for `MTLFXFrameInterpolator.deltaTime`.
+    pub fn interval_secs(&self) -> f32 {
+        self.interval.as_secs_f32().clamp(0.001, 0.25)
     }
 
     /// Ends frame generation's frames and present thread: before the surface is

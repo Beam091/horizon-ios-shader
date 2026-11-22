@@ -51,6 +51,40 @@ struct Targets {
     reset_next: bool,
 }
 
+/// Per-frame camera and timing inputs for Apple `MTLFXFrameInterpolator`.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub struct FrameGenParams {
+    pub delta_time: f32,
+    pub near: f32,
+    pub far: f32,
+    pub fov_degrees: f32,
+    pub render_size: [u32; 2],
+}
+
+#[allow(dead_code)]
+struct FrameGenTargets {
+    size: [u32; 2],
+    color_format: wgpu::TextureFormat,
+    /// Ping-pong current/previous color buffers (`curr_idx` and `1 - curr_idx`) matching `size`.
+    history: [wgpu::Texture; 2],
+    history_views: [wgpu::TextureView; 2],
+    motion: wgpu::Texture,
+    motion_view: wgpu::TextureView,
+    depth_r32: wgpu::Texture,
+    depth_r32_view: wgpu::TextureView,
+    reactive: wgpu::Texture,
+    reactive_view: wgpu::TextureView,
+    output: wgpu::Texture,
+    output_view: wgpu::TextureView,
+    output_blit_group: wgpu::BindGroup,
+    curr_idx: usize,
+    has_prev: bool,
+    reset_next: bool,
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    interpolator: Option<wgpu::hal::metal::metalfx::FrameInterpolator>,
+}
+
 #[allow(dead_code)]
 pub struct MetalFx {
     pub mode: MetalFxMode,
@@ -60,6 +94,7 @@ pub struct MetalFx {
     motion_pipeline: wgpu::RenderPipeline,
     motion_layout: wgpu::BindGroupLayout,
     motion_uniform: wgpu::Buffer,
+    fg_motion_uniform: wgpu::Buffer,
     blit_pipeline: wgpu::RenderPipeline,
     cas_pipeline: wgpu::RenderPipeline,
     input_copy_rgba8: wgpu::RenderPipeline,
@@ -67,6 +102,8 @@ pub struct MetalFx {
     blit_layout: wgpu::BindGroupLayout,
     linear: wgpu::Sampler,
     targets: Option<Targets>,
+    fg_targets: Option<FrameGenTargets>,
+    fg_supported_cache: std::sync::OnceLock<bool>,
     frame_index: u32,
     previous_camera: Option<(DMat4, DVec3, bool)>,
     jitter_px: [f32; 2],
@@ -236,6 +273,12 @@ impl MetalFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let fg_motion_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MetalFX frame-gen motion uniform"),
+            size: std::mem::size_of::<MotionUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             mode: MetalFxMode::Off,
@@ -245,6 +288,7 @@ impl MetalFx {
             motion_pipeline,
             motion_layout,
             motion_uniform,
+            fg_motion_uniform,
             blit_pipeline,
             cas_pipeline,
             input_copy_rgba8,
@@ -252,6 +296,8 @@ impl MetalFx {
             blit_layout,
             linear,
             targets: None,
+            fg_targets: None,
+            fg_supported_cache: std::sync::OnceLock::new(),
             frame_index: 0,
             previous_camera: None,
             jitter_px: [0.0; 2],
@@ -265,15 +311,48 @@ impl MetalFx {
         self.mode != MetalFxMode::Off
     }
 
+    /// Queries once whether this Metal device & OS support `MTLFXFrameInterpolator` (iOS 26+).
+    #[allow(unused_variables)]
+    pub fn frame_gen_supported(&self, device: &wgpu::Device) -> bool {
+        *self.fg_supported_cache.get_or_init(|| {
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            {
+                let supported = unsafe {
+                    device
+                        .as_hal::<wgpu::hal::api::Metal>()
+                        .is_some_and(|hal_dev| {
+                            wgpu::hal::metal::metalfx::FrameInterpolator::is_supported(
+                                hal_dev.raw_device(),
+                            )
+                        })
+                };
+                log::info!("Horizon: MetalFX Frame Interpolation supported = {supported}");
+                supported
+            }
+            #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+            {
+                false
+            }
+        })
+    }
+
+    /// Invalidates MetalFX Frame Interpolation history (e.g. menu open, resize, world switch).
+    pub fn reset_frame_gen(&mut self) {
+        if let Some(fg) = &mut self.fg_targets {
+            fg.has_prev = false;
+            fg.reset_next = true;
+        }
+    }
+
     /// Computes `(render_size, output_size)` for the active preset, mode, and factor on `window`.
     pub fn sizes(&self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
         self.preset
             .sizes_for_window_with_factor(self.mode, self.factor, window)
     }
 
-    /// Sub-pixel jitter matrix (Halton 2, 3) for `MetalFxMode::Temporal` and camera reprojection.
-    /// Returns `Mat4::IDENTITY` when MetalFX is off, spatial, on the title screen, or when
-    /// `apply_jitter` is false (shader packs supply their own projection matrix).
+    /// Sub-pixel jitter matrix (Halton 2, 3) for `MetalFxMode::Temporal` and camera reprojection
+    /// (shared with `MTLFXFrameInterpolator`). Returns `Mat4::IDENTITY` when not Temporal, on the
+    /// title screen, or when `apply_jitter` is false (shader packs supply their own projection).
     pub fn begin_frame(
         &mut self,
         window: [u32; 2],
@@ -282,7 +361,7 @@ impl MetalFx {
         view_proj: Mat4,
         camera: DVec3,
     ) -> Mat4 {
-        if !world_active || self.mode == MetalFxMode::Off {
+        if !world_active {
             self.previous_camera = None;
             self.jitter_px = [0.0; 2];
             self.reproject = Mat4::IDENTITY;
@@ -795,6 +874,472 @@ impl MetalFx {
             rp.draw(0..3, 0..1);
         }
     }
+
+    fn ensure_frame_gen_targets(&mut self, device: &wgpu::Device, render_size: [u32; 2]) {
+        // Cap MetalFX Frame Interpolation at 720p vertical so mobile GPUs (A14/A16) stay well
+        // within a ~2-4 ms interpolation budget while real frames retain full resolution.
+        let fg_size = frame_gen_size(render_size);
+        let color_format = if matches!(
+            self.format,
+            wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgb10a2Unorm
+        ) {
+            wgpu::TextureFormat::Rgba16Float
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        let valid = self
+            .fg_targets
+            .as_ref()
+            .is_some_and(|t| t.size == fg_size && t.color_format == color_format);
+        if valid {
+            return;
+        }
+        self.fg_targets = None;
+        let tex = |label, format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: fg_size[0].max(1),
+                    height: fg_size[1].max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let color_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST;
+        let h0 = tex("MetalFX FI history 0", color_format, color_usage);
+        let h1 = tex("MetalFX FI history 1", color_format, color_usage);
+        let h0_view = h0.create_view(&Default::default());
+        let h1_view = h1.create_view(&Default::default());
+        let motion = tex(
+            "MetalFX FI motion",
+            wgpu::TextureFormat::Rg16Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING,
+        );
+        let motion_view = motion.create_view(&Default::default());
+        let depth_r32 = tex(
+            "MetalFX FI depth",
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING,
+        );
+        let depth_r32_view = depth_r32.create_view(&Default::default());
+        let reactive = tex(
+            "MetalFX FI reactive",
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let reactive_view = reactive.create_view(&Default::default());
+        let output = tex(
+            "MetalFX FI output",
+            color_format,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
+        );
+        let output_view = output.create_view(&Default::default());
+        let output_blit_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MetalFX FI output blit"),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear),
+                },
+            ],
+        });
+
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        let interpolator = {
+            let built = unsafe {
+                device
+                    .as_hal::<wgpu::hal::api::Metal>()
+                    .and_then(|hal_dev| {
+                        let raw_dev = hal_dev.raw_device();
+                        let c_tex = h0.as_hal::<wgpu::hal::api::Metal>()?;
+                        let d_tex = depth_r32.as_hal::<wgpu::hal::api::Metal>()?;
+                        let m_tex = motion.as_hal::<wgpu::hal::api::Metal>()?;
+                        let o_tex = output.as_hal::<wgpu::hal::api::Metal>()?;
+                        wgpu::hal::metal::metalfx::FrameInterpolator::new(
+                            raw_dev,
+                            fg_size,
+                            c_tex.raw_handle(),
+                            d_tex.raw_handle(),
+                            m_tex.raw_handle(),
+                            o_tex.raw_handle(),
+                        )
+                    })
+            };
+            if built.is_some() {
+                log::info!(
+                    "Horizon: MetalFX Frame Interpolation active ({}x{})",
+                    fg_size[0],
+                    fg_size[1],
+                );
+            } else {
+                log::warn!(
+                    "Horizon: MetalFX Frame Interpolation unavailable for {}x{}",
+                    fg_size[0],
+                    fg_size[1],
+                );
+            }
+            built
+        };
+
+        self.fg_targets = Some(FrameGenTargets {
+            size: fg_size,
+            color_format,
+            history: [h0, h1],
+            history_views: [h0_view, h1_view],
+            motion,
+            motion_view,
+            depth_r32,
+            depth_r32_view,
+            reactive,
+            reactive_view,
+            output,
+            output_view,
+            output_blit_group,
+            curr_idx: 0,
+            has_prev: false,
+            reset_next: true,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            interpolator,
+        });
+    }
+
+    /// Runs MetalFX Upscaling (if enabled) and/or Apple `MTLFXFrameInterpolator` (when `generated`
+    /// and `fg_params` are provided). Writes the real frame onto `screen` and the interpolated
+    /// frame onto `generated`, returning `true` when an interpolated frame was produced.
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    pub fn finish_with_frame_gen(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        pending_cmds: &mut Vec<wgpu::CommandBuffer>,
+        src_color: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        opaque_depth: Option<&wgpu::TextureView>,
+        screen: &wgpu::TextureView,
+        generated: Option<&wgpu::TextureView>,
+        fg_params: Option<FrameGenParams>,
+        window: [u32; 2],
+        gl_depth_flipped: bool,
+    ) -> bool {
+        let upscale_on = self.active();
+        let Some((gen_view, fg_p)) = generated.zip(fg_params) else {
+            if upscale_on {
+                self.finish(
+                    device,
+                    queue,
+                    encoder,
+                    pending_cmds,
+                    Some(src_color),
+                    depth_view,
+                    opaque_depth,
+                    screen,
+                    window,
+                    gl_depth_flipped,
+                );
+            }
+            return false;
+        };
+
+        // 1. Real frame: run MetalFX upscaler if enabled, else blit `src_color` directly to `screen`.
+        if upscale_on {
+            self.finish(
+                device,
+                queue,
+                encoder,
+                pending_cmds,
+                Some(src_color),
+                depth_view,
+                opaque_depth,
+                screen,
+                window,
+                gl_depth_flipped,
+            );
+        } else {
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("MetalFX FI real copy"),
+                layout: &self.blit_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_color),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.linear),
+                    },
+                ],
+            });
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FI real"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: screen,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.blit_pipeline);
+            rp.set_bind_group(0, &group, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        // 2. Interpolated frame: copy current world into ping-pong history + build motion/depth.
+        self.ensure_frame_gen_targets(device, fg_p.render_size);
+        let fg = self.fg_targets.as_mut().expect("fg_targets");
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        let has_interp = fg.interpolator.is_some();
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        let has_interp = false;
+        if !has_interp {
+            return false;
+        }
+
+        let curr_idx = fg.curr_idx;
+        let copy_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MetalFX FI input copy"),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear),
+                },
+            ],
+        });
+        let copy_pl = if fg.color_format == wgpu::TextureFormat::Rgba16Float {
+            &self.input_copy_rgba16
+        } else {
+            &self.input_copy_rgba8
+        };
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FI history"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &fg.history_views[curr_idx],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            rp.set_pipeline(copy_pl);
+            rp.set_bind_group(0, &copy_group, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        let has_opaque = opaque_depth.is_some();
+        let u = MotionUniform {
+            reproject: self.reproject.to_cols_array_2d(),
+            reproject_sky: self.reproject_sky.to_cols_array_2d(),
+            size: [fg.size[0] as f32, fg.size[1] as f32],
+            jitter_px: self.jitter_px,
+            flags: [
+                if gl_depth_flipped { 1.0 } else { 0.0 },
+                if has_opaque { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+        };
+        queue.write_buffer(&self.fg_motion_uniform, 0, bytemuck::bytes_of(&u));
+        let motion_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MetalFX FI motion"),
+            layout: &self.motion_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.fg_motion_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        opaque_depth.unwrap_or(depth_view),
+                    ),
+                },
+            ],
+        });
+        {
+            let clear = wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            };
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FI motion"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &fg.motion_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: clear,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &fg.depth_r32_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: clear,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &fg.reactive_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: clear,
+                    }),
+                ],
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.motion_pipeline);
+            rp.set_bind_group(0, &motion_group, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        // 3. Encode `MTLFXFrameInterpolator` into a dedicated untouched CommandEncoder.
+        #[allow(unused_mut)]
+        let mut made = false;
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        if let Some(interp) = &fg.interpolator {
+            let prev = std::mem::replace(
+                encoder,
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Horizon post-MetalFX-FI"),
+                }),
+            );
+            pending_cmds.push(prev.finish());
+
+            let mut fi_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("MetalFX FI"),
+            });
+            let prev_idx = if fg.has_prev { 1 - curr_idx } else { curr_idx };
+            let reset = self.reset_history || fg.reset_next || !fg.has_prev;
+            let jitter_px = self.jitter_px;
+            let aspect = fg.size[0] as f32 / fg.size[1].max(1) as f32;
+            let mut encoded = false;
+            unsafe {
+                fi_enc.as_hal_mut::<wgpu::hal::api::Metal, _, _>(|hal_enc| {
+                    let Some(hal_enc) = hal_enc else {
+                        return;
+                    };
+                    hal_enc.end_pending_encoders();
+                    let Some(cmd_buf) = hal_enc.raw_command_buffer() else {
+                        return;
+                    };
+                    let Some(c_tex) = fg.history[curr_idx].as_hal::<wgpu::hal::api::Metal>() else {
+                        return;
+                    };
+                    let Some(p_tex) = fg.history[prev_idx].as_hal::<wgpu::hal::api::Metal>() else {
+                        return;
+                    };
+                    let Some(d_tex) = fg.depth_r32.as_hal::<wgpu::hal::api::Metal>() else {
+                        return;
+                    };
+                    let Some(m_tex) = fg.motion.as_hal::<wgpu::hal::api::Metal>() else {
+                        return;
+                    };
+                    let Some(o_tex) = fg.output.as_hal::<wgpu::hal::api::Metal>() else {
+                        return;
+                    };
+                    interp.encode(
+                        cmd_buf,
+                        c_tex.raw_handle(),
+                        p_tex.raw_handle(),
+                        d_tex.raw_handle(),
+                        m_tex.raw_handle(),
+                        o_tex.raw_handle(),
+                        jitter_px,
+                        fg_p.delta_time.clamp(0.001, 0.25),
+                        fg_p.near.max(0.01),
+                        fg_p.far.max(1.0),
+                        fg_p.fov_degrees.clamp(10.0, 150.0),
+                        aspect,
+                        true,
+                        reset,
+                    );
+                    encoded = true;
+                });
+            }
+            if encoded {
+                pending_cmds.push(fi_enc.finish());
+                fg.has_prev = true;
+                fg.reset_next = false;
+                fg.curr_idx = 1 - curr_idx;
+                made = !reset;
+            }
+        }
+
+        // 4. Composite interpolated output onto `generated` (CAS-sharpened when upscaling to display).
+        if made {
+            let pl = if fg.size != window {
+                &self.cas_pipeline
+            } else {
+                &self.blit_pipeline
+            };
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FI present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: gen_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            rp.set_pipeline(pl);
+            rp.set_bind_group(0, &fg.output_blit_group, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        made
+    }
+}
+
+/// Computes the working resolution for `MTLFXFrameInterpolator` (even dimensions, capped at 720p
+/// height to keep mobile GPU overhead around ~2–4 ms on iPhone/iPad while preserving aspect ratio).
+fn frame_gen_size(render_size: [u32; 2]) -> [u32; 2] {
+    let w = render_size[0].max(64);
+    let h = render_size[1].max(64);
+    if h <= 720 {
+        return [(w & !1).max(64), (h & !1).max(64)];
+    }
+    let out_h = 720u32;
+    let out_w = ((w as f64 * f64::from(out_h) / h as f64).round() as u32 & !1).max(64);
+    [out_w, out_h]
 }
 
 fn halton(mut index: u32, base: u32) -> f32 {

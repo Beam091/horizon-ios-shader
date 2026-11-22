@@ -4908,7 +4908,7 @@ impl PackPost {
                 None => size,
             };
             if final_pass {
-                if size != window {
+                if size != window || defer_upscale {
                     if self.final_target.as_ref().is_none_or(|t| t.size != size) {
                         let texture = device.create_texture(&wgpu::TextureDescriptor {
                             label: Some("Shader pack final"),
@@ -5016,7 +5016,32 @@ impl PackPost {
         };
         // Without `final`, colortex0 holds floats (`new` refuses an integer one).
         if !shown {
-            self.final_target = None;
+            if defer_upscale {
+                if self.final_target.as_ref().is_none_or(|t| t.size != size) {
+                    let texture = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Shader pack final"),
+                        size: wgpu::Extent3d {
+                            width: size[0],
+                            height: size[1],
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.screen,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    self.final_target = Some(FinalTarget {
+                        size,
+                        view: texture.create_view(&Default::default()),
+                    });
+                }
+            } else {
+                self.final_target = None;
+            }
+            let dest = self.final_target.as_ref().map_or(screen, |t| &t.view);
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Shader pack colortex0"),
                 layout: &self.copy.1,
@@ -5035,12 +5060,18 @@ impl PackPost {
             });
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Shader pack colortex0"),
-                color_attachments: &[attach(screen, overwrite)],
+                color_attachments: &[attach(dest, overwrite)],
                 ..Default::default()
             });
             rp.set_pipeline(&self.copy.0);
             rp.set_bind_group(0, &group, &[]);
             rp.draw(0..3, 0..1);
+            if defer_upscale
+                && let Some(picture) = self.final_target.as_ref().map(|t| &t.view)
+            {
+                let opaque = targets.depth1.as_ref().map(|(_, v)| v.clone());
+                return Some((picture.clone(), targets.depth.clone(), opaque));
+            }
         } else if let Some(picture) = self.final_target.as_ref().map(|t| &t.view) {
             if defer_upscale {
                 let opaque = targets.depth1.as_ref().map(|(_, v)| v.clone());

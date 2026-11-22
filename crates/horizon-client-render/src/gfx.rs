@@ -6357,13 +6357,21 @@ impl Renderer {
     pub fn frame_generation_share(&self) -> Option<f32> {
         self.frame_gen.made_share
     }
-    /// Frame generation on or off (FSR 3.1's frame interpolation).
-    pub fn set_frame_generation(&mut self, on: bool) {
-        let on = on && !cfg!(target_os = "ios");
-        if !on {
+    /// Frame generation mode (FSR 3.1 on desktop, MetalFX Frame Interpolation on iOS 26+).
+    pub fn set_frame_generation(&mut self, mode: crate::graphics::FrameGeneration) {
+        let (on, metalfx) = match mode {
+            crate::graphics::FrameGeneration::Off => (false, false),
+            crate::graphics::FrameGeneration::Fsr31 => (!cfg!(target_os = "ios"), false),
+            crate::graphics::FrameGeneration::MetalFx => {
+                (cfg!(any(target_os = "ios", target_os = "macos")), true)
+            }
+        };
+        if self.frame_gen.on != on || self.frame_gen.metalfx != metalfx {
             self.frame_gen.stop();
+            self.metalfx.reset_frame_gen();
         }
         self.frame_gen.on = on;
+        self.frame_gen.metalfx = metalfx;
     }
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     pub fn set_world_post(&mut self, scale: f32, antialias: bool, taa: bool, upscale: f32) {
@@ -7123,20 +7131,26 @@ impl Renderer {
         }
         laps.lap("r_prepare");
         // Frame generation: its present thread acquires and presents, this frame draws
-        // into frames of its own. Not over menus that blur the frame, a shader pack's
-        // own post passes, HDR (or the 16-bit frame it was started with) or the title screen.
+        // into frames of its own. Not over menus that blur the frame, HDR (or the 16-bit
+        // frame it was started with) or the title screen. FSR 3.1 skips shader packs;
+        // Apple MetalFX Frame Interpolation runs on both Vanilla and Shader Packs.
+        let fg_metalfx = self.frame_gen.on
+            && self.frame_gen.metalfx
+            && self.metalfx.frame_gen_supported(&self.device);
         let fg = self.frame_gen.on
+            && (!self.frame_gen.metalfx || fg_metalfx)
             && !self.frame_gen.paused
             && self.hdr.is_none()
             && self.frame_format == self.config.format.remove_srgb_suffix()
             && !frame.title
             && frame.menu_blur.is_none()
-            && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
+            && (fg_metalfx || self.pack_post.as_ref().is_none_or(|p| p.1.is_none()))
             && self.native.as_ref().is_none_or(|n| n.post.is_none())
             && (self.surface.is_none()
                 || self.config.usage.contains(wgpu::TextureUsages::COPY_DST));
         if !fg {
             self.frame_gen.stop();
+            self.metalfx.reset_frame_gen();
         }
         // Waits for the submit thread since the last frame's present (this frame's uploads).
         let queued = self.queue.take_waited();
@@ -7266,6 +7280,7 @@ impl Renderer {
         let has_pack = self.pack_post.as_ref().is_some_and(|p| p.1.is_some())
             || self.native.as_ref().is_some_and(|n| n.post.is_some());
         let mfx_active = !frame.title && self.metalfx.active();
+        let mfx_fg_active = fg && fg_metalfx;
         let mfx_render_size = mfx_active.then(|| self.metalfx.sizes(window_size).0);
         self.world_post.fixed_size = mfx_render_size;
         let mfx_view_proj = if has_pack
@@ -7279,8 +7294,8 @@ impl Renderer {
         };
         let mfx_jitter = self.metalfx.begin_frame(
             window_size,
-            mfx_active,
-            !has_pack,
+            mfx_active || mfx_fg_active,
+            mfx_active && !has_pack,
             mfx_view_proj,
             frame.camera,
         );
@@ -8504,13 +8519,15 @@ impl Renderer {
         if fg {
             self.frame_gen
                 .halfway_hand(frame.hand, hand_view, &mut self.entity_batch.combined);
-            self.frame_gen.track_entities(
-                &self.device,
-                &self.entity_atlas,
-                frame.entities,
-                frame.entity_motion,
-                frame.camera,
-            );
+            if !fg_metalfx {
+                self.frame_gen.track_entities(
+                    &self.device,
+                    &self.entity_atlas,
+                    frame.entities,
+                    frame.entity_motion,
+                    frame.camera,
+                );
+            }
         }
         let all_entities = &self.entity_batch.combined;
         let hand_quads = (frame.hand.len() / 4) as u32;
@@ -10457,7 +10474,7 @@ impl Renderer {
                 [self.config.width, self.config.height],
                 &pages,
                 &mut terrain,
-                mfx_active,
+                mfx_active || mfx_fg_active,
             );
             if let Some((picture, pack_depth, opaque_depth)) = deferred {
                 self.uploads.finish(&encoder);
@@ -10466,18 +10483,53 @@ impl Renderer {
                     self.section_uploads.finish(&encoder);
                     has_section_copies = false;
                 }
-                self.metalfx.finish(
+                let generated_view = if mfx_fg_active
+                    && let Some((_, generated)) = &fg_frames
+                {
+                    Some(generated.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(self.config.format.remove_srgb_suffix()),
+                        ..Default::default()
+                    }))
+                } else {
+                    None
+                };
+                let fg_params = generated_view.as_ref().map(|_| metalfx::FrameGenParams {
+                    delta_time: self.frame_gen.interval_secs(),
+                    near: NEAR_PLANE,
+                    far: frame.depth_far,
+                    fov_degrees: frame.fov_degrees,
+                    render_size: size,
+                });
+                fg_made = self.metalfx.finish_with_frame_gen(
                     &self.device,
                     &self.queue,
                     &mut encoder,
                     &mut pending_cmds,
-                    Some(&picture),
+                    &picture,
                     &pack_depth,
                     opaque_depth.as_ref(),
                     &view_target,
+                    generated_view.as_ref(),
+                    fg_params,
                     [self.config.width, self.config.height],
                     true,
                 );
+                if fg_made
+                    && let (Some((_, generated)), Some(generated_view)) =
+                        (&fg_frames, &generated_view)
+                {
+                    let overlay = Overlay {
+                        hand_quads: hand_quads * u32::from(!pack_draws_hand),
+                        first_hand_vertex: made_hand_vertex,
+                        crosshair,
+                        first_crosshair: debug_depth + debug_top,
+                        world_depth: false,
+                        real: false,
+                        hand_drawn: !pack_draws_hand,
+                        hand_view_proj,
+                    };
+                    self.draw_overlay(&mut encoder, frame, generated_view, generated, &overlay);
+                }
             }
             self.pack_post = Some((dimension, Some(post)));
         } else if let Some((color, depth)) = &scaled
@@ -10496,7 +10548,9 @@ impl Renderer {
                 history_reset,
                 native.timing.as_mut(),
             );
-        } else if let (Some((_, generated)), Some((_, depth))) = (&fg_frames, &scaled) {
+        } else if let (Some((_, generated)), Some((_, depth))) = (&fg_frames, &scaled)
+            && !fg_metalfx
+        {
             let world = self
                 .frame_gen
                 .world(&self.device, &self.world_post, &self.config);
@@ -10540,25 +10594,64 @@ impl Renderer {
                 self.draw_overlay(&mut encoder, frame, &generated_view, generated, &overlay);
             }
         } else if let Some((color, depth)) = &scaled {
-            if mfx_active {
+            if mfx_active || mfx_fg_active {
                 self.uploads.finish(&encoder);
                 if has_section_copies {
                     self.section_copy_bytes = 0;
                     self.section_uploads.finish(&encoder);
                     has_section_copies = false;
                 }
-                self.metalfx.finish(
+                let generated_view = if mfx_fg_active
+                    && let Some((_, generated)) = &fg_frames
+                {
+                    Some(generated.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(self.config.format.remove_srgb_suffix()),
+                        ..Default::default()
+                    }))
+                } else {
+                    None
+                };
+                let render_size = self
+                    .world_post
+                    .size()
+                    .unwrap_or([self.config.width, self.config.height]);
+                let fg_params = generated_view.as_ref().map(|_| metalfx::FrameGenParams {
+                    delta_time: self.frame_gen.interval_secs(),
+                    near: NEAR_PLANE,
+                    far: frame.depth_far,
+                    fov_degrees: frame.fov_degrees,
+                    render_size,
+                });
+                fg_made = self.metalfx.finish_with_frame_gen(
                     &self.device,
                     &self.queue,
                     &mut encoder,
                     &mut pending_cmds,
-                    Some(color),
+                    color,
                     depth,
                     None,
                     &view_target,
+                    generated_view.as_ref(),
+                    fg_params,
                     [self.config.width, self.config.height],
                     false,
                 );
+                if fg_made
+                    && let (Some((_, generated)), Some(generated_view)) =
+                        (&fg_frames, &generated_view)
+                {
+                    let overlay = Overlay {
+                        hand_quads: hand_quads * u32::from(!pack_draws_hand),
+                        first_hand_vertex: made_hand_vertex,
+                        crosshair,
+                        first_crosshair: debug_depth + debug_top,
+                        world_depth: false,
+                        real: false,
+                        hand_drawn: !pack_draws_hand,
+                        hand_view_proj,
+                    };
+                    self.draw_overlay(&mut encoder, frame, generated_view, generated, &overlay);
+                }
             } else {
                 self.world_post.finish(
                     &self.queue,

@@ -386,26 +386,39 @@ pub enum FrameGeneration {
     Off,
     /// AMD FidelityFX Super Resolution 3.1's frame interpolation, ported to WGSL.
     Fsr31,
+    /// Apple MetalFX Frame Interpolation (`MTLFXFrameInterpolator`, iOS/iPadOS 26+).
+    MetalFx,
 }
 impl FrameGeneration {
     pub const ALL: [FrameGeneration; 2] = [FrameGeneration::Off, FrameGeneration::Fsr31];
+    pub const IOS_ALL: [FrameGeneration; 2] = [FrameGeneration::Off, FrameGeneration::MetalFx];
+    pub fn available() -> &'static [FrameGeneration] {
+        if cfg!(target_os = "ios") {
+            &Self::IOS_ALL
+        } else {
+            &Self::ALL
+        }
+    }
     pub fn name(self) -> &'static str {
         match self {
             FrameGeneration::Off => "off",
             FrameGeneration::Fsr31 => "fsr3.1",
+            FrameGeneration::MetalFx => "metalfx",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             FrameGeneration::Off => "Off",
             FrameGeneration::Fsr31 => "FSR 3.1",
+            FrameGeneration::MetalFx => "MetalFX",
         }
     }
     fn parse(s: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|f| f.name() == s)
-            .unwrap_or_default()
+        match s {
+            "fsr3.1" => FrameGeneration::Fsr31,
+            "metalfx" => FrameGeneration::MetalFx,
+            _ => FrameGeneration::Off,
+        }
     }
 }
 
