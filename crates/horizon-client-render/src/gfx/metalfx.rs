@@ -65,6 +65,7 @@ pub struct FrameGenParams {
 #[allow(dead_code)]
 struct FrameGenTargets {
     size: [u32; 2],
+    window_size: [u32; 2],
     color_format: wgpu::TextureFormat,
     /// Ping-pong current/previous color buffers (`curr_idx` and `1 - curr_idx`) matching `size`.
     history: [wgpu::Texture; 2],
@@ -78,6 +79,10 @@ struct FrameGenTargets {
     output: wgpu::Texture,
     output_view: wgpu::TextureView,
     output_blit_group: wgpu::BindGroup,
+    /// Full-window cached real world frame `N`, presented on the very next display tick.
+    real_cache: wgpu::Texture,
+    real_cache_view: wgpu::TextureView,
+    real_cache_blit_group: wgpu::BindGroup,
     curr_idx: usize,
     has_prev: bool,
     reset_next: bool,
@@ -104,6 +109,13 @@ pub struct MetalFx {
     targets: Option<Targets>,
     fg_targets: Option<FrameGenTargets>,
     fg_supported_cache: std::sync::OnceLock<bool>,
+    has_cached_real: bool,
+    fi_last_real: Option<std::time::Instant>,
+    fi_interval: f32,
+    fi_real_count: u32,
+    fi_made_count: u32,
+    fi_shown_since: std::time::Instant,
+    fi_made_share: Option<f32>,
     frame_index: u32,
     previous_camera: Option<(DMat4, DVec3, bool)>,
     jitter_px: [f32; 2],
@@ -298,6 +310,13 @@ impl MetalFx {
             targets: None,
             fg_targets: None,
             fg_supported_cache: std::sync::OnceLock::new(),
+            has_cached_real: false,
+            fi_last_real: None,
+            fi_interval: 1.0 / 30.0,
+            fi_real_count: 0,
+            fi_made_count: 0,
+            fi_shown_since: std::time::Instant::now(),
+            fi_made_share: None,
             frame_index: 0,
             previous_camera: None,
             jitter_px: [0.0; 2],
@@ -336,11 +355,84 @@ impl MetalFx {
         })
     }
 
-    /// Invalidates MetalFX Frame Interpolation history (e.g. menu open, resize, world switch).
+    /// Invalidates MetalFX Frame Interpolation history and cached real frame (e.g. menu open, resize).
     pub fn reset_frame_gen(&mut self) {
+        self.has_cached_real = false;
+        self.fi_last_real = None;
+        self.fi_real_count = 0;
+        self.fi_made_count = 0;
+        self.fi_made_share = None;
         if let Some(fg) = &mut self.fg_targets {
             fg.has_prev = false;
             fg.reset_next = true;
+        }
+    }
+
+    /// Whether a cached real frame `N` is waiting to be presented on this odd display tick.
+    pub fn has_cached_real(&self) -> bool {
+        self.has_cached_real && self.fg_targets.is_some()
+    }
+
+    /// The cached real frame's render attachment view (used to stamp Vanilla first-person hand onto it).
+    pub fn cached_real_view(&self) -> Option<&wgpu::TextureView> {
+        self.has_cached_real
+            .then(|| self.fg_targets.as_ref().map(|fg| &fg.real_cache_view))
+            .flatten()
+    }
+
+    /// Share of real frames that produced an interpolated MetalFX frame (for F3 readout).
+    pub fn frame_gen_share(&self) -> Option<f32> {
+        self.fi_made_share
+    }
+
+    /// Presents the cached real frame `N` onto `screen` on the odd display tick, skipping all 3D rendering.
+    pub fn blit_cached_real(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        screen: &wgpu::TextureView,
+    ) -> bool {
+        if !self.has_cached_real {
+            return false;
+        }
+        let Some(fg) = &self.fg_targets else {
+            self.has_cached_real = false;
+            return false;
+        };
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("MetalFX FI cached real"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: screen,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        rp.set_pipeline(&self.blit_pipeline);
+        rp.set_bind_group(0, &fg.real_cache_blit_group, &[]);
+        rp.draw(0..3, 0..1);
+        self.has_cached_real = false;
+        self.record_fi_tick(false);
+        true
+    }
+
+    fn record_fi_tick(&mut self, made: bool) {
+        if made {
+            self.fi_made_count += 1;
+        } else {
+            self.fi_real_count += 1;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.fi_shown_since) >= std::time::Duration::from_millis(500) {
+            if self.fi_real_count > 0 {
+                self.fi_made_share = Some(self.fi_made_count as f32 / self.fi_real_count as f32);
+            }
+            self.fi_real_count = 0;
+            self.fi_made_count = 0;
+            self.fi_shown_since = now;
         }
     }
 
@@ -875,7 +967,12 @@ impl MetalFx {
         }
     }
 
-    fn ensure_frame_gen_targets(&mut self, device: &wgpu::Device, render_size: [u32; 2]) {
+    fn ensure_frame_gen_targets(
+        &mut self,
+        device: &wgpu::Device,
+        render_size: [u32; 2],
+        window: [u32; 2],
+    ) {
         // Cap MetalFX Frame Interpolation at 720p vertical so mobile GPUs (A14/A16) stay well
         // within a ~2-4 ms interpolation budget while real frames retain full resolution.
         let fg_size = frame_gen_size(render_size);
@@ -887,20 +984,20 @@ impl MetalFx {
         } else {
             wgpu::TextureFormat::Rgba8Unorm
         };
-        let valid = self
-            .fg_targets
-            .as_ref()
-            .is_some_and(|t| t.size == fg_size && t.color_format == color_format);
+        let valid = self.fg_targets.as_ref().is_some_and(|t| {
+            t.size == fg_size && t.window_size == window && t.color_format == color_format
+        });
         if valid {
             return;
         }
         self.fg_targets = None;
-        let tex = |label, format, usage| {
+        self.has_cached_real = false;
+        let tex = |label, size: [u32; 2], format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
-                    width: fg_size[0].max(1),
-                    height: fg_size[1].max(1),
+                    width: size[0].max(1),
+                    height: size[1].max(1),
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -916,12 +1013,13 @@ impl MetalFx {
             | wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::COPY_DST;
-        let h0 = tex("MetalFX FI history 0", color_format, color_usage);
-        let h1 = tex("MetalFX FI history 1", color_format, color_usage);
+        let h0 = tex("MetalFX FI history 0", fg_size, color_format, color_usage);
+        let h1 = tex("MetalFX FI history 1", fg_size, color_format, color_usage);
         let h0_view = h0.create_view(&Default::default());
         let h1_view = h1.create_view(&Default::default());
         let motion = tex(
             "MetalFX FI motion",
+            fg_size,
             wgpu::TextureFormat::Rg16Float,
             wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
@@ -930,6 +1028,7 @@ impl MetalFx {
         let motion_view = motion.create_view(&Default::default());
         let depth_r32 = tex(
             "MetalFX FI depth",
+            fg_size,
             wgpu::TextureFormat::R32Float,
             wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
@@ -938,12 +1037,14 @@ impl MetalFx {
         let depth_r32_view = depth_r32.create_view(&Default::default());
         let reactive = tex(
             "MetalFX FI reactive",
+            fg_size,
             wgpu::TextureFormat::R8Unorm,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let reactive_view = reactive.create_view(&Default::default());
         let output = tex(
             "MetalFX FI output",
+            fg_size,
             color_format,
             wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
@@ -958,6 +1059,27 @@ impl MetalFx {
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear),
+                },
+            ],
+        });
+        let real_cache = tex(
+            "MetalFX FI real cache",
+            window,
+            self.format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let real_cache_view = real_cache.create_view(&Default::default());
+        let real_cache_blit_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MetalFX FI real cache blit"),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&real_cache_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -989,9 +1111,11 @@ impl MetalFx {
             };
             if built.is_some() {
                 log::info!(
-                    "Horizon: MetalFX Frame Interpolation active ({}x{})",
+                    "Horizon: MetalFX Frame Interpolation active ({}x{}, window {}x{})",
                     fg_size[0],
                     fg_size[1],
+                    window[0],
+                    window[1],
                 );
             } else {
                 log::warn!(
@@ -1005,6 +1129,7 @@ impl MetalFx {
 
         self.fg_targets = Some(FrameGenTargets {
             size: fg_size,
+            window_size: window,
             color_format,
             history: [h0, h1],
             history_views: [h0_view, h1_view],
@@ -1017,6 +1142,9 @@ impl MetalFx {
             output,
             output_view,
             output_blit_group,
+            real_cache,
+            real_cache_view,
+            real_cache_blit_group,
             curr_idx: 0,
             has_prev: false,
             reset_next: true,
@@ -1025,9 +1153,14 @@ impl MetalFx {
         });
     }
 
-    /// Runs MetalFX Upscaling (if enabled) and/or Apple `MTLFXFrameInterpolator` (when `generated`
-    /// and `fg_params` are provided). Writes the real frame onto `screen` and the interpolated
-    /// frame onto `generated`, returning `true` when an interpolated frame was produced.
+    /// Runs MetalFX Upscaling (if enabled) and/or Apple `MTLFXFrameInterpolator` using
+    /// main-thread alternating presentation (no background `Presenter` thread, avoiding iOS
+    /// `CAMetalLayer` deadlocks):
+    /// - Frame 0: writes the real frame directly to `screen` and records it in `history[0]`.
+    /// - Frame 1+: writes the real frame `N` into `real_cache` (shown on the next odd display
+    ///   tick), runs `MTLFXFrameInterpolator(history[prev], history[curr])`, and presents the
+    ///   interpolated frame `N-0.5` onto `screen`.
+    /// Returns `true` when `screen` holds an interpolated frame (`N-0.5`) and `real_cache` holds `N`.
     #[allow(clippy::too_many_arguments, unused_variables)]
     pub fn finish_with_frame_gen(
         &mut self,
@@ -1039,13 +1172,13 @@ impl MetalFx {
         depth_view: &wgpu::TextureView,
         opaque_depth: Option<&wgpu::TextureView>,
         screen: &wgpu::TextureView,
-        generated: Option<&wgpu::TextureView>,
         fg_params: Option<FrameGenParams>,
         window: [u32; 2],
         gl_depth_flipped: bool,
     ) -> bool {
         let upscale_on = self.active();
-        let Some((gen_view, fg_p)) = generated.zip(fg_params) else {
+        let Some(fg_p) = fg_params else {
+            self.has_cached_real = false;
             if upscale_on {
                 self.finish(
                     device,
@@ -1063,65 +1196,52 @@ impl MetalFx {
             return false;
         };
 
-        // 1. Real frame: run MetalFX upscaler if enabled, else blit `src_color` directly to `screen`.
-        if upscale_on {
-            self.finish(
-                device,
-                queue,
-                encoder,
-                pending_cmds,
-                Some(src_color),
-                depth_view,
-                opaque_depth,
-                screen,
-                window,
-                gl_depth_flipped,
-            );
-        } else {
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("MetalFX FI real copy"),
-                layout: &self.blit_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(src_color),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.linear),
-                    },
-                ],
-            });
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MetalFX FI real"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: screen,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            rp.set_pipeline(&self.blit_pipeline);
-            rp.set_bind_group(0, &group, &[]);
-            rp.draw(0..3, 0..1);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.fi_last_real {
+            let dt = now.duration_since(last).as_secs_f32().clamp(0.004, 0.25);
+            self.fi_interval = self.fi_interval * 0.85 + dt * 0.15;
         }
+        self.fi_last_real = Some(now);
 
-        // 2. Interpolated frame: copy current world into ping-pong history + build motion/depth.
-        self.ensure_frame_gen_targets(device, fg_p.render_size);
-        let fg = self.fg_targets.as_mut().expect("fg_targets");
+        self.ensure_frame_gen_targets(device, fg_p.render_size, window);
         #[cfg(any(target_os = "ios", target_os = "macos"))]
-        let has_interp = fg.interpolator.is_some();
+        let has_interp = self
+            .fg_targets
+            .as_ref()
+            .is_some_and(|fg| fg.interpolator.is_some());
         #[cfg(not(any(target_os = "ios", target_os = "macos")))]
         let has_interp = false;
         if !has_interp {
+            self.has_cached_real = false;
+            if upscale_on {
+                self.finish(
+                    device,
+                    queue,
+                    encoder,
+                    pending_cmds,
+                    Some(src_color),
+                    depth_view,
+                    opaque_depth,
+                    screen,
+                    window,
+                    gl_depth_flipped,
+                );
+            } else {
+                self.blit_view(device, encoder, src_color, screen, "MetalFX FI fallback");
+            }
             return false;
         }
 
-        let curr_idx = fg.curr_idx;
+        // First frame (or immediately after a camera cut / scene reset): skip interpolation so
+        // `prevColorTexture` is never aliased to `colorTexture` and no stale frame is shown.
+        let can_interpolate = self
+            .fg_targets
+            .as_ref()
+            .is_some_and(|fg| fg.has_prev && !self.reset_history);
+
+        // 1. Copy `src_color` into the ping-pong history slot `curr_idx` (at `fg.size`).
+        let curr_idx = self.fg_targets.as_ref().expect("fg_targets").curr_idx;
+        let color_format = self.fg_targets.as_ref().expect("fg_targets").color_format;
         let copy_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MetalFX FI input copy"),
             layout: &self.blit_layout,
@@ -1136,16 +1256,17 @@ impl MetalFx {
                 },
             ],
         });
-        let copy_pl = if fg.color_format == wgpu::TextureFormat::Rgba16Float {
+        let copy_pl = if color_format == wgpu::TextureFormat::Rgba16Float {
             &self.input_copy_rgba16
         } else {
             &self.input_copy_rgba8
         };
         {
+            let hist_view = &self.fg_targets.as_ref().expect("fg_targets").history_views[curr_idx];
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FI history"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &fg.history_views[curr_idx],
+                    view: hist_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1160,11 +1281,70 @@ impl MetalFx {
             rp.draw(0..3, 0..1);
         }
 
+        if !can_interpolate {
+            // Prime history with Frame 0 and display the real frame directly on `screen`.
+            if upscale_on {
+                self.finish(
+                    device,
+                    queue,
+                    encoder,
+                    pending_cmds,
+                    Some(src_color),
+                    depth_view,
+                    opaque_depth,
+                    screen,
+                    window,
+                    gl_depth_flipped,
+                );
+            } else {
+                self.blit_view(device, encoder, src_color, screen, "MetalFX FI prime");
+            }
+            let fg = self.fg_targets.as_mut().expect("fg_targets");
+            fg.has_prev = true;
+            fg.reset_next = true;
+            fg.curr_idx = 1 - curr_idx;
+            self.has_cached_real = false;
+            self.record_fi_tick(false);
+            return false;
+        }
+
+        // 2. Render the real frame `N` into `real_cache_view` (to be presented on the next tick).
+        let real_cache_view = self
+            .fg_targets
+            .as_ref()
+            .expect("fg_targets")
+            .real_cache_view
+            .clone();
+        if upscale_on {
+            self.finish(
+                device,
+                queue,
+                encoder,
+                pending_cmds,
+                Some(src_color),
+                depth_view,
+                opaque_depth,
+                &real_cache_view,
+                window,
+                gl_depth_flipped,
+            );
+        } else {
+            self.blit_view(
+                device,
+                encoder,
+                src_color,
+                &real_cache_view,
+                "MetalFX FI real cache",
+            );
+        }
+
+        // 3. Build screen-space motion vectors & reverse-Z depth for `MTLFXFrameInterpolator`.
+        let fg_size = self.fg_targets.as_ref().expect("fg_targets").size;
         let has_opaque = opaque_depth.is_some();
         let u = MotionUniform {
             reproject: self.reproject.to_cols_array_2d(),
             reproject_sky: self.reproject_sky.to_cols_array_2d(),
-            size: [fg.size[0] as f32, fg.size[1] as f32],
+            size: [fg_size[0] as f32, fg_size[1] as f32],
             jitter_px: self.jitter_px,
             flags: [
                 if gl_depth_flipped { 1.0 } else { 0.0 },
@@ -1195,6 +1375,7 @@ impl MetalFx {
             ],
         });
         {
+            let fg = self.fg_targets.as_ref().expect("fg_targets");
             let clear = wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                 store: wgpu::StoreOp::Store,
@@ -1228,81 +1409,88 @@ impl MetalFx {
             rp.draw(0..3, 0..1);
         }
 
-        // 3. Encode `MTLFXFrameInterpolator` into a dedicated untouched CommandEncoder.
+        // 4. Encode `MTLFXFrameInterpolator` with distinct `prev` and `curr` history textures.
         #[allow(unused_mut)]
         let mut made = false;
         #[cfg(any(target_os = "ios", target_os = "macos"))]
-        if let Some(interp) = &fg.interpolator {
-            let prev = std::mem::replace(
-                encoder,
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Horizon post-MetalFX-FI"),
-                }),
-            );
-            pending_cmds.push(prev.finish());
+        {
+            let fg = self.fg_targets.as_mut().expect("fg_targets");
+            if let Some(interp) = &fg.interpolator {
+                let prev = std::mem::replace(
+                    encoder,
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Horizon post-MetalFX-FI"),
+                    }),
+                );
+                pending_cmds.push(prev.finish());
 
-            let mut fi_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("MetalFX FI"),
-            });
-            let prev_idx = if fg.has_prev { 1 - curr_idx } else { curr_idx };
-            let reset = self.reset_history || fg.reset_next || !fg.has_prev;
-            let jitter_px = self.jitter_px;
-            let aspect = fg.size[0] as f32 / fg.size[1].max(1) as f32;
-            let mut encoded = false;
-            unsafe {
-                fi_enc.as_hal_mut::<wgpu::hal::api::Metal, _, _>(|hal_enc| {
-                    let Some(hal_enc) = hal_enc else {
-                        return;
-                    };
-                    hal_enc.end_pending_encoders();
-                    let Some(cmd_buf) = hal_enc.raw_command_buffer() else {
-                        return;
-                    };
-                    let Some(c_tex) = fg.history[curr_idx].as_hal::<wgpu::hal::api::Metal>() else {
-                        return;
-                    };
-                    let Some(p_tex) = fg.history[prev_idx].as_hal::<wgpu::hal::api::Metal>() else {
-                        return;
-                    };
-                    let Some(d_tex) = fg.depth_r32.as_hal::<wgpu::hal::api::Metal>() else {
-                        return;
-                    };
-                    let Some(m_tex) = fg.motion.as_hal::<wgpu::hal::api::Metal>() else {
-                        return;
-                    };
-                    let Some(o_tex) = fg.output.as_hal::<wgpu::hal::api::Metal>() else {
-                        return;
-                    };
-                    interp.encode(
-                        cmd_buf,
-                        c_tex.raw_handle(),
-                        p_tex.raw_handle(),
-                        d_tex.raw_handle(),
-                        m_tex.raw_handle(),
-                        o_tex.raw_handle(),
-                        jitter_px,
-                        fg_p.delta_time.clamp(0.001, 0.25),
-                        fg_p.near.max(0.01),
-                        fg_p.far.max(1.0),
-                        fg_p.fov_degrees.clamp(10.0, 150.0),
-                        aspect,
-                        true,
-                        reset,
-                    );
-                    encoded = true;
+                let mut fi_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("MetalFX FI"),
                 });
-            }
-            if encoded {
-                pending_cmds.push(fi_enc.finish());
-                fg.has_prev = true;
-                fg.reset_next = false;
-                fg.curr_idx = 1 - curr_idx;
-                made = !reset;
+                let prev_idx = 1 - curr_idx;
+                let reset = fg.reset_next;
+                let jitter_px = self.jitter_px;
+                let aspect = fg.size[0] as f32 / fg.size[1].max(1) as f32;
+                let dt = self.fi_interval.clamp(0.004, 0.25);
+                let mut encoded = false;
+                unsafe {
+                    fi_enc.as_hal_mut::<wgpu::hal::api::Metal, _, _>(|hal_enc| {
+                        let Some(hal_enc) = hal_enc else {
+                            return;
+                        };
+                        hal_enc.end_pending_encoders();
+                        let Some(cmd_buf) = hal_enc.raw_command_buffer() else {
+                            return;
+                        };
+                        let Some(c_tex) = fg.history[curr_idx].as_hal::<wgpu::hal::api::Metal>()
+                        else {
+                            return;
+                        };
+                        let Some(p_tex) = fg.history[prev_idx].as_hal::<wgpu::hal::api::Metal>()
+                        else {
+                            return;
+                        };
+                        let Some(d_tex) = fg.depth_r32.as_hal::<wgpu::hal::api::Metal>() else {
+                            return;
+                        };
+                        let Some(m_tex) = fg.motion.as_hal::<wgpu::hal::api::Metal>() else {
+                            return;
+                        };
+                        let Some(o_tex) = fg.output.as_hal::<wgpu::hal::api::Metal>() else {
+                            return;
+                        };
+                        interp.encode(
+                            cmd_buf,
+                            fg.size,
+                            c_tex.raw_handle(),
+                            p_tex.raw_handle(),
+                            d_tex.raw_handle(),
+                            m_tex.raw_handle(),
+                            o_tex.raw_handle(),
+                            jitter_px,
+                            dt,
+                            fg_p.near.max(0.01),
+                            fg_p.far.max(1.0),
+                            fg_p.fov_degrees.clamp(10.0, 150.0),
+                            aspect,
+                            true,
+                            reset,
+                        );
+                        encoded = true;
+                    });
+                }
+                if encoded {
+                    pending_cmds.push(fi_enc.finish());
+                    fg.reset_next = false;
+                    fg.curr_idx = 1 - curr_idx;
+                    made = true;
+                }
             }
         }
 
-        // 4. Composite interpolated output onto `generated` (CAS-sharpened when upscaling to display).
+        // 5. Present the interpolated frame `N-0.5` onto `screen` now, and queue `real_cache` for next tick.
         if made {
+            let fg = self.fg_targets.as_ref().expect("fg_targets");
             let pl = if fg.size != window {
                 &self.cas_pipeline
             } else {
@@ -1311,7 +1499,7 @@ impl MetalFx {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FI present"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: gen_view,
+                    view: screen,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1324,8 +1512,70 @@ impl MetalFx {
             rp.set_pipeline(pl);
             rp.set_bind_group(0, &fg.output_blit_group, &[]);
             rp.draw(0..3, 0..1);
+            self.has_cached_real = true;
+            self.record_fi_tick(true);
+        } else {
+            let fg = self.fg_targets.as_ref().expect("fg_targets");
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FI fallback present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: screen,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.blit_pipeline);
+            rp.set_bind_group(0, &fg.real_cache_blit_group, &[]);
+            rp.draw(0..3, 0..1);
+            self.has_cached_real = false;
+            self.record_fi_tick(false);
         }
         made
+    }
+
+    fn blit_view(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        label: &str,
+    ) {
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear),
+                },
+            ],
+        });
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dst,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        rp.set_pipeline(&self.blit_pipeline);
+        rp.set_bind_group(0, &group, &[]);
+        rp.draw(0..3, 0..1);
     }
 }
 

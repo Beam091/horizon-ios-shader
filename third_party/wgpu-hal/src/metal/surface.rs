@@ -357,11 +357,11 @@ impl crate::Surface for super::Surface {
         // wait deadlocks a resize against a present.
         let render_layer = self.render_layer.lock().clone();
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let off_main = objc2::MainThreadMarker::new().is_none();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let off_main = false;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let _ = timeout;
 
         #[cfg(target_os = "macos")]

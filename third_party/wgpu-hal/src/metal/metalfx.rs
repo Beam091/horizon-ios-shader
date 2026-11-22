@@ -313,6 +313,7 @@ impl FrameInterpolator {
     pub fn encode(
         &self,
         cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+        size: [u32; 2],
         color: &ProtocolObject<dyn MTLTexture>,
         prev_color: &ProtocolObject<dyn MTLTexture>,
         depth: &ProtocolObject<dyn MTLTexture>,
@@ -333,6 +334,14 @@ impl FrameInterpolator {
             let _: () = msg_send![&*self.raw, setDepthTexture: depth];
             let _: () = msg_send![&*self.raw, setMotionTexture: motion];
             let _: () = msg_send![&*self.raw, setOutputTexture: output];
+            let has_content_w: bool = msg_send![
+                &*self.raw,
+                respondsToSelector: objc2::sel!(setContentWidth:)
+            ];
+            if has_content_w {
+                let _: () = msg_send![&*self.raw, setContentWidth: size[0] as usize];
+                let _: () = msg_send![&*self.raw, setContentHeight: size[1] as usize];
+            }
             let _: () = msg_send![&*self.raw, setMotionVectorScaleX: 1.0f32];
             let _: () = msg_send![&*self.raw, setMotionVectorScaleY: 1.0f32];
             let _: () = msg_send![&*self.raw, setDeltaTime: delta_time];

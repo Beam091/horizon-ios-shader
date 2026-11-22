@@ -374,11 +374,18 @@ impl Game<'_> {
             .as_ref()
             .and_then(|r| r.frame_generation_share())
             .map_or(String::new(), |share| {
-                format!(
-                    " ({} fps {})",
-                    (self.fps * (1.0 + share)).round() as i32,
-                    self.settings.horizon.frame_generation.label(),
-                )
+                if self.settings.horizon.frame_generation
+                    == horizon_client::graphics::FrameGeneration::MetalFx
+                {
+                    let real = (self.fps / (1.0 + share)).round() as i32;
+                    format!(" ({real} real fps, MetalFX)")
+                } else {
+                    format!(
+                        " ({} fps {})",
+                        (self.fps * (1.0 + share)).round() as i32,
+                        self.settings.horizon.frame_generation.label(),
+                    )
+                }
             });
         d.priority(format!(
             "{} fps{generated} T: {}{present} @{refresh}Hz",

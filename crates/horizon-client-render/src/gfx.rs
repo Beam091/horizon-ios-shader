@@ -6355,7 +6355,11 @@ impl Renderer {
     }
 
     pub fn frame_generation_share(&self) -> Option<f32> {
-        self.frame_gen.made_share
+        if self.frame_gen.metalfx {
+            self.metalfx.frame_gen_share()
+        } else {
+            self.frame_gen.made_share
+        }
     }
     /// Frame generation mode (FSR 3.1 on desktop, MetalFX Frame Interpolation on iOS 26+).
     pub fn set_frame_generation(&mut self, mode: crate::graphics::FrameGeneration) {
@@ -7130,27 +7134,34 @@ impl Renderer {
             self.surface_unconfigured = false;
         }
         laps.lap("r_prepare");
-        // Frame generation: its present thread acquires and presents, this frame draws
-        // into frames of its own. Not over menus that blur the frame, HDR (or the 16-bit
-        // frame it was started with) or the title screen. FSR 3.1 skips shader packs;
-        // Apple MetalFX Frame Interpolation runs on both Vanilla and Shader Packs.
-        let fg_metalfx = self.frame_gen.on
+        // Apple MetalFX Frame Interpolation uses main-thread alternating presentation (no
+        // background Presenter thread), avoiding iOS CAMetalLayer nextDrawable() deadlocks.
+        let mfx_fg_active = self.frame_gen.on
             && self.frame_gen.metalfx
-            && self.metalfx.frame_gen_supported(&self.device);
+            && self.metalfx.frame_gen_supported(&self.device)
+            && self.hdr.is_none()
+            && self.frame_format == self.config.format.remove_srgb_suffix()
+            && !frame.title
+            && frame.menu_blur.is_none()
+            && self.native.as_ref().is_none_or(|n| n.post.is_none());
+        if !mfx_fg_active {
+            self.metalfx.reset_frame_gen();
+        }
+        // Desktop FSR 3.1 frame generation: its present thread acquires and presents, this frame
+        // draws into frames of its own. Never spawned for MetalFX Frame Interpolation on iOS.
         let fg = self.frame_gen.on
-            && (!self.frame_gen.metalfx || fg_metalfx)
+            && !self.frame_gen.metalfx
             && !self.frame_gen.paused
             && self.hdr.is_none()
             && self.frame_format == self.config.format.remove_srgb_suffix()
             && !frame.title
             && frame.menu_blur.is_none()
-            && (fg_metalfx || self.pack_post.as_ref().is_none_or(|p| p.1.is_none()))
+            && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
             && self.native.as_ref().is_none_or(|n| n.post.is_none())
             && (self.surface.is_none()
                 || self.config.usage.contains(wgpu::TextureUsages::COPY_DST));
         if !fg {
             self.frame_gen.stop();
-            self.metalfx.reset_frame_gen();
         }
         // Waits for the submit thread since the last frame's present (this frame's uploads).
         let queued = self.queue.take_waited();
@@ -7248,6 +7259,55 @@ impl Renderer {
                     label: Some("Horizon frame"),
                 })
         });
+        // MetalFX Frame Interpolation odd display tick: present the cached real world frame `N`
+        // with fresh 60/120Hz HUD on the main thread, skipping all 3D world and shader pack work.
+        if mfx_fg_active
+            && self.metalfx.has_cached_real()
+            && self.screenshot.is_none()
+            && let Some(surface_frame) = surface_frame
+        {
+            let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.frame_format),
+                ..Default::default()
+            });
+            if self.metalfx.blit_cached_real(&mut encoder, &view_target) {
+                self.hud.prepare(
+                    &self.device,
+                    &mut self.uploads,
+                    &mut encoder,
+                    frame.hud,
+                    [self.config.width, self.config.height],
+                );
+                self.hud.draw_range(
+                    &mut encoder,
+                    &view_target,
+                    &self.depth,
+                    frame.hud,
+                    [self.config.width, self.config.height],
+                    0..frame.hud.vertices.len() as u32,
+                    None,
+                );
+                self.uploads.finish(&encoder);
+                if has_section_copies {
+                    self.section_copy_bytes = 0;
+                    self.section_uploads.finish(&encoder);
+                }
+                let commands = encoder.finish();
+                let _ = self.queue.submit([commands]);
+                if self.config.present_mode == wgpu::PresentMode::Fifo {
+                    self.window.pre_present_notify();
+                }
+                self.queue.present(surface_frame);
+                if reconfigure {
+                    self.configure_surface();
+                }
+                self.last_encode = started.elapsed().saturating_sub(self.last_wait);
+                return Ok(true);
+            }
+            // Fall through if blit unexpectedly failed (rare resize race): drop surface safely.
+            self.queue.present(surface_frame);
+            return Ok(false);
+        }
         // Horizon's own passes are timed like a shader pack's, from the frame's first pass.
         if self.own_timing.is_some() != self.pass_timing {
             self.own_timing = self
@@ -7280,7 +7340,6 @@ impl Renderer {
         let has_pack = self.pack_post.as_ref().is_some_and(|p| p.1.is_some())
             || self.native.as_ref().is_some_and(|n| n.post.is_some());
         let mfx_active = !frame.title && self.metalfx.active();
-        let mfx_fg_active = fg && fg_metalfx;
         let mfx_render_size = mfx_active.then(|| self.metalfx.sizes(window_size).0);
         self.world_post.fixed_size = mfx_render_size;
         let mfx_view_proj = if has_pack
@@ -8516,10 +8575,10 @@ impl Renderer {
         );
         // Frame generation's made frame draws its own hand, halfway, after the others.
         let made_hand_vertex = (posed as usize + self.entity_batch.combined.len()) as i32;
-        if fg {
+        if fg || mfx_fg_active {
             self.frame_gen
                 .halfway_hand(frame.hand, hand_view, &mut self.entity_batch.combined);
-            if !fg_metalfx {
+            if fg {
                 self.frame_gen.track_entities(
                     &self.device,
                     &self.entity_atlas,
@@ -8979,7 +9038,7 @@ impl Renderer {
         let scaled = self.world_post.prepare(
             &self.device,
             [self.config.width, self.config.height],
-            pack_reads_world || fg,
+            pack_reads_world || fg || mfx_fg_active,
         );
         let (world_view, world_depth) = match &scaled {
             Some((color, depth)) => (color, depth),
@@ -8997,6 +9056,7 @@ impl Renderer {
             && self.hdr.is_none()
             // Frame generation draws the hand over the real and the made frame after the world.
             && fg_frames.is_none()
+            && !mfx_fg_active
             && !native_render::world_drawn_hooked();
         if oit_on {
             let size = self
@@ -10483,17 +10543,7 @@ impl Renderer {
                     self.section_uploads.finish(&encoder);
                     has_section_copies = false;
                 }
-                let generated_view = if mfx_fg_active
-                    && let Some((_, generated)) = &fg_frames
-                {
-                    Some(generated.create_view(&wgpu::TextureViewDescriptor {
-                        format: Some(self.config.format.remove_srgb_suffix()),
-                        ..Default::default()
-                    }))
-                } else {
-                    None
-                };
-                let fg_params = generated_view.as_ref().map(|_| metalfx::FrameGenParams {
+                let fg_params = mfx_fg_active.then(|| metalfx::FrameGenParams {
                     delta_time: self.frame_gen.interval_secs(),
                     near: NEAR_PLANE,
                     far: frame.depth_far,
@@ -10509,27 +10559,10 @@ impl Renderer {
                     &pack_depth,
                     opaque_depth.as_ref(),
                     &view_target,
-                    generated_view.as_ref(),
                     fg_params,
                     [self.config.width, self.config.height],
                     true,
                 );
-                if fg_made
-                    && let (Some((_, generated)), Some(generated_view)) =
-                        (&fg_frames, &generated_view)
-                {
-                    let overlay = Overlay {
-                        hand_quads: hand_quads * u32::from(!pack_draws_hand),
-                        first_hand_vertex: made_hand_vertex,
-                        crosshair,
-                        first_crosshair: debug_depth + debug_top,
-                        world_depth: false,
-                        real: false,
-                        hand_drawn: !pack_draws_hand,
-                        hand_view_proj,
-                    };
-                    self.draw_overlay(&mut encoder, frame, generated_view, generated, &overlay);
-                }
             }
             self.pack_post = Some((dimension, Some(post)));
         } else if let Some((color, depth)) = &scaled
@@ -10548,9 +10581,7 @@ impl Renderer {
                 history_reset,
                 native.timing.as_mut(),
             );
-        } else if let (Some((_, generated)), Some((_, depth))) = (&fg_frames, &scaled)
-            && !fg_metalfx
-        {
+        } else if let (Some((_, generated)), Some((_, depth))) = (&fg_frames, &scaled) {
             let world = self
                 .frame_gen
                 .world(&self.device, &self.world_post, &self.config);
@@ -10601,21 +10632,11 @@ impl Renderer {
                     self.section_uploads.finish(&encoder);
                     has_section_copies = false;
                 }
-                let generated_view = if mfx_fg_active
-                    && let Some((_, generated)) = &fg_frames
-                {
-                    Some(generated.create_view(&wgpu::TextureViewDescriptor {
-                        format: Some(self.config.format.remove_srgb_suffix()),
-                        ..Default::default()
-                    }))
-                } else {
-                    None
-                };
                 let render_size = self
                     .world_post
                     .size()
                     .unwrap_or([self.config.width, self.config.height]);
-                let fg_params = generated_view.as_ref().map(|_| metalfx::FrameGenParams {
+                let fg_params = mfx_fg_active.then(|| metalfx::FrameGenParams {
                     delta_time: self.frame_gen.interval_secs(),
                     near: NEAR_PLANE,
                     far: frame.depth_far,
@@ -10631,27 +10652,10 @@ impl Renderer {
                     depth,
                     None,
                     &view_target,
-                    generated_view.as_ref(),
                     fg_params,
                     [self.config.width, self.config.height],
                     false,
                 );
-                if fg_made
-                    && let (Some((_, generated)), Some(generated_view)) =
-                        (&fg_frames, &generated_view)
-                {
-                    let overlay = Overlay {
-                        hand_quads: hand_quads * u32::from(!pack_draws_hand),
-                        first_hand_vertex: made_hand_vertex,
-                        crosshair,
-                        first_crosshair: debug_depth + debug_top,
-                        world_depth: false,
-                        real: false,
-                        hand_drawn: !pack_draws_hand,
-                        hand_view_proj,
-                    };
-                    self.draw_overlay(&mut encoder, frame, generated_view, generated, &overlay);
-                }
             } else {
                 self.world_post.finish(
                     &self.queue,
@@ -10693,13 +10697,55 @@ impl Renderer {
                 },
             });
         }
+        // Under MetalFX Frame Interpolation, `view_target` holds the interpolated frame `N-0.5`
+        // (gets halfway hand) while `real_cache` holds real frame `N` (stamp the real hand onto it
+        // now so the odd display tick shows both real world and real hand with zero world re-render).
+        let mfx_interpolated = mfx_fg_active && fg_made;
+        let real_hand_quads = hand_quads * u32::from(!pack_draws_hand && !hand_in_world);
+        let real_hand_vertex = ((world_quads + additive_quads) * 4) as i32;
+        if mfx_interpolated
+            && real_hand_quads > 0
+            && let Some(cached_real) = self.metalfx.cached_real_view().cloned()
+        {
+            let attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: &cached_real,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MetalFX FI cached real hand"),
+                color_attachments: &attachments,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.entity_pipeline);
+            pass.set_bind_group(0, &self.hand_group, &[]);
+            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+            pass.draw_indexed(0..real_hand_quads * 6, real_hand_vertex, 0..1);
+        }
         let overlay = Overlay {
-            hand_quads: hand_quads * u32::from(!pack_draws_hand && !hand_in_world),
-            first_hand_vertex: ((world_quads + additive_quads) * 4) as i32,
+            hand_quads: real_hand_quads,
+            first_hand_vertex: if mfx_interpolated {
+                made_hand_vertex
+            } else {
+                real_hand_vertex
+            },
             crosshair,
             first_crosshair: debug_depth + debug_top,
             world_depth: scaled.is_none(),
-            real: true,
+            real: !mfx_interpolated,
             hand_drawn: !pack_draws_hand,
             hand_view_proj,
         };
