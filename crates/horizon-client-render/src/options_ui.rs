@@ -273,6 +273,7 @@ impl Opt {
             Opt::PadLightbar => "horizon.options.lightbar",
             Opt::PadLookSensitivity => "horizon.options.look_sensitivity",
             Opt::TouchSensitivity => "horizon.options.touch_sensitivity",
+            Opt::HotbarScrollSensitivity => "horizon.options.hotbar_scroll_sensitivity",
             Opt::PadPointerSpeed => "horizon.options.pointer_speed",
             Opt::PadScrollSpeed => "horizon.options.scroll_speed",
             Opt::PadRepeatDelay => "horizon.options.repeat_delay",
@@ -357,6 +358,7 @@ impl Opt {
             Opt::ChatLineSpacing => Kind::Slider(s.chat_line_spacing),
             Opt::PadLookSensitivity => Kind::Slider(s.controller.look_sensitivity),
             Opt::TouchSensitivity => Kind::Slider(s.controller.touch_sensitivity),
+            Opt::HotbarScrollSensitivity => unit(s.controller.hotbar_scroll_sensitivity, 0.25, 4.0),
             Opt::PadPointerSpeed => unit(s.controller.pointer_speed, 0.25, 3.0),
             Opt::PadScrollSpeed => unit(s.controller.scroll_speed, 1.0, 36.0),
             Opt::PadRepeatDelay => unit(s.controller.repeat_delay, 0.1, 1.0),
@@ -620,6 +622,7 @@ impl Opt {
             ),
             Opt::PadLookSensitivity => percent(c, 2.0 * s.controller.look_sensitivity),
             Opt::TouchSensitivity => percent(c, 2.0 * s.controller.touch_sensitivity),
+            Opt::HotbarScrollSensitivity => percent(c, s.controller.hotbar_scroll_sensitivity),
             Opt::PadPointerSpeed => percent(c, s.controller.pointer_speed),
             Opt::PadScrollSpeed => percent(c, s.controller.scroll_speed / 12.0),
             Opt::PadRepeatDelay | Opt::PadRepeatInterval => generic(
@@ -895,6 +898,9 @@ impl Opt {
             Opt::ChatLineSpacing => s.chat_line_spacing = v,
             Opt::PadLookSensitivity => s.controller.look_sensitivity = v,
             Opt::TouchSensitivity => s.controller.touch_sensitivity = v,
+            Opt::HotbarScrollSensitivity => {
+                s.controller.hotbar_scroll_sensitivity = step(25.0, 400.0) / 100.0
+            }
             Opt::PadPointerSpeed => s.controller.pointer_speed = step(25.0, 300.0) / 100.0,
             Opt::PadScrollSpeed => s.controller.scroll_speed = step(1.0, 36.0),
             Opt::PadRepeatDelay => s.controller.repeat_delay = step(100.0, 1000.0) / 1000.0,
@@ -2829,6 +2835,7 @@ impl OptionsUi {
                 if cfg!(target_os = "ios") {
                     let mut opts = MOUSE_OPTIONS.to_vec();
                     opts.insert(1, Opt::TouchSensitivity);
+                    opts.insert(3, Opt::HotbarScrollSensitivity);
                     pairs(&opts)
                 } else {
                     pairs(MOUSE_OPTIONS)

@@ -1035,10 +1035,14 @@ impl Game<'_> {
             self.last_input = now;
             if playing {
                 if sy != 0.0 {
-                    // Scale the anti-bounce interval with Mouse Settings -> Scroll Sensitivity
-                    // (1.00 -> 28ms for crisp 1-notch stepping; higher = faster, lower = slower).
-                    let wheel_sens = self.settings.mouse_wheel_sensitivity.clamp(0.4, 2.5);
-                    let min_interval_ms = (28.0 / wheel_sens).round() as u64;
+                    // Scale the anti-bounce interval with the dedicated Hotbar Scroll sensitivity
+                    // (100% -> 28ms for crisp 1-notch stepping; higher = faster, lower = slower).
+                    let hotbar_sens = self
+                        .settings
+                        .controller
+                        .hotbar_scroll_sensitivity
+                        .clamp(0.4, 2.5);
+                    let min_interval_ms = (28.0 / hotbar_sens).round() as u64;
                     let step_ready = self.pad.ios_hw_last_scroll_step.is_none_or(|t| {
                         now.duration_since(t) >= std::time::Duration::from_millis(min_interval_ms)
                     });

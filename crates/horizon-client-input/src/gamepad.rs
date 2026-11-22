@@ -468,6 +468,8 @@ pub struct PadSettings {
     pub look_sensitivity: f32,
     /// Touch-screen camera drag sensitivity (0..1; 0.5 = 100%, independent of hardware mouse).
     pub touch_sensitivity: f32,
+    /// Separate hotbar mouse-wheel scroll sensitivity on iOS/iPadOS (0.25..=4.0; 1.0 = 100%).
+    pub hotbar_scroll_sensitivity: f32,
     pub invert_x: bool,
     pub invert_y: bool,
     pub move_deadzone: f32,
@@ -499,6 +501,7 @@ impl Default for PadSettings {
             lightbar: Lightbar::Health,
             look_sensitivity: 0.5,
             touch_sensitivity: 0.5,
+            hotbar_scroll_sensitivity: 1.0,
             invert_x: false,
             invert_y: false,
             move_deadzone: 0.15,
@@ -566,6 +569,9 @@ impl PadSettings {
                 "lightbar" => s.lightbar = Lightbar::parse(value),
                 "lookSensitivity" => s.look_sensitivity = unit(s.look_sensitivity),
                 "touchSensitivity" => s.touch_sensitivity = unit(s.touch_sensitivity),
+                "hotbarScrollSensitivity" => {
+                    s.hotbar_scroll_sensitivity = bounded(s.hotbar_scroll_sensitivity, 0.25, 4.0)
+                }
                 "invertX" => s.invert_x = flag(s.invert_x),
                 "invertY" => s.invert_y = flag(s.invert_y),
                 "moveDeadzone" => s.move_deadzone = unit(s.move_deadzone).min(0.9),
@@ -599,13 +605,14 @@ impl PadSettings {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "enabled:{}\nvibration:{}\nadaptiveTriggers:{}\nlightbar:{}\nlookSensitivity:{}\ntouchSensitivity:{}\ninvertX:{}\ninvertY:{}\nmoveDeadzone:{}\nlookDeadzone:{}\ntriggerThreshold:{}\ntoggleSneak:{}\nglyphs:{}\nnintendoLetters:{}\nkeyboard:{}\n",
+            "enabled:{}\nvibration:{}\nadaptiveTriggers:{}\nlightbar:{}\nlookSensitivity:{}\ntouchSensitivity:{}\nhotbarScrollSensitivity:{}\ninvertX:{}\ninvertY:{}\nmoveDeadzone:{}\nlookDeadzone:{}\ntriggerThreshold:{}\ntoggleSneak:{}\nglyphs:{}\nnintendoLetters:{}\nkeyboard:{}\n",
             bool_text(self.enabled),
             bool_text(self.vibration),
             bool_text(self.adaptive_triggers),
             self.lightbar.name(),
             self.look_sensitivity,
             self.touch_sensitivity,
+            self.hotbar_scroll_sensitivity,
             bool_text(self.invert_x),
             bool_text(self.invert_y),
             self.move_deadzone,

@@ -5,6 +5,7 @@
   "horizon.options.lightbar": "แถบไฟ",
   "horizon.options.look_sensitivity": "ความไวในการมอง",
   "horizon.options.touch_sensitivity": "ความไวการแตะหน้าจอ",
+  "horizon.options.hotbar_scroll_sensitivity": "ความไวสกอ Hotbar",
   "horizon.options.invert_x": "กลับแกน X การมอง",
   "horizon.options.invert_y": "กลับแกน Y การมอง",
   "horizon.options.sneak_button": "ปุ่มย่อง",

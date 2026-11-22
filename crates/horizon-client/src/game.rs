@@ -18310,6 +18310,11 @@ impl Game<'_> {
                     // MouseHandler.onScroll: the hotbar (or the spectator
                     // menu) takes the wheel only when no screen is open; a
                     // book, lectern, sign or prompt drawn over gameplay is one.
+                    #[cfg(target_os = "ios")]
+                    let hotbar_wheel_sensitivity =
+                        f64::from(self.settings.controller.hotbar_scroll_sensitivity);
+                    #[cfg(not(target_os = "ios"))]
+                    let hotbar_wheel_sensitivity = wheel_sensitivity;
                     if self.screen == Screen::Playing
                         && !self.screen_over_playing()
                         && self.sleeping.is_none()
@@ -18318,7 +18323,7 @@ impl Game<'_> {
                         && !self.native_wheel_event(d)
                         && let Some((wheel, (horizontal_steps, vertical_steps))) = self
                             .mouse
-                            .on_scroll(raw_x, raw_y, discrete, wheel_sensitivity)
+                            .on_scroll(raw_x, raw_y, discrete, hotbar_wheel_sensitivity)
                     {
                         if !self.pad_synthetic_input() {
                             let mut canceled = false;
@@ -18350,8 +18355,8 @@ impl Game<'_> {
                         } else {
                             #[cfg(target_os = "ios")]
                             {
-                                // On iOS/iPadOS, let Mouse Settings -> Scroll Sensitivity scale
-                                // hotbar slot steps instead of clamping every scroll event to ±1.
+                                // On iOS/iPadOS, let Hotbar Scroll sensitivity scale hotbar slot
+                                // steps independently from UI list Scroll Sensitivity.
                                 let steps = wheel.clamp(-8, 8);
                                 self.selected = (self.selected as i32 - steps).rem_euclid(9) as usize;
                             }
