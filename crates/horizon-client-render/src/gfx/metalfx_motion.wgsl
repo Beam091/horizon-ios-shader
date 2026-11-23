@@ -108,7 +108,7 @@ fn compute_motion(v: Full) -> MotionOut {
     }
 
     // Remove this frame's sub-pixel jitter before unprojecting with the unjittered camera matrix.
-    let uv_unjit = (vec2<f32>(best_p) + 0.5) / vec2<f32>(dim) - motion_u.jitter_px / max(motion_u.size, vec2<f32>(1.0));
+    let uv_unjit = (vec2<f32>(best_p) + 0.5) / vec2<f32>(dim) - motion_u.jitter_px / max(vec2<f32>(dim), vec2<f32>(1.0));
     let ndc = vec2<f32>(uv_unjit.x * 2.0 - 1.0, 1.0 - uv_unjit.y * 2.0);
     let is_sky = best_z <= 1e-6;
     let prev_clip = select(

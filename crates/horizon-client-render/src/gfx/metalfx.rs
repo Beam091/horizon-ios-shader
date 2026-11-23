@@ -495,6 +495,12 @@ impl MetalFx {
         self.reset_history
     }
 
+    /// Supplies sub-pixel depth jitter (in depth pixels) when Vanilla TAA jitters `world_depth`
+    /// while MetalFX Upscaling itself is OFF and Frame Generation is ON.
+    pub fn set_external_jitter(&mut self, jitter_px: [f32; 2]) {
+        self.jitter_px = jitter_px;
+    }
+
     /// Releases GPU targets not currently needed (e.g. on iOS low-memory warning).
     pub fn release_unused(&mut self, fg_active: bool) {
         if !self.active() {

@@ -9110,12 +9110,15 @@ impl Renderer {
         }
         let pack_reads_world = pack_post || native_post;
         laps.lap("r_uploads");
-        // Phase 2 of occlusion culling draws over the depth, and a shader pack or TAA reads it.
+        // Phase 2 of occlusion culling draws over the depth; shader packs, TAA, OIT,
+        // MetalFX Temporal, and Frame Generation (`ObjectMotion` + `FG motion`) all read it.
         let keep_depth = pack_reads_world
             || (taa && self.world_post.taa)
             || oit_on
             || native_render::render_needs().world_depth
-            || fg;
+            || fg
+            || mfx_fg_active
+            || (mfx_active && self.metalfx.mode == crate::graphics::MetalFxMode::Temporal);
         // The pack's program reads the vertices this frame's draws bind.
         let pack_draws_terrain = pack_terrain && flat_frame == self.pack_terrain_flat;
         // The shadow camera's lists, drawn by the pack's shadow programs.
@@ -10805,6 +10808,8 @@ impl Renderer {
                 // When Frame Gen is ON without MetalFX Upscaling in Vanilla, run `world_post.finish`
                 // directly into `real_cache[curr_idx]` so TAA and FXAA stay 100% functional (A4).
                 let src_color = if mfx_fg_active && !mfx_active {
+                    self.metalfx
+                        .set_external_jitter(self.world_post.jitter_pixels());
                     let real_target = self.metalfx.begin_frame_gen_real_target(
                         &self.device,
                         render_size,
