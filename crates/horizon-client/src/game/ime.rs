@@ -164,4 +164,39 @@ impl Game<'_> {
             }
         }
     }
+
+    /// Pastes text from the system clipboard (`UIPasteboard` on iOS) directly into whichever text
+    /// field currently has focus, keeping the soft keyboard open.
+    pub(super) fn paste_into_focused_field(&mut self) {
+        if !self.text_field_focused() {
+            return;
+        }
+        let raw = {
+            use horizon_client::clipboard::Clipboard;
+            self.clipboard.get()
+        };
+        if raw.is_empty() {
+            return;
+        }
+        // Normalize line endings into spaces (preserving single spaces) and strip control chars
+        // so single-line fields (Chat, Server IP, Command Block, Anvil, Search) paste cleanly
+        // without triggering Return / dismissing the iOS soft keyboard.
+        let mut cleaned = String::with_capacity(raw.len());
+        let mut prev_newline = false;
+        for ch in raw.chars() {
+            if ch == '\n' || ch == '\r' {
+                if !prev_newline {
+                    cleaned.push(' ');
+                    prev_newline = true;
+                }
+            } else if !ch.is_control() {
+                cleaned.push(ch);
+                prev_newline = false;
+            }
+        }
+        let cleaned = cleaned.trim_end_matches(' ');
+        if !cleaned.is_empty() {
+            self.ime_commit(cleaned);
+        }
+    }
 }

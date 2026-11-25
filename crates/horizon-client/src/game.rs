@@ -17619,6 +17619,8 @@ fn autosave_interval(rate: f32) -> i64 {
 impl ApplicationHandler for Game<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.suspended = false;
+        #[cfg(target_os = "ios")]
+        horizon_client_input::ios_controllers::refresh_pointer_lock();
         if let Some(window) = &self.window {
             window.request_redraw();
             return;
@@ -18215,6 +18217,8 @@ impl Game<'_> {
                     self.focused = focused;
                     self.focus_lost = (!focused).then(Instant::now);
                     if focused {
+                        #[cfg(target_os = "ios")]
+                        horizon_client_input::ios_controllers::refresh_pointer_lock();
                         self.regrab_on_refocus();
                     } else {
                         // A held pointer goes with the focus, wherever the

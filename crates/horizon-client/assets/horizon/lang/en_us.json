@@ -941,5 +941,6 @@
   "horizon.touch.zoom": "Zoom",
   "horizon.touch.swap_offhand": "Swap Hands",
   "horizon.touch.mouse": "Mouse",
-  "horizon.touch.shift": "Shift"
+  "horizon.touch.shift": "Shift",
+  "horizon.touch.paste": "Paste"
 }

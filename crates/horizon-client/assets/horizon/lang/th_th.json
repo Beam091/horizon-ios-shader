@@ -573,5 +573,6 @@
   "horizon.touch.swap_offhand": "สลับมือซ้าย",
   "horizon.touch.mouse": "เมาส์",
   "horizon.touch.shift": "Shift",
+  "horizon.touch.paste": "วางข้อความ",
   "How fast dragging the touch screen turns the view.": "ความเร็วในการหันมุมกล้องเมื่อลากนิ้วบนหน้าจอ (แยกจากเมาส์)"
 }

@@ -58,6 +58,10 @@ pub(super) struct Pads {
     pub(super) touch_menu_shift: bool,
     pub(super) touch_menu_shift_finger: Option<(u64, Instant)>,
     pub(super) touch_menu_shift_applied: bool,
+    /// Long-press while typing on iOS: tracks `(finger_id, start_gui_pos, started_at, triggered)`
+    /// and shows a floating Paste button at `(gui_x, gui_y)` when held >= 450ms.
+    pub(super) touch_paste_hold: Option<(u64, (f32, f32), Instant, bool)>,
+    pub(super) touch_paste_popup: Option<(f32, f32)>,
     /// Whether an iOS/iPadOS hardware keyboard or mouse (`GCKeyboard`/`GCMouse`) is active.
     pub(super) ios_hw_active: bool,
     pub(super) ios_hw_mouse_connected: bool,

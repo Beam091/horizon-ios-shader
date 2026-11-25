@@ -134,7 +134,7 @@ use objc2::encode::{Encode, Encoding};
 use objc2::rc::Allocated;
 use objc2::runtime::{AnyClass, Bool, Imp, NSObject, Sel};
 use objc2::{ClassType, define_class, sel};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
 use winit::keyboard::KeyCode;
 
 /// State of a hardware keyboard (`GCKeyboard`) and mouse/trackpad (`GCMouse`) connected to iOS/iPadOS.
@@ -470,13 +470,10 @@ pub fn poll_hardware_input() -> HardwareInput {
         && let Some(input) = get!(kb, keyboardInput)
     {
         out.keyboard_connected = true;
-        let any_pressed: bool = unsafe { msg_send![&*input, isAnyKeyPressed] };
-        if any_pressed {
-            for &(usage, code) in GC_KEY_MAP {
-                let button: Option<Obj> = unsafe { msg_send![&*input, buttonForKeyCode: usage] };
-                if pressed(button) {
-                    out.keys.push(code);
-                }
+        for &(usage, code) in GC_KEY_MAP {
+            let button: Option<Obj> = unsafe { msg_send![&*input, buttonForKeyCode: usage] };
+            if pressed(button) {
+                out.keys.push(code);
             }
         }
     }
@@ -493,6 +490,7 @@ pub fn poll_hardware_input() -> HardwareInput {
                 let scroll_block = (&MOUSE_SCROLL_BLOCK as *const StaticBlock).cast::<AnyObject>();
                 let _: () = unsafe { msg_send![&*scroll, setValueChangedHandler: scroll_block] };
             }
+            refresh_pointer_lock();
         }
         out.mouse_buttons = [
             pressed(get!(input, leftButton)),
@@ -518,6 +516,15 @@ pub fn poll_hardware_input() -> HardwareInput {
 
 static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
 static POINTER_LOCK_INSTALLED_CLS: AtomicUsize = AtomicUsize::new(0);
+// -1 = dirty / needs update, 0 = unlocked applied, 1 = locked applied
+static POINTER_LOCK_APPLIED: AtomicI8 = AtomicI8::new(-1);
+
+/// Marks the iPadOS pointer-lock state dirty so the next `set_pointer_locked()` call re-asserts
+/// `setNeedsUpdateOfPrefersPointerLocked` (e.g. after returning from background, Control Center,
+/// or regaining window focus).
+pub fn refresh_pointer_lock() {
+    POINTER_LOCK_APPLIED.store(-1, Ordering::Relaxed);
+}
 
 unsafe extern "C" fn prefers_pointer_locked(_this: *mut AnyObject, _cmd: Sel) -> Bool {
     Bool::new(POINTER_LOCKED.load(Ordering::Relaxed))
@@ -570,17 +577,17 @@ unsafe fn root_view_controller() -> Option<Obj> {
 /// unlocks/restores it when a menu or inventory screen is open, and attaches the native
 /// `UIHoverGestureRecognizer` for exact 1:1 cursor tracking in menus.
 pub fn set_pointer_locked(locked: bool) {
-    let prev = POINTER_LOCKED.swap(locked, Ordering::Relaxed);
-    if prev == locked && POINTER_LOCK_INSTALLED_CLS.load(Ordering::Relaxed) != 0 {
-        return;
-    }
+    POINTER_LOCKED.store(locked, Ordering::Relaxed);
+    let wanted = i8::from(locked);
     unsafe {
         let Some(vc) = root_view_controller() else {
+            POINTER_LOCK_APPLIED.store(-1, Ordering::Relaxed);
             return;
         };
         ensure_hover_recognizer(&vc);
         let cls = objc2::ffi::object_getClass((&*vc as *const AnyObject).cast_mut().cast());
         if cls.is_null() {
+            POINTER_LOCK_APPLIED.store(-1, Ordering::Relaxed);
             return;
         }
         let cls_addr = cls as usize;
@@ -598,11 +605,12 @@ pub fn set_pointer_locked(locked: bool) {
                 c"B@:".as_ptr(),
             );
         }
-        if prev != locked || installed_now {
+        if installed_now || POINTER_LOCK_APPLIED.load(Ordering::Relaxed) != wanted {
             let update_sel = sel!(setNeedsUpdateOfPrefersPointerLocked);
             let responds: bool = msg_send![&*vc, respondsToSelector: update_sel];
             if responds {
                 let _: () = msg_send![&*vc, setNeedsUpdateOfPrefersPointerLocked];
+                POINTER_LOCK_APPLIED.store(wanted, Ordering::Relaxed);
             }
         }
     }

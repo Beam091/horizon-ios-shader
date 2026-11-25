@@ -184,8 +184,40 @@ impl Game<'_> {
         })
     }
 
+    /// Floating Paste button shown above the user's finger after a long-press while typing
+    /// in any text box on iOS (clamped inside the safe area and above the soft keyboard).
+    fn touch_paste_button(&self, batch: &HudBatch) -> Option<Area> {
+        let (px, py) = self.pad.touch_paste_popup?;
+        let label = horizon_client::lang::get("horizon.touch.paste");
+        let w = (HudBatch::text_width(&self.gui.atlas, &label) + 16.0).max(46.0);
+        let h = 22.0;
+        let safe = self.touch_safe(batch.width, batch.height, batch.scale);
+        let kbd_points = horizon_client::screen_keyboard::height_points();
+        let kbd_gui = if kbd_points > 0.0 && batch.scale > 0.0 {
+            let factor = self.window.as_ref().map_or(1.0, |win| win.scale_factor());
+            (kbd_points * factor) as f32 / batch.scale
+        } else {
+            0.0
+        };
+        let min_x = safe.x + 4.0;
+        let max_x = (safe.x + safe.w - w - 4.0).max(min_x);
+        let x = (px - w * 0.5).clamp(min_x, max_x);
+        let min_y = safe.y + 4.0;
+        let max_y = (batch.height - kbd_gui - h - 6.0)
+            .min(safe.y + safe.h - h - 4.0)
+            .max(min_y);
+        let above = py - h - 12.0;
+        let y = if above >= min_y {
+            above.clamp(min_y, max_y)
+        } else {
+            (py + 14.0).clamp(min_y, max_y)
+        };
+        Some(Area { x, y, w, h })
+    }
+
     /// The Esc, Mouse, and Shift buttons at the top-left, plus the virtual mouse cursor
-    /// (ONLY in touch-screen trackpad mode — never over a physical iPadOS mouse pointer).
+    /// (ONLY in touch-screen trackpad mode — never over a physical iPadOS mouse pointer)
+    /// and the floating long-press Paste popup when typing on iOS.
     pub(super) fn draw_touch_close(&self, batch: &mut HudBatch) {
         let atlas = &self.gui.atlas;
         if let Some(a) = self.touch_close_button(batch) {
@@ -213,6 +245,17 @@ impl Game<'_> {
                 a,
                 &horizon_client::lang::get("horizon.touch.shift"),
                 self.touch_shift_active(),
+            );
+        }
+        if let Some(a) = self.touch_paste_button(batch) {
+            // Drop shadow + highlighted floating context pill so it stands out over text fields.
+            batch.fill(atlas, a.x + 2.0, a.y + 2.0, a.w, a.h, 0x9000_0000);
+            draw_top_pill(
+                batch,
+                atlas,
+                a,
+                &horizon_client::lang::get("horizon.touch.paste"),
+                true,
             );
         }
         if TOUCH_CONTROLS
@@ -274,6 +317,55 @@ impl Game<'_> {
             }
             return Vec::new();
         }
+        // Handle the floating Paste popup button (tap Paste to insert clipboard text, tap
+        // anywhere else to dismiss it) and track long-press holds while typing on iOS.
+        if TOUCH_CONTROLS
+            && !is_hw_mouse_touch
+            && let Some(batch) = self.gui_scale()
+        {
+            let at = (
+                touch.location.x as f32 / batch.scale,
+                touch.location.y as f32 / batch.scale,
+            );
+            if touch.phase == TouchPhase::Started && self.pad.touch_paste_popup.is_some() {
+                if let Some(paste_btn) = self.touch_paste_button(&batch)
+                    && paste_btn.contains(at)
+                {
+                    self.pad.touch_paste_popup = None;
+                    self.pad.touch_paste_hold = None;
+                    self.paste_into_focused_field();
+                    self.ime_dismissed = false;
+                    self.sync_ime();
+                    self.audio.play_button_click();
+                    return Vec::new();
+                }
+                self.pad.touch_paste_popup = None;
+            }
+            if let Some((hold_id, start, _, triggered)) = self.pad.touch_paste_hold
+                && hold_id == touch.id
+            {
+                match touch.phase {
+                    TouchPhase::Moved => {
+                        let dx = at.0 - start.0;
+                        let dy = at.1 - start.1;
+                        if !triggered && dx * dx + dy * dy > 14.0 * 14.0 {
+                            self.pad.touch_paste_hold = None;
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        self.pad.touch_paste_hold = None;
+                        if triggered {
+                            self.pad.touch_mouse.reset_touches();
+                            self.drag_button = None;
+                            self.physical_buttons
+                                .remove(&winit::event::MouseButton::Left);
+                            return Vec::new();
+                        }
+                    }
+                    TouchPhase::Started => {}
+                }
+            }
+        }
         let mouse = self.pad.touch_mouse.has_finger(touch.id);
         if !mouse
             && touch.phase == TouchPhase::Started
@@ -317,6 +409,16 @@ impl Game<'_> {
                 self.sync_touch_menu_shift();
                 self.audio.play_button_click();
                 return Vec::new();
+            }
+            // Start tracking a long-press for the floating Paste popup in menus; `touch_frame`
+            // clears it immediately unless a text field is focused (allowing a single long-press
+            // directly onto an unfocused text box to focus it and pop up Paste).
+            if TOUCH_CONTROLS
+                && !is_hw_mouse_touch
+                && !self.touch_playing()
+                && !self.pad.touch_mouse.trackpad
+            {
+                self.pad.touch_paste_hold = Some((touch.id, at, Instant::now(), false));
             }
         }
         // The on-screen keyboard takes every finger while it is open.
@@ -387,6 +489,22 @@ impl Game<'_> {
         self.account_poll();
         self.mods_poll();
         self.sync_touch_menu_shift();
+        // Trigger the floating Paste popup after a 450ms long-press while typing on iOS.
+        if self.pad.touch_paste_hold.is_some() || self.pad.touch_paste_popup.is_some() {
+            if self.touch_playing() || !self.text_field_focused() {
+                self.pad.touch_paste_hold = None;
+                self.pad.touch_paste_popup = None;
+            } else if let Some((_, pos, since, ref mut triggered)) = self.pad.touch_paste_hold
+                && !*triggered
+                && Instant::now().duration_since(since) >= std::time::Duration::from_millis(450)
+            {
+                *triggered = true;
+                self.pad.touch_paste_popup = Some(pos);
+                self.ime_dismissed = false;
+                self.sync_ime();
+                self.audio.play_button_click();
+            }
+        }
         if let Some(id) = self.window.as_ref().map(|w| w.id()) {
             let events = self.pad.touch_mouse.poll(Instant::now());
             for event in events {
@@ -831,7 +949,7 @@ impl Game<'_> {
         &mut self,
         event_loop: &dyn super::event_loop::EventLoopCtl,
     ) {
-        let playing = self.touch_playing();
+        let playing = !self.pad_in_menu() && self.player.is_some();
         horizon_client_input::ios_controllers::set_pointer_locked(playing);
 
         let id = self.window.as_ref().map(|w| w.id());
