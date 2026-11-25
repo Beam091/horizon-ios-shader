@@ -495,6 +495,13 @@ impl Game<'_> {
         {
             d.group("system", [r.hdr_line()]);
         }
+        #[cfg(target_os = "ios")]
+        if self.pad.ios_hw_mouse_connected {
+            d.group(
+                "system",
+                [horizon_client_input::ios_controllers::pointer_lock_debug_status()],
+            );
+        }
     }
     /// `DebugEntryTps` for local and remote connections.
     pub(super) fn debug_tps_line(&self, d: &mut debug_overlay::Displayer) {

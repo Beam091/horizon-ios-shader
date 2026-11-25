@@ -1121,12 +1121,16 @@ impl Game<'_> {
             effective_buttons[0] = false;
         }
         let old_btns = std::mem::replace(&mut self.pad.ios_hw_mouse_buttons, effective_buttons);
+        let mut any_released_in_world = false;
         for (i, &button) in buttons.iter().enumerate() {
             if effective_buttons[i] != old_btns[i] {
                 let pressed = effective_buttons[i];
                 self.last_input = Instant::now();
                 if playing {
                     self.captured = true;
+                    if !pressed {
+                        any_released_in_world = true;
+                    }
                 }
                 let state = if pressed {
                     winit::event::ElementState::Pressed
@@ -1144,6 +1148,9 @@ impl Game<'_> {
                     super::input_trace::InputOrigin::User,
                 );
             }
+        }
+        if any_released_in_world && !horizon_client_input::ios_controllers::is_pointer_locked() {
+            horizon_client_input::ios_controllers::refresh_pointer_lock();
         }
 
         // 4. Hardware mouse scroll wheel (`GCMouseInput.scroll.valueChangedHandler`).

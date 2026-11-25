@@ -17637,6 +17637,15 @@ impl ApplicationHandler for Game<'_> {
         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
             attributes, "horizon", "horizon",
         );
+        #[cfg(target_os = "ios")]
+        let attributes = {
+            use winit::platform::ios::{ScreenEdge, ValidOrientations, WindowAttributesExtIOS};
+            attributes
+                .with_prefers_status_bar_hidden(true)
+                .with_prefers_home_indicator_hidden(true)
+                .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
+                .with_valid_orientations(ValidOrientations::Landscape)
+        };
         // `--offscreen` renders into a texture: its window would only show white.
         let window_step = startup::step("window.create");
         let window = match event_loop.create_window(
@@ -18212,6 +18221,8 @@ impl Game<'_> {
                         r.resize(size.width, size.height);
                     }
                     self.observe_fullscreen();
+                    #[cfg(target_os = "ios")]
+                    horizon_client_input::ios_controllers::refresh_pointer_lock();
                 }
                 WindowEvent::Focused(focused) => {
                     self.focused = focused;
@@ -21828,6 +21839,15 @@ impl Loading {
         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
             attributes, "horizon", "horizon",
         );
+        #[cfg(target_os = "ios")]
+        let attributes = {
+            use winit::platform::ios::{ScreenEdge, ValidOrientations, WindowAttributesExtIOS};
+            attributes
+                .with_prefers_status_bar_hidden(true)
+                .with_prefers_home_indicator_hidden(true)
+                .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
+                .with_valid_orientations(ValidOrientations::Landscape)
+        };
         // `--offscreen` renders into a texture: its window would only show white.
         let window_step = startup::step("window.create");
         let window = match event_loop.create_window(

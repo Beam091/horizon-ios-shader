@@ -233,6 +233,15 @@ impl ApplicationHandler for Missing {
         let attributes = Window::default_attributes()
             .with_title("Horizon")
             .with_window_icon(horizon_client::window::icon());
+        #[cfg(target_os = "ios")]
+        let attributes = {
+            use winit::platform::ios::{ScreenEdge, ValidOrientations, WindowAttributesExtIOS};
+            attributes
+                .with_prefers_status_bar_hidden(true)
+                .with_prefers_home_indicator_hidden(true)
+                .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
+                .with_valid_orientations(ValidOrientations::Landscape)
+        };
         let attributes = super::window_size(attributes, [1040.0, 700.0]);
         let made = event_loop
             .create_window(attributes)
