@@ -283,6 +283,8 @@ define_class!(
     }
 );
 
+static POINTER_STYLE_CALLS: AtomicU32 = AtomicU32::new(0);
+
 define_class!(
     // SAFETY: `NSObject` has no subclassing requirements and `PointerStyleDelegate` has no `Drop`.
     #[unsafe(super(NSObject))]
@@ -290,12 +292,27 @@ define_class!(
     struct PointerStyleDelegate;
 
     impl PointerStyleDelegate {
+        #[unsafe(method_id(pointerInteraction:regionForRequest:defaultRegion:))]
+        fn region_for_request(
+            &self,
+            _interaction: &AnyObject,
+            _request: &AnyObject,
+            default_region: &AnyObject,
+        ) -> Option<Retained<AnyObject>> {
+            if WANT_POINTER_LOCK.load(Ordering::Relaxed) {
+                unsafe { Retained::retain((default_region as *const AnyObject).cast_mut()) }
+            } else {
+                None
+            }
+        }
+
         #[unsafe(method_id(pointerInteraction:styleForRegion:))]
         fn style_for_region(
             &self,
             _interaction: &AnyObject,
             _region: &AnyObject,
         ) -> Option<Retained<AnyObject>> {
+            POINTER_STYLE_CALLS.fetch_add(1, Ordering::Relaxed);
             if WANT_POINTER_LOCK.load(Ordering::Relaxed) {
                 AnyClass::get(c"UIPointerStyle")
                     .and_then(|style_cls| unsafe { msg_send![style_cls, hiddenPointerStyle] })
@@ -368,6 +385,14 @@ unsafe fn ensure_view_interactions(vc: &AnyObject, locked: bool) {
         }
         if let Some(inter_cls) = AnyClass::get(c"UIPointerInteraction") {
             unsafe {
+                // Declare formal UIPointerInteractionDelegate conformance before instantiating.
+                let proto = objc2::ffi::objc_getProtocol(c"UIPointerInteractionDelegate".as_ptr());
+                if !proto.is_null() {
+                    let cls_ptr = (PointerStyleDelegate::class() as *const AnyClass)
+                        .cast_mut()
+                        .cast();
+                    let _ = objc2::ffi::class_addProtocol(cls_ptr, proto);
+                }
                 let delegate: Retained<PointerStyleDelegate> =
                     msg_send![PointerStyleDelegate::class(), new];
                 let alloc: Allocated<AnyObject> = msg_send![inter_cls, alloc];
@@ -397,10 +422,12 @@ unsafe fn ensure_view_interactions(vc: &AnyObject, locked: bool) {
                 let _: () = msg_send![rec_ptr, setEnabled: Bool::new(!locked)];
             }
         }
+        // Keep UIPointerInteraction always enabled so in-view pointer updates immediately pick up
+        // `hiddenPointerStyle` (in-world) or `nil` (menus) on `invalidate` without requiring the
+        // pointer to leave and re-enter the view.
         let inter_ptr = POINTER_INTERACTION.load(Ordering::Relaxed) as *const AnyObject;
         if !inter_ptr.is_null() {
             unsafe {
-                let _: () = msg_send![inter_ptr, setEnabled: Bool::new(locked)];
                 let _: () = msg_send![inter_ptr, invalidate];
             }
         }
@@ -598,15 +625,20 @@ static PREFERS_POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
 /// Last observed `UIWindowScene.pointerLockState.isLocked` reported by iPadOS.
 static SYS_POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
 static POINTER_LOCK_INSTALLED_CLS: AtomicUsize = AtomicUsize::new(0);
+/// Number of times UIKit itself queried `-[WinitUIViewController prefersPointerLocked]`.
+static PREFERS_CB_CALLS: AtomicU32 = AtomicU32::new(0);
+static PROBING_PREFERS: AtomicBool = AtomicBool::new(false);
 
 struct PointerLockState {
     want_lock: bool,
     applied: Option<bool>,
     pulse_until: Option<Instant>,
     next_retry_at: Option<Instant>,
+    auto_retries: u8,
     last_probe_at: Option<Instant>,
     sys_locked: bool,
-    has_scene: bool,
+    win_has_scene: bool,
+    win_is_key: bool,
     activation_state: isize,
     vc_prefers: bool,
     vc_class: String,
@@ -620,9 +652,11 @@ impl PointerLockState {
             applied: None,
             pulse_until: None,
             next_retry_at: None,
+            auto_retries: 0,
             last_probe_at: None,
             sys_locked: false,
-            has_scene: false,
+            win_has_scene: false,
+            win_is_key: false,
             activation_state: -99,
             vc_prefers: false,
             vc_class: String::new(),
@@ -645,6 +679,7 @@ pub fn refresh_pointer_lock() {
     let mut st = POINTER_LOCK_STATE.lock().unwrap_or_else(|e| e.into_inner());
     st.applied = None;
     st.next_retry_at = None;
+    st.auto_retries = 0;
     st.last_probe_at = None;
 }
 
@@ -657,18 +692,24 @@ pub fn pointer_lock_debug_status() -> String {
         st.vc_class.as_str()
     };
     format!(
-        "Pointer: lock={} want={} pref={} scene={} act={} vc={} p={}",
+        "Pointer: lock={} want={} pref={} cb={} ws={} key={} act={} st={} p={} vc={}",
         if st.sys_locked { "ON" } else { "OFF" },
         if st.want_lock { "ON" } else { "OFF" },
         u8::from(st.vc_prefers),
-        u8::from(st.has_scene),
+        PREFERS_CB_CALLS.load(Ordering::Relaxed),
+        u8::from(st.win_has_scene),
+        u8::from(st.win_is_key),
         st.activation_state,
-        vc,
+        POINTER_STYLE_CALLS.load(Ordering::Relaxed),
         st.pulse_count,
+        vc,
     )
 }
 
 unsafe extern "C" fn prefers_pointer_locked(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+    if !PROBING_PREFERS.load(Ordering::Relaxed) {
+        PREFERS_CB_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     Bool::new(PREFERS_POINTER_LOCKED.load(Ordering::Relaxed))
 }
 
@@ -771,10 +812,17 @@ unsafe fn root_view_controller() -> Option<Obj> {
     win.and_then(|w| unsafe { msg_send![&*w, rootViewController] })
 }
 
-unsafe fn read_scene_lock_state(vc: &AnyObject) -> (bool, bool, isize) {
-    let mut scene: Option<Obj> = get!(vc, view)
-        .and_then(|v| get!(v, window))
-        .and_then(|w| get!(w, windowScene));
+/// Returns `(win_has_scene, win_is_key, is_locked, activation_state)`, repairing a detached
+/// `UIWindow.windowScene` or non-key active window if needed so `setNeedsUpdateOfPrefersPointerLocked`
+/// reaches the foreground `UIWindowScene`.
+unsafe fn read_scene_lock_state(vc: &AnyObject) -> (bool, bool, bool, isize) {
+    let win: Option<Obj> = get!(vc, view).and_then(|v| get!(v, window));
+    let mut win_is_key = win
+        .as_ref()
+        .is_some_and(|w| unsafe { msg_send![&**w, isKeyWindow] });
+    let mut scene: Option<Obj> = win.as_ref().and_then(|w| get!(w, windowScene));
+    let mut win_has_scene = scene.is_some();
+
     if scene.is_none() {
         let app: Option<Obj> = unsafe { msg_send![class!(UIApplication), sharedApplication] };
         if let Some(app) = app
@@ -800,19 +848,39 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> (bool, bool, isize) {
                 }
             }
         }
+        // If `winit`'s UIWindow lost its windowScene association, re-attach it to the active scene.
+        if let (Some(w), Some(s)) = (win.as_ref(), scene.as_ref()) {
+            let set_sel = sel!(setWindowScene:);
+            let responds: bool = unsafe { msg_send![&**w, respondsToSelector: set_sel] };
+            if responds {
+                unsafe {
+                    let _: () = msg_send![&**w, setWindowScene: &**s];
+                    let _: () = msg_send![&**w, makeKeyAndVisible];
+                }
+                win_has_scene = get!(w, windowScene).is_some();
+                win_is_key = unsafe { msg_send![&**w, isKeyWindow] };
+            }
+        }
     }
+
     let Some(scene) = scene else {
-        return (false, false, -99);
+        return (win_has_scene, win_is_key, false, -99);
     };
     let act: isize = unsafe { msg_send![&*scene, activationState] };
+    if act == 0 && !win_is_key && let Some(w) = win.as_ref() {
+        unsafe {
+            let _: () = msg_send![&**w, makeKeyWindow];
+        }
+        win_is_key = unsafe { msg_send![&**w, isKeyWindow] };
+    }
     let lock_sel = sel!(pointerLockState);
     let responds: bool = unsafe { msg_send![&*scene, respondsToSelector: lock_sel] };
     if !responds {
-        return (true, false, act);
+        return (win_has_scene, win_is_key, false, act);
     }
     let state: Option<Obj> = get!(scene, pointerLockState);
     let is_locked = state.is_some_and(|st| unsafe { msg_send![&*st, isLocked] });
-    (true, is_locked, act)
+    (win_has_scene, win_is_key, is_locked, act)
 }
 
 unsafe fn request_pointer_lock_update(vc: &AnyObject) {
@@ -882,17 +950,21 @@ pub fn set_pointer_locked(locked: bool) {
                 .last_probe_at
                 .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(120));
         if need_probe {
-            let (has_scene, sys_locked, act) = read_scene_lock_state(&vc);
+            let (win_has_scene, win_is_key, sys_locked, act) = read_scene_lock_state(&vc);
             let was_sys_locked = st.sys_locked;
-            st.has_scene = has_scene;
+            st.win_has_scene = win_has_scene;
+            st.win_is_key = win_is_key;
             st.sys_locked = sys_locked;
             st.activation_state = act;
             st.last_probe_at = Some(now);
             SYS_POINTER_LOCKED.store(sys_locked, Ordering::Relaxed);
+            PROBING_PREFERS.store(true, Ordering::Relaxed);
             let vc_pref: bool = msg_send![&*vc, prefersPointerLocked];
+            PROBING_PREFERS.store(false, Ordering::Relaxed);
             st.vc_prefers = vc_pref;
-            // If iPadOS dropped pointer lock while we still want it, schedule a prompt re-ask.
+            // If iPadOS dropped pointer lock while we still want it, schedule a single prompt re-ask.
             if locked && was_sys_locked && !sys_locked {
+                st.auto_retries = 0;
                 st.next_retry_at = Some(now + Duration::from_millis(150));
             }
         }
@@ -901,6 +973,7 @@ pub fn set_pointer_locked(locked: bool) {
             st.want_lock = false;
             st.pulse_until = None;
             st.next_retry_at = None;
+            st.auto_retries = 0;
             if installed_now
                 || st.applied != Some(false)
                 || PREFERS_POINTER_LOCKED.load(Ordering::Relaxed)
@@ -918,11 +991,13 @@ pub fn set_pointer_locked(locked: bool) {
             st.applied = None;
             st.pulse_until = None;
             st.next_retry_at = None;
+            st.auto_retries = 0;
         }
 
         if st.sys_locked {
             st.pulse_until = None;
             st.next_retry_at = None;
+            st.auto_retries = 0;
             st.applied = Some(true);
             if !PREFERS_POINTER_LOCKED.load(Ordering::Relaxed) {
                 PREFERS_POINTER_LOCKED.store(true, Ordering::Relaxed);
@@ -942,7 +1017,7 @@ pub fn set_pointer_locked(locked: bool) {
                 st.applied = Some(true);
                 st.vc_prefers = true;
                 st.pulse_count = st.pulse_count.saturating_add(1);
-                st.next_retry_at = Some(now + Duration::from_millis(1200));
+                st.next_retry_at = None;
                 invalidate_pointer_interaction();
             }
             return;
@@ -962,16 +1037,21 @@ pub fn set_pointer_locked(locked: bool) {
                 st.applied = Some(true);
                 st.vc_prefers = true;
                 st.pulse_count = st.pulse_count.saturating_add(1);
-                st.next_retry_at = Some(now + Duration::from_millis(600));
+                st.next_retry_at = Some(now + Duration::from_millis(500));
                 invalidate_pointer_interaction();
             }
             return;
         }
 
+        // At most one automatic follow-up pulse (500ms after initial ask or after a lock drop);
+        // further re-asks are driven by grantable events (click-up, focus, resize, resume).
         if !button_down
             && MOUSE_CONNECTED.load(Ordering::Relaxed)
+            && st.auto_retries < 1
             && st.next_retry_at.is_some_and(|t| now >= t)
         {
+            st.auto_retries = st.auto_retries.saturating_add(1);
+            st.next_retry_at = None;
             PREFERS_POINTER_LOCKED.store(false, Ordering::Relaxed);
             request_pointer_lock_update(&vc);
             st.pulse_until = Some(now + Duration::from_millis(60));

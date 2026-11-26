@@ -82,10 +82,6 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.games</string>
-	<key>GCSupportsGameMode</key>
-	<true/>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>GCSupportsControllerUserInteraction</key>
