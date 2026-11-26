@@ -15,14 +15,19 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     // An iOS app starts in `/`, which it cannot write: the game folder (saves, options.txt,
     // the prepared `resources`) is its Documents folder, which the Files app shows.
     #[cfg(target_os = "ios")]
-    if let Some(home) = std::env::var_os("HOME") {
-        let documents = std::path::Path::new(&home).join("Documents");
-        let _ = std::fs::create_dir_all(&documents);
-        let _ = std::env::set_current_dir(&documents);
-        // The prepared game files are gigabytes the player can make again: not for iCloud.
-        crate::resource_import::exclude_from_backup(&documents.join("resources"));
-        // The log and crash reports go there too, where the Files app shows them.
-        logging::set_game_home(documents);
+    {
+        // Register HorizonSceneDelegate and UIScene window adoption before winit calls
+        // UIApplicationMain, so UIKit's UIApplicationSceneManifest finds the class immediately.
+        horizon_client_input::ios_controllers::install_scene_lifecycle();
+        if let Some(home) = std::env::var_os("HOME") {
+            let documents = std::path::Path::new(&home).join("Documents");
+            let _ = std::fs::create_dir_all(&documents);
+            let _ = std::env::set_current_dir(&documents);
+            // The prepared game files are gigabytes the player can make again: not for iCloud.
+            crate::resource_import::exclude_from_backup(&documents.join("resources"));
+            // The log and crash reports go there too, where the Files app shows them.
+            logging::set_game_home(documents);
+        }
     }
     horizon_threads::configure_allocator();
     horizon_client::telemetry::mark_start();
