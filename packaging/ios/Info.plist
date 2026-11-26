@@ -81,10 +81,6 @@
 	</dict>
 	<key>UIRequiresFullScreen</key>
 	<true/>
-	<!-- Opt out of iPadOS 26's legacy UIRequiresFullScreen compatibility mode (Apple TN3192)
-	     while preserving full-screen behavior on iOS/iPadOS 15-18. -->
-	<key>UIRequiresFullScreenIgnoredStartingWithVersion</key>
-	<string>26</string>
 	<key>UIStatusBarHidden</key>
 	<true/>
 	<key>UISupportedInterfaceOrientations</key>

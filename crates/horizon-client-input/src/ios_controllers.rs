@@ -302,6 +302,23 @@ unsafe impl Encode for Rect {
     const ENCODING: Encoding = Encoding::Struct("CGRect", &[Point::ENCODING, Size::ENCODING]);
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EdgeInsets {
+    top: f64,
+    left: f64,
+    bottom: f64,
+    right: f64,
+}
+
+// SAFETY: `UIEdgeInsets` layout on 64-bit iOS (`CGFloat` = `f64`).
+unsafe impl Encode for EdgeInsets {
+    const ENCODING: Encoding = Encoding::Struct(
+        "UIEdgeInsets",
+        &[f64::ENCODING, f64::ENCODING, f64::ENCODING, f64::ENCODING],
+    );
+}
+
 /// Wrapper for Obj-C objects accessed strictly from UIKit main-thread callbacks.
 struct SendObj(Obj);
 unsafe impl Send for SendObj {}
@@ -329,13 +346,62 @@ impl SceneLifecycleState {
 
 static SCENE_STATE: Mutex<SceneLifecycleState> = Mutex::new(SceneLifecycleState::new());
 static SCENE_CONNECTED_COUNT: AtomicU32 = AtomicU32::new(0);
+static SCENE_INIT_WS_COUNT: AtomicU32 = AtomicU32::new(0);
 static SCENE_ADOPTED_COUNT: AtomicU32 = AtomicU32::new(0);
+static POINTER_LOCK_NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
 static SCENE_LIFECYCLE_INSTALLED: Once = Once::new();
 static POINTER_LOCK_OBSERVER_INSTALLED: Once = Once::new();
 static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static IN_INIT_WITH_SCENE: AtomicBool = AtomicBool::new(false);
 
+type InitWithFrameFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, Rect) -> *mut AnyObject;
+type SetRootVcFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject);
 type MakeKeyAndVisibleFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
+static ORIG_INIT_WITH_FRAME: OnceLock<InitWithFrameFn> = OnceLock::new();
+static ORIG_SET_ROOT_VC: OnceLock<SetRootVcFn> = OnceLock::new();
 static ORIG_MAKE_KEY_AND_VISIBLE: OnceLock<MakeKeyAndVisibleFn> = OnceLock::new();
+
+unsafe fn is_winit_window_ptr(this: *const AnyObject) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let Some(winit_cls) = AnyClass::get(c"WinitUIWindow") else {
+        return false;
+    };
+    let obj_cls = unsafe { objc2::ffi::object_getClass(this.cast_mut().cast()) };
+    std::ptr::eq(obj_cls, (winit_cls as *const AnyClass).cast())
+}
+
+unsafe fn track_window_ptr(this: *const AnyObject) {
+    let mut st = SCENE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.tracked_windows.retain(|w| w.0.load().is_some());
+    let already_tracked = st.tracked_windows.iter().any(|w| {
+        w.0.load()
+            .is_some_and(|obj| std::ptr::eq(&*obj as *const AnyObject, this))
+    });
+    if !already_tracked {
+        st.tracked_windows
+            .push(SendWeak(Weak::new(unsafe { &*this })));
+    }
+}
+
+unsafe fn configure_scene_restrictions(scene: &AnyObject) {
+    let sr_sel = sel!(sizeRestrictions);
+    let has_sr: bool = unsafe { msg_send![scene, respondsToSelector: sr_sel] };
+    if !has_sr {
+        return;
+    }
+    let Some(sr) = get!(scene, sizeRestrictions) else {
+        return;
+    };
+    let allow_fs_sel = sel!(setAllowsFullScreen:);
+    let has_allow_fs: bool = unsafe { msg_send![&*sr, respondsToSelector: allow_fs_sel] };
+    if has_allow_fs {
+        unsafe {
+            let _: () = msg_send![&*sr, setAllowsFullScreen: Bool::YES];
+        }
+    }
+}
 
 unsafe fn is_app_window_scene(scene: &AnyObject) -> bool {
     let Some(ws_cls) = AnyClass::get(c"UIWindowScene") else {
@@ -388,6 +454,7 @@ unsafe fn attach_window_inner(
             SCENE_ADOPTED_COUNT.fetch_add(1, Ordering::Relaxed);
         }
     }
+    unsafe { configure_scene_restrictions(scene) };
     if let Some(del) = delegate {
         unsafe {
             let _: () = msg_send![del, setWindow: win];
@@ -395,33 +462,83 @@ unsafe fn attach_window_inner(
     }
 }
 
-unsafe extern "C-unwind" fn swizzled_make_key_and_visible(this: *mut AnyObject, cmd: Sel) {
-    let is_winit = !this.is_null()
-        && AnyClass::get(c"WinitUIWindow")
-            .is_some_and(|cls| unsafe { msg_send![this, isKindOfClass: cls] });
-    if is_winit && unsafe { window_needs_scene(this) } {
+/// Redirects `[[WinitUIWindow alloc] initWithFrame:]` to `initWithWindowScene:` when our
+/// `HorizonSceneDelegate` already connected an application `UIWindowScene` (matching SDL3),
+/// so winit's window is created natively on the scene from birth.
+unsafe extern "C-unwind" fn swizzled_init_with_frame(
+    this: *mut AnyObject,
+    cmd: Sel,
+    frame: Rect,
+) -> *mut AnyObject {
+    if unsafe { is_winit_window_ptr(this) } && !IN_INIT_WITH_SCENE.load(Ordering::Relaxed) {
         let (scene, delegate) = {
-            let mut st = SCENE_STATE.lock().unwrap_or_else(|e| e.into_inner());
-            st.tracked_windows.retain(|w| w.0.load().is_some());
-            let already_tracked = st.tracked_windows.iter().any(|w| {
-                w.0.load()
-                    .is_some_and(|obj| std::ptr::eq(&*obj as *const AnyObject, this))
-            });
-            if !already_tracked {
-                st.tracked_windows
-                    .push(SendWeak(Weak::new(unsafe { &*this })));
-            }
+            let st = SCENE_STATE.lock().unwrap_or_else(|e| e.into_inner());
             (
                 st.scene.as_ref().map(|s| s.0.clone()),
                 st.delegate.as_ref().map(|d| d.0.clone()),
             )
         };
         if let Some(scene) = scene {
-            unsafe { attach_window_inner(this, &scene, delegate.as_deref()) };
-        } else {
-            // Keep the window off-screen until `scene:willConnectToSession:options:` connects
-            // the real application UIWindowScene and attaches + shows it.
-            return;
+            IN_INIT_WITH_SCENE.store(true, Ordering::Relaxed);
+            let res: *mut AnyObject = unsafe { msg_send![this, initWithWindowScene: &*scene] };
+            IN_INIT_WITH_SCENE.store(false, Ordering::Relaxed);
+            if !res.is_null() {
+                SCENE_INIT_WS_COUNT.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    track_window_ptr(res);
+                    configure_scene_restrictions(&scene);
+                    if let Some(del) = delegate.as_deref() {
+                        let _: () = msg_send![del, setWindow: res];
+                    }
+                }
+            }
+            return res;
+        }
+    }
+    if let Some(orig) = ORIG_INIT_WITH_FRAME.get() {
+        unsafe { orig(this, cmd, frame) }
+    } else {
+        this
+    }
+}
+
+/// Installs `prefersPointerLocked` on `WinitUIViewController` BEFORE `-[UIWindow setRootViewController:]`
+/// attaches the controller to the window and before UIKit loads its view or computes initial scene
+/// client settings.
+unsafe extern "C-unwind" fn swizzled_set_root_vc(
+    this: *mut AnyObject,
+    cmd: Sel,
+    vc: *mut AnyObject,
+) {
+    if !vc.is_null() && unsafe { is_winit_window_ptr(this) } {
+        unsafe {
+            let _ = ensure_pointer_lock_methods(&*vc);
+        }
+    }
+    if let Some(orig) = ORIG_SET_ROOT_VC.get() {
+        unsafe { orig(this, cmd, vc) };
+    }
+}
+
+unsafe extern "C-unwind" fn swizzled_make_key_and_visible(this: *mut AnyObject, cmd: Sel) {
+    let is_winit = unsafe { is_winit_window_ptr(this) };
+    if is_winit {
+        unsafe { track_window_ptr(this) };
+        if unsafe { window_needs_scene(this) } {
+            let (scene, delegate) = {
+                let st = SCENE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    st.scene.as_ref().map(|s| s.0.clone()),
+                    st.delegate.as_ref().map(|d| d.0.clone()),
+                )
+            };
+            if let Some(scene) = scene {
+                unsafe { attach_window_inner(this, &scene, delegate.as_deref()) };
+            } else {
+                // Keep the window off-screen until `scene:willConnectToSession:options:` connects
+                // the real application UIWindowScene and attaches + shows it.
+                return;
+            }
         }
     }
     if let Some(orig) = ORIG_MAKE_KEY_AND_VISIBLE.get() {
@@ -444,6 +561,7 @@ define_class!(
 );
 
 fn handle_pointer_lock_notification(notification: &AnyObject) {
+    POINTER_LOCK_NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed);
     let user_info: Option<Obj> = get!(notification, userInfo);
     let key = unsafe { UIPointerLockStateSceneUserInfoKey };
     let scene: Option<Obj> = if !key.is_null() {
@@ -647,19 +765,42 @@ pub fn install_scene_lifecycle() {
             return;
         };
         let win_cls_ptr = (ui_window_cls as *const AnyClass).cast_mut().cast();
-        let method = objc2::ffi::class_getInstanceMethod(win_cls_ptr, sel!(makeKeyAndVisible));
-        if method.is_null() {
-            return;
+        // 1. Redirect `[[WinitUIWindow alloc] initWithFrame:]` to `initWithWindowScene:` when
+        //    our scene delegate already connected the app scene.
+        let init_method = objc2::ffi::class_getInstanceMethod(win_cls_ptr, sel!(initWithFrame:));
+        if !init_method.is_null()
+            && let Some(orig_imp) = objc2::ffi::method_getImplementation(init_method)
+        {
+            let orig_fn: InitWithFrameFn = std::mem::transmute::<Imp, InitWithFrameFn>(orig_imp);
+            let _ = ORIG_INIT_WITH_FRAME.set(orig_fn);
+            let new_imp: Imp =
+                std::mem::transmute::<InitWithFrameFn, Imp>(swizzled_init_with_frame);
+            let _ = objc2::ffi::method_setImplementation(init_method.cast_mut(), new_imp);
         }
-        let Some(orig_imp) = objc2::ffi::method_getImplementation(method) else {
-            return;
-        };
-        let orig_fn: MakeKeyAndVisibleFn =
-            std::mem::transmute::<Imp, MakeKeyAndVisibleFn>(orig_imp);
-        let _ = ORIG_MAKE_KEY_AND_VISIBLE.set(orig_fn);
-        let new_imp: Imp =
-            std::mem::transmute::<MakeKeyAndVisibleFn, Imp>(swizzled_make_key_and_visible);
-        let _ = objc2::ffi::method_setImplementation(method.cast_mut(), new_imp);
+        // 2. Install `prefersPointerLocked` on `WinitUIViewController` BEFORE `setRootViewController:`
+        //    attaches it to the window (so UIKit sees the override before viewDidLoad / scene setup).
+        let root_method =
+            objc2::ffi::class_getInstanceMethod(win_cls_ptr, sel!(setRootViewController:));
+        if !root_method.is_null()
+            && let Some(orig_imp) = objc2::ffi::method_getImplementation(root_method)
+        {
+            let orig_fn: SetRootVcFn = std::mem::transmute::<Imp, SetRootVcFn>(orig_imp);
+            let _ = ORIG_SET_ROOT_VC.set(orig_fn);
+            let new_imp: Imp = std::mem::transmute::<SetRootVcFn, Imp>(swizzled_set_root_vc);
+            let _ = objc2::ffi::method_setImplementation(root_method.cast_mut(), new_imp);
+        }
+        // 3. Fallback adoption if winit created its window before the scene connected.
+        let method = objc2::ffi::class_getInstanceMethod(win_cls_ptr, sel!(makeKeyAndVisible));
+        if !method.is_null()
+            && let Some(orig_imp) = objc2::ffi::method_getImplementation(method)
+        {
+            let orig_fn: MakeKeyAndVisibleFn =
+                std::mem::transmute::<Imp, MakeKeyAndVisibleFn>(orig_imp);
+            let _ = ORIG_MAKE_KEY_AND_VISIBLE.set(orig_fn);
+            let new_imp: Imp =
+                std::mem::transmute::<MakeKeyAndVisibleFn, Imp>(swizzled_make_key_and_visible);
+            let _ = objc2::ffi::method_setImplementation(method.cast_mut(), new_imp);
+        }
     });
 }
 
@@ -771,6 +912,21 @@ unsafe fn ensure_view_interactions(vc: &AnyObject, locked: bool) {
                     action: sel!(hoverChanged:)
                 ];
                 if let Some(rec) = rec {
+                    // Match SDL3: restrict hover tracking to indirect pointer devices
+                    // (`UITouchTypeIndirectPointer == 3`).
+                    let set_types = sel!(setAllowedTouchTypes:);
+                    let has_types: bool = msg_send![&*rec, respondsToSelector: set_types];
+                    if has_types {
+                        let num: Option<Obj> =
+                            msg_send![class!(NSNumber), numberWithInteger: 3isize];
+                        if let Some(num) = num {
+                            let arr: Option<Obj> =
+                                msg_send![class!(NSArray), arrayWithObject: &*num];
+                            if let Some(arr) = arr {
+                                let _: () = msg_send![&*rec, setAllowedTouchTypes: &*arr];
+                            }
+                        }
+                    }
                     // WinitUIView already implements UIGestureRecognizerDelegate returning YES
                     // for simultaneous recognition.
                     let _: () = msg_send![&*rec, setDelegate: &*view];
@@ -1016,7 +1172,7 @@ pub fn poll_hardware_input() -> HardwareInput {
 }
 
 /// Whether the game currently wants pointer lock (in-world); drives `UIPointerInteraction`
-/// fallback cursor hiding continuously even across `false -> true` re-ask pulses.
+/// fallback cursor hiding continuously while unlocked.
 static WANT_POINTER_LOCK: AtomicBool = AtomicBool::new(false);
 /// The exact value returned by `-[WinitUIViewController prefersPointerLocked]`.
 static PREFERS_POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
@@ -1030,7 +1186,6 @@ static PROBING_PREFERS: AtomicBool = AtomicBool::new(false);
 struct PointerLockState {
     want_lock: bool,
     applied: Option<bool>,
-    pulse_until: Option<Instant>,
     next_retry_at: Option<Instant>,
     auto_retries: u8,
     last_probe_at: Option<Instant>,
@@ -1039,13 +1194,16 @@ struct PointerLockState {
     win_is_key: bool,
     has_pls: bool,
     scene_fullscreen: bool,
+    sa_top: i32,
+    sa_bottom: i32,
+    resizing_restrictions: isize,
+    view_first_responder: bool,
     assistive_touch: bool,
     mouse_count: usize,
     scene_window_count: usize,
     activation_state: isize,
     vc_prefers: bool,
     vc_class: String,
-    pulse_count: u32,
 }
 
 impl PointerLockState {
@@ -1053,7 +1211,6 @@ impl PointerLockState {
         Self {
             want_lock: false,
             applied: None,
-            pulse_until: None,
             next_retry_at: None,
             auto_retries: 0,
             last_probe_at: None,
@@ -1062,13 +1219,16 @@ impl PointerLockState {
             win_is_key: false,
             has_pls: false,
             scene_fullscreen: false,
+            sa_top: 0,
+            sa_bottom: 0,
+            resizing_restrictions: -1,
+            view_first_responder: false,
             assistive_touch: false,
             mouse_count: 0,
             scene_window_count: 0,
             activation_state: -99,
             vc_prefers: false,
             vc_class: String::new(),
-            pulse_count: 0,
         }
     }
 }
@@ -1081,8 +1241,8 @@ pub fn is_pointer_locked() -> bool {
 }
 
 /// Marks the iPadOS pointer-lock state dirty so the next `set_pointer_locked()` call immediately
-/// re-asks via a `false -> true` edge (e.g. after returning from background, Control Center,
-/// window resize/maximize, click-up while unlocked, or regaining focus).
+/// re-requests `setNeedsUpdateOfPrefersPointerLocked` (e.g. after returning from background,
+/// Control Center, window resize/maximize, click-up while unlocked, or regaining focus).
 pub fn refresh_pointer_lock() {
     REFRESH_PENDING.store(true, Ordering::Release);
     if let Ok(mut st) = POINTER_LOCK_STATE.try_lock() {
@@ -1102,23 +1262,28 @@ pub fn pointer_lock_debug_status() -> String {
         st.vc_class.as_str()
     };
     format!(
-        "Pointer: lock={} want={} pref={} cb={} sd={}/{} ws={} key={} act={} pls={} full={} at={} m={} nw={} st={} p={} vc={}",
+        "Pointer: lock={} want={} pref={} cb={} sd={}/{}/{} ws={} key={} act={} pls={} full={} sa={}/{} rr={} fr={} at={} m={} n={} nw={} st={} vc={}",
         if st.sys_locked { "ON" } else { "OFF" },
         if st.want_lock { "ON" } else { "OFF" },
         u8::from(st.vc_prefers),
         PREFERS_CB_CALLS.load(Ordering::Relaxed),
         SCENE_CONNECTED_COUNT.load(Ordering::Relaxed),
+        SCENE_INIT_WS_COUNT.load(Ordering::Relaxed),
         SCENE_ADOPTED_COUNT.load(Ordering::Relaxed),
         st.win_scene_kind,
         u8::from(st.win_is_key),
         st.activation_state,
         u8::from(st.has_pls),
         u8::from(st.scene_fullscreen),
+        st.sa_top,
+        st.sa_bottom,
+        st.resizing_restrictions,
+        u8::from(st.view_first_responder),
         u8::from(st.assistive_touch),
         st.mouse_count,
+        POINTER_LOCK_NOTIFY_COUNT.load(Ordering::Relaxed),
         st.scene_window_count,
         POINTER_STYLE_CALLS.load(Ordering::Relaxed),
-        st.pulse_count,
         vc,
     )
 }
@@ -1135,6 +1300,48 @@ unsafe extern "C" fn child_vc_for_pointer_lock(
     _cmd: Sel,
 ) -> *mut AnyObject {
     std::ptr::null_mut()
+}
+
+/// Installs `prefersPointerLocked` and `childViewControllerForPointerLock` on `vc`'s Obj-C class
+/// once. Shared by `swizzled_set_root_vc` (before UIKit attaches the root VC to the window) and
+/// `set_pointer_locked` (fallback).
+unsafe fn ensure_pointer_lock_methods(vc: &AnyObject) -> bool {
+    let cls = unsafe { objc2::ffi::object_getClass((vc as *const AnyObject).cast_mut().cast()) };
+    if cls.is_null() {
+        return false;
+    }
+    let cls_addr = cls as usize;
+    let installed_now = POINTER_LOCK_INSTALLED_CLS.swap(cls_addr, Ordering::Relaxed) != cls_addr;
+    if installed_now {
+        let pref_imp: Imp = unsafe {
+            std::mem::transmute::<unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool, Imp>(
+                prefers_pointer_locked,
+            )
+        };
+        unsafe {
+            objc2::ffi::class_replaceMethod(
+                cls.cast_mut(),
+                sel!(prefersPointerLocked),
+                pref_imp,
+                c"B@:".as_ptr(),
+            );
+        }
+        let child_imp: Imp = unsafe {
+            std::mem::transmute::<
+                unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+                Imp,
+            >(child_vc_for_pointer_lock)
+        };
+        unsafe {
+            objc2::ffi::class_replaceMethod(
+                cls.cast_mut(),
+                sel!(childViewControllerForPointerLock),
+                child_imp,
+                c"@@:".as_ptr(),
+            );
+        }
+    }
+    installed_now
 }
 
 unsafe fn root_view_controller() -> Option<Obj> {
@@ -1236,6 +1443,10 @@ struct SceneLockInfo {
     is_locked: bool,
     has_pls: bool,
     scene_fullscreen: bool,
+    sa_top: i32,
+    sa_bottom: i32,
+    resizing_restrictions: isize,
+    view_first_responder: bool,
     assistive_touch: bool,
     mouse_count: usize,
     scene_window_count: usize,
@@ -1250,7 +1461,21 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
     let mice: Option<Obj> = unsafe { msg_send![class!(GCMouse), mice] };
     let mouse_count: usize = mice.map_or(0, |list| unsafe { msg_send![&*list, count] });
 
-    let win: Option<Obj> = get!(vc, view).and_then(|v| get!(v, window));
+    let view: Option<Obj> = get!(vc, view);
+    let view_first_responder = view
+        .as_ref()
+        .is_some_and(|v| unsafe { msg_send![&**v, isFirstResponder] });
+    let win: Option<Obj> = view.as_ref().and_then(|v| get!(v, window));
+    let (sa_top, sa_bottom) = win.as_ref().map_or((0, 0), |w| {
+        let sa_sel = sel!(safeAreaInsets);
+        let has_sa: bool = unsafe { msg_send![&**w, respondsToSelector: sa_sel] };
+        if has_sa {
+            let insets: EdgeInsets = unsafe { msg_send![&**w, safeAreaInsets] };
+            (insets.top.round() as i32, insets.bottom.round() as i32)
+        } else {
+            (0, 0)
+        }
+    });
     let mut win_is_key = win
         .as_ref()
         .is_some_and(|w| unsafe { msg_send![&**w, isKeyWindow] });
@@ -1315,6 +1540,10 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
             is_locked: false,
             has_pls: false,
             scene_fullscreen: false,
+            sa_top,
+            sa_bottom,
+            resizing_restrictions: -1,
+            view_first_responder,
             assistive_touch,
             mouse_count,
             scene_window_count: 0,
@@ -1344,6 +1573,21 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
     } else {
         false
     };
+    let resizing_restrictions = {
+        let eg_sel = sel!(effectiveGeometry);
+        let has_eg: bool = unsafe { msg_send![&*scene, respondsToSelector: eg_sel] };
+        if has_eg && let Some(geom) = get!(scene, effectiveGeometry) {
+            let rr_sel = sel!(resizingRestrictions);
+            let has_rr: bool = unsafe { msg_send![&*geom, respondsToSelector: rr_sel] };
+            if has_rr {
+                unsafe { msg_send![&*geom, resizingRestrictions] }
+            } else {
+                -1
+            }
+        } else {
+            -1
+        }
+    };
 
     let lock_sel = sel!(pointerLockState);
     let responds: bool = unsafe { msg_send![&*scene, respondsToSelector: lock_sel] };
@@ -1354,6 +1598,10 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
             is_locked: false,
             has_pls: false,
             scene_fullscreen,
+            sa_top,
+            sa_bottom,
+            resizing_restrictions,
+            view_first_responder,
             assistive_touch,
             mouse_count,
             scene_window_count,
@@ -1369,6 +1617,10 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
         is_locked,
         has_pls,
         scene_fullscreen,
+        sa_top,
+        sa_bottom,
+        resizing_restrictions,
+        view_first_responder,
         assistive_touch,
         mouse_count,
         scene_window_count,
@@ -1387,9 +1639,10 @@ unsafe fn request_pointer_lock_update(vc: &AnyObject) {
 }
 
 /// Locks and hides the iPadOS/iOS hardware mouse pointer while in-world (`prefersPointerLocked`),
-/// unlocks/restores it when a menu or inventory screen is open, toggles `UIHoverGestureRecognizer`
-/// and `UIPointerInteraction` (`hiddenPointerStyle` fallback), and retries declined requests on
-/// click-up / focus / resize via a genuine `false -> true` edge pulse.
+/// unlocks/restores it when a menu or inventory screen is open, and toggles
+/// `UIHoverGestureRecognizer` and `UIPointerInteraction` (`hiddenPointerStyle` fallback).
+/// Keeps `prefersPointerLocked == YES` steadily while in-world (matching SDL3 / vkQuake-ios)
+/// without flipping back to `NO` on re-asks.
 pub fn set_pointer_locked(locked: bool) {
     WANT_POINTER_LOCK.store(locked, Ordering::Relaxed);
     let now = Instant::now();
@@ -1406,45 +1659,20 @@ pub fn set_pointer_locked(locked: bool) {
             return;
         };
         ensure_view_interactions(&vc, locked);
-        let cls = objc2::ffi::object_getClass((&*vc as *const AnyObject).cast_mut().cast());
-        if cls.is_null() {
-            st.applied = None;
-            return;
-        }
-        let cls_addr = cls as usize;
-        let installed_now =
-            POINTER_LOCK_INSTALLED_CLS.swap(cls_addr, Ordering::Relaxed) != cls_addr;
-        if installed_now {
-            let pref_imp: Imp = std::mem::transmute::<
-                unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
-                Imp,
-            >(prefers_pointer_locked);
-            objc2::ffi::class_replaceMethod(
-                cls.cast_mut(),
-                sel!(prefersPointerLocked),
-                pref_imp,
-                c"B@:".as_ptr(),
-            );
-            let child_imp: Imp = std::mem::transmute::<
-                unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
-                Imp,
-            >(child_vc_for_pointer_lock);
-            objc2::ffi::class_replaceMethod(
-                cls.cast_mut(),
-                sel!(childViewControllerForPointerLock),
-                child_imp,
-                c"@@:".as_ptr(),
-            );
-            let cname = objc2::ffi::class_getName(cls);
-            if !cname.is_null() {
-                st.vc_class = CStr::from_ptr(cname).to_string_lossy().into_owned();
+        let installed_now = ensure_pointer_lock_methods(&vc);
+        if st.vc_class.is_empty() {
+            let cls = objc2::ffi::object_getClass((&*vc as *const AnyObject).cast_mut().cast());
+            if !cls.is_null() {
+                let cname = objc2::ffi::class_getName(cls);
+                if !cname.is_null() {
+                    st.vc_class = CStr::from_ptr(cname).to_string_lossy().into_owned();
+                }
             }
         }
 
         let need_probe = installed_now
             || st.want_lock != locked
             || st.applied != Some(locked)
-            || st.pulse_until.is_some()
             || st
                 .last_probe_at
                 .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(120));
@@ -1456,6 +1684,10 @@ pub fn set_pointer_locked(locked: bool) {
             st.sys_locked = info.is_locked;
             st.has_pls = info.has_pls;
             st.scene_fullscreen = info.scene_fullscreen;
+            st.sa_top = info.sa_top;
+            st.sa_bottom = info.sa_bottom;
+            st.resizing_restrictions = info.resizing_restrictions;
+            st.view_first_responder = info.view_first_responder;
             st.assistive_touch = info.assistive_touch;
             st.mouse_count = info.mouse_count;
             st.scene_window_count = info.scene_window_count;
@@ -1478,7 +1710,6 @@ pub fn set_pointer_locked(locked: bool) {
 
         if !locked {
             st.want_lock = false;
-            st.pulse_until = None;
             st.next_retry_at = None;
             st.auto_retries = 0;
             if installed_now
@@ -1496,13 +1727,11 @@ pub fn set_pointer_locked(locked: bool) {
         if !st.want_lock {
             st.want_lock = true;
             st.applied = None;
-            st.pulse_until = None;
             st.next_retry_at = None;
             st.auto_retries = 0;
         }
 
         if st.sys_locked {
-            st.pulse_until = None;
             st.next_retry_at = None;
             st.auto_retries = 0;
             st.applied = Some(true);
@@ -1516,41 +1745,17 @@ pub fn set_pointer_locked(locked: bool) {
         // Wait for mouse button release (e.g. clicking "Play" or "Back to Game") before asking
         // SpringBoard for pointer lock; mid-click requests are often declined on iPadOS 26.
         let button_down = is_hardware_mouse_button_down();
-        if let Some(deadline) = st.pulse_until {
-            if now >= deadline && !button_down {
-                st.pulse_until = None;
-                PREFERS_POINTER_LOCKED.store(true, Ordering::Relaxed);
-                request_pointer_lock_update(&vc);
-                st.applied = Some(true);
-                st.vc_prefers = true;
-                st.pulse_count = st.pulse_count.saturating_add(1);
-                st.next_retry_at = None;
-                invalidate_pointer_interaction();
-            }
-            return;
-        }
-
         if !button_down && (installed_now || st.applied != Some(true)) {
-            if PREFERS_POINTER_LOCKED.load(Ordering::Relaxed) {
-                // Force a real `false -> true` edge (60ms hold) so UIKit/SpringBoard does not
-                // treat a repeated `prefersPointerLocked == YES` as a cached no-op.
-                PREFERS_POINTER_LOCKED.store(false, Ordering::Relaxed);
-                request_pointer_lock_update(&vc);
-                st.pulse_until = Some(now + Duration::from_millis(60));
-                st.vc_prefers = false;
-            } else {
-                PREFERS_POINTER_LOCKED.store(true, Ordering::Relaxed);
-                request_pointer_lock_update(&vc);
-                st.applied = Some(true);
-                st.vc_prefers = true;
-                st.pulse_count = st.pulse_count.saturating_add(1);
-                st.next_retry_at = Some(now + Duration::from_millis(500));
-                invalidate_pointer_interaction();
-            }
+            PREFERS_POINTER_LOCKED.store(true, Ordering::Relaxed);
+            request_pointer_lock_update(&vc);
+            st.applied = Some(true);
+            st.vc_prefers = true;
+            st.next_retry_at = Some(now + Duration::from_millis(500));
+            invalidate_pointer_interaction();
             return;
         }
 
-        // At most one automatic follow-up pulse (500ms after initial ask or after a lock drop);
+        // At most one automatic follow-up (500ms after initial ask or after a lock drop);
         // further re-asks are driven by grantable events (click-up, focus, resize, resume).
         if !button_down
             && MOUSE_CONNECTED.load(Ordering::Relaxed)
@@ -1559,10 +1764,10 @@ pub fn set_pointer_locked(locked: bool) {
         {
             st.auto_retries = st.auto_retries.saturating_add(1);
             st.next_retry_at = None;
-            PREFERS_POINTER_LOCKED.store(false, Ordering::Relaxed);
+            PREFERS_POINTER_LOCKED.store(true, Ordering::Relaxed);
             request_pointer_lock_update(&vc);
-            st.pulse_until = Some(now + Duration::from_millis(60));
-            st.vc_prefers = false;
+            st.vc_prefers = true;
+            invalidate_pointer_interaction();
         }
     }
 }
