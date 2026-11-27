@@ -23,9 +23,9 @@ concurrency:
 
 jobs:
   ipa:
-    # GitHub's Apple Silicon Macs often have no capacity (the job is never picked up);
-    # its Intel ones build the same iPhone (arm64) binary.
-    runs-on: macos-15-intel
+    # Build with the Xcode 27 runner (macOS 27 arm64 + iOS 27 SDK) so iPadOS 27+ treats the app
+    # natively (UIScene + pointer lock + Game Mode) instead of legacy iOS 18 SDK compatibility.
+    runs-on: xcode-27
     permissions:
       contents: write
     timeout-minutes: 120
@@ -38,13 +38,17 @@ jobs:
           targets: aarch64-apple-ios
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ios
+          key: ios-xcode27
       - name: Build
         env:
           IPHONEOS_DEPLOYMENT_TARGET: "15.0"
           # The fork whose "Native mods for iOS" issue the app's Native tab ticks.
           HORIZON_IOS_REPO: ${{ github.repository }}
-        run: cargo build --release --locked --target aarch64-apple-ios -p horizon-client --bin horizon-client
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          cargo build --release --locked --target aarch64-apple-ios -p horizon-client --bin horizon-client
+          otool -l target/aarch64-apple-ios/release/horizon-client | grep -A4 LC_BUILD_VERSION
       - name: Package
         id: package
         run: |

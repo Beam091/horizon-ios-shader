@@ -41,6 +41,35 @@ fi
 name=$(printf '%s' "$name" | tr -d '<>&"\\/' | cut -c1-30)
 sed -e "s/@VERSION@/$version/g" -e "s/@BUNDLE@/$bundle/g" -e "s/@SCHEME@/$scheme/g" -e "s/@NAME@/$name/g" \
   "$here/Info.plist" > "$app/Info.plist"
+if command -v xcrun >/dev/null && command -v plutil >/dev/null; then
+  sdk_ver=$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true)
+  sdk_build=$(xcrun --sdk iphoneos --show-sdk-build-version 2>/dev/null || true)
+  macos_build=$(sw_vers -buildVersion 2>/dev/null || true)
+  xcode_ver_line=$(xcodebuild -version 2>/dev/null || true)
+  xcode_ver=$(printf '%s\n' "$xcode_ver_line" | sed -n 's/^Xcode \([0-9]*\)\.\([0-9]*\).*/\1\2/p')
+  xcode_build=$(printf '%s\n' "$xcode_ver_line" | sed -n 's/^Build version \(.*\)/\1/p')
+  plutil -replace DTPlatformName -string iphoneos "$app/Info.plist"
+  plutil -replace DTCompiler -string com.apple.compilers.llvm.clang.1_0 "$app/Info.plist"
+  if [[ -n "$sdk_ver" ]]; then
+    plutil -replace DTPlatformVersion -string "$sdk_ver" "$app/Info.plist"
+    plutil -replace DTSDKName -string "iphoneos$sdk_ver" "$app/Info.plist"
+  fi
+  if [[ -n "$sdk_build" ]]; then
+    plutil -replace DTPlatformBuild -string "$sdk_build" "$app/Info.plist"
+    plutil -replace DTSDKBuild -string "$sdk_build" "$app/Info.plist"
+  fi
+  if [[ -n "$xcode_ver" ]]; then
+    # Format e.g. 27.2 -> 2720 (4-digit DTXcode convention).
+    dt_xcode=$(printf '%04d' "$((10#$xcode_ver * 10))")
+    plutil -replace DTXcode -string "$dt_xcode" "$app/Info.plist"
+  fi
+  if [[ -n "$xcode_build" ]]; then
+    plutil -replace DTXcodeBuild -string "$xcode_build" "$app/Info.plist"
+  fi
+  if [[ -n "$macos_build" ]]; then
+    plutil -replace BuildMachineOSBuild -string "$macos_build" "$app/Info.plist"
+  fi
+fi
 if command -v plutil >/dev/null; then plutil -lint "$app/Info.plist"; else python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$app/Info.plist"; fi
 printf 'APPL????' > "$app/PkgInfo"
 icon=$here/icon.png

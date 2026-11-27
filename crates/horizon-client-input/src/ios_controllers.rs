@@ -1738,13 +1738,55 @@ pub fn pointer_lock_debug_status() -> String {
     )
 }
 
-/// Second F3 debug line enumerating all windows attached to the foreground `UIWindowScene`.
+static BUNDLE_PLIST_DIAG: OnceLock<String> = OnceLock::new();
+
+unsafe fn bundle_plist_diag() -> &'static str {
+    BUNDLE_PLIST_DIAG
+        .get_or_init(|| {
+            let bundle: Option<Obj> = unsafe { msg_send![class!(NSBundle), mainBundle] };
+            let Some(bundle) = bundle else {
+                return "sdk=none".to_owned();
+            };
+            let str_key = |k: &str| -> Option<String> {
+                let key = NSString::from_str(k);
+                let val: Option<Obj> =
+                    unsafe { msg_send![&*bundle, objectForInfoDictionaryKey: &*key] };
+                let val = val?;
+                let desc: Option<Retained<NSString>> = unsafe { msg_send![&*val, description] };
+                desc.map(|s| s.to_string())
+            };
+            let bool_key = |k: &str| -> u8 {
+                let key = NSString::from_str(k);
+                let val: Option<Obj> =
+                    unsafe { msg_send![&*bundle, objectForInfoDictionaryKey: &*key] };
+                val.map_or(0, |v| {
+                    let sel_bool = sel!(boolValue);
+                    let has: bool = unsafe { msg_send![&*v, respondsToSelector: sel_bool] };
+                    if has {
+                        let b: bool = unsafe { msg_send![&*v, boolValue] };
+                        u8::from(b)
+                    } else {
+                        1
+                    }
+                })
+            };
+            let sdk = str_key("DTSDKName").unwrap_or_else(|| "none".to_owned());
+            let ind = bool_key("UIApplicationSupportsIndirectInputEvents");
+            let rfs = bool_key("UIRequiresFullScreen");
+            let gm = bool_key("GCSupportsGameMode");
+            format!("sdk={sdk} ind={ind} rfs={rfs} gm={gm}")
+        })
+        .as_str()
+}
+
+/// Second F3 debug line showing runtime `Info.plist` SDK/pointer flags and all scene windows.
 pub fn pointer_lock_windows_status() -> String {
+    let diag = unsafe { bundle_plist_diag() };
     let st = POINTER_LOCK_STATE.lock().unwrap_or_else(|e| e.into_inner());
     if st.windows_summary.is_empty() {
-        "SceneWin: none".to_owned()
+        format!("SceneWin: {diag} | none")
     } else {
-        format!("SceneWin: {}", st.windows_summary)
+        format!("SceneWin: {diag} | {}", st.windows_summary)
     }
 }
 
