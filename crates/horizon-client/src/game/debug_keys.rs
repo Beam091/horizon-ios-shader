@@ -499,7 +499,10 @@ impl Game<'_> {
         if self.pad.ios_hw_mouse_connected {
             d.group(
                 "system",
-                [horizon_client_input::ios_controllers::pointer_lock_debug_status()],
+                [
+                    horizon_client_input::ios_controllers::pointer_lock_debug_status(),
+                    horizon_client_input::ios_controllers::pointer_lock_windows_status(),
+                ],
             );
         }
     }

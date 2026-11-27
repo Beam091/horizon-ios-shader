@@ -132,7 +132,7 @@ pub fn connected() -> Vec<Pad> {
 
 use objc2::encode::{Encode, Encoding};
 use objc2::rc::{Allocated, Weak};
-use objc2::runtime::{AnyClass, Bool, Imp, NSObject, Sel};
+use objc2::runtime::{AnyClass, Bool, ClassBuilder, Imp, NSObject, Sel};
 use objc2::{ClassType, define_class, sel};
 use objc2_foundation::NSString;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
@@ -345,6 +345,8 @@ impl SceneLifecycleState {
 }
 
 static SCENE_STATE: Mutex<SceneLifecycleState> = Mutex::new(SceneLifecycleState::new());
+static APP_DELEGATE_PTR: AtomicUsize = AtomicUsize::new(0);
+static HORIZON_ROOT_VC_CLS: OnceLock<&'static AnyClass> = OnceLock::new();
 static SCENE_CONNECTED_COUNT: AtomicU32 = AtomicU32::new(0);
 static SCENE_INIT_WS_COUNT: AtomicU32 = AtomicU32::new(0);
 static SCENE_ADOPTED_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -354,12 +356,52 @@ static POINTER_LOCK_OBSERVER_INSTALLED: Once = Once::new();
 static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 static IN_INIT_WITH_SCENE: AtomicBool = AtomicBool::new(false);
 
+type AppInitFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel) -> *mut AnyObject;
 type InitWithFrameFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, Rect) -> *mut AnyObject;
 type SetRootVcFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject);
 type MakeKeyAndVisibleFn = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
+static ORIG_APP_INIT: OnceLock<AppInitFn> = OnceLock::new();
 static ORIG_INIT_WITH_FRAME: OnceLock<InitWithFrameFn> = OnceLock::new();
 static ORIG_SET_ROOT_VC: OnceLock<SetRootVcFn> = OnceLock::new();
 static ORIG_MAKE_KEY_AND_VISIBLE: OnceLock<MakeKeyAndVisibleFn> = OnceLock::new();
+
+/// Landscape mask (`UIInterfaceOrientationMaskLandscapeLeft | Right`).
+const LANDSCAPE_ORIENTATION_MASK: usize = (1 << 3) | (1 << 4);
+/// All screen edges (`UIRectEdgeAll`).
+const RECT_EDGE_ALL: usize = 0x0F;
+/// `UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight`.
+const VIEW_AUTORESIZING_FLEXIBLE_WH: usize = (1 << 1) | (1 << 4);
+
+/// Safely replaces or overrides an instance method on `cls` without ever mutating an inherited
+/// superclass method implementation.
+unsafe fn swizzle_instance_method(
+    cls: &AnyClass,
+    sel: Sel,
+    new_imp: Imp,
+    types: &CStr,
+) -> Option<Imp> {
+    let cls_ptr = (cls as *const AnyClass).cast_mut().cast();
+    let method = unsafe { objc2::ffi::class_getInstanceMethod(cls_ptr, sel) };
+    if method.is_null() {
+        return None;
+    }
+    let orig_imp = unsafe { objc2::ffi::method_getImplementation(method) }?;
+    let super_cls = unsafe { objc2::ffi::class_getSuperclass(cls_ptr) };
+    let super_method = if super_cls.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { objc2::ffi::class_getInstanceMethod(super_cls, sel) }
+    };
+    if std::ptr::eq(method, super_method) {
+        let added = unsafe { objc2::ffi::class_addMethod(cls_ptr, sel, new_imp, types.as_ptr()) };
+        if !added.as_bool() {
+            return None;
+        }
+    } else {
+        let _ = unsafe { objc2::ffi::method_setImplementation(method.cast_mut(), new_imp) };
+    }
+    Some(orig_imp)
+}
 
 unsafe fn is_winit_window_ptr(this: *const AnyObject) -> bool {
     if this.is_null() {
@@ -370,6 +412,26 @@ unsafe fn is_winit_window_ptr(this: *const AnyObject) -> bool {
     };
     let obj_cls = unsafe { objc2::ffi::object_getClass(this.cast_mut().cast()) };
     std::ptr::eq(obj_cls, (winit_cls as *const AnyClass).cast())
+}
+
+unsafe fn is_winit_vc_ptr(vc: *const AnyObject) -> bool {
+    if vc.is_null() {
+        return false;
+    }
+    let Some(winit_cls) = AnyClass::get(c"WinitUIViewController") else {
+        return false;
+    };
+    unsafe { msg_send![vc, isKindOfClass: winit_cls] }
+}
+
+unsafe fn is_horizon_root_vc_ptr(vc: *const AnyObject) -> bool {
+    if vc.is_null() {
+        return false;
+    }
+    let Some(root_cls) = HORIZON_ROOT_VC_CLS.get().copied() else {
+        return false;
+    };
+    unsafe { msg_send![vc, isKindOfClass: root_cls] }
 }
 
 unsafe fn track_window_ptr(this: *const AnyObject) {
@@ -388,17 +450,31 @@ unsafe fn track_window_ptr(this: *const AnyObject) {
 unsafe fn configure_scene_restrictions(scene: &AnyObject) {
     let sr_sel = sel!(sizeRestrictions);
     let has_sr: bool = unsafe { msg_send![scene, respondsToSelector: sr_sel] };
-    if !has_sr {
-        return;
+    if has_sr && let Some(sr) = get!(scene, sizeRestrictions) {
+        let allow_fs_sel = sel!(setAllowsFullScreen:);
+        let has_allow_fs: bool = unsafe { msg_send![&*sr, respondsToSelector: allow_fs_sel] };
+        if has_allow_fs {
+            unsafe {
+                let _: () = msg_send![&*sr, setAllowsFullScreen: Bool::YES];
+            }
+        }
     }
-    let Some(sr) = get!(scene, sizeRestrictions) else {
-        return;
-    };
-    let allow_fs_sel = sel!(setAllowsFullScreen:);
-    let has_allow_fs: bool = unsafe { msg_send![&*sr, respondsToSelector: allow_fs_sel] };
-    if has_allow_fs {
-        unsafe {
-            let _: () = msg_send![&*sr, setAllowsFullScreen: Bool::YES];
+    // Match DELOSApp.swift: ask iPadOS 16+/26+ explicitly for landscape scene geometry.
+    let req_sel = sel!(requestGeometryUpdateWithPreferences:errorHandler:);
+    let has_req: bool = unsafe { msg_send![scene, respondsToSelector: req_sel] };
+    if has_req && let Some(pref_cls) = AnyClass::get(c"UIWindowSceneGeometryPreferencesIOS") {
+        let alloc: Allocated<AnyObject> = unsafe { msg_send![pref_cls, alloc] };
+        let prefs: Option<Obj> = unsafe {
+            msg_send![alloc, initWithInterfaceOrientations: LANDSCAPE_ORIENTATION_MASK]
+        };
+        if let Some(prefs) = prefs {
+            unsafe {
+                let _: () = msg_send![
+                    scene,
+                    requestGeometryUpdateWithPreferences: &*prefs,
+                    errorHandler: std::ptr::null::<std::ffi::c_void>()
+                ];
+            }
         }
     }
 }
@@ -462,6 +538,275 @@ unsafe fn attach_window_inner(
     }
 }
 
+unsafe extern "C" fn hvc_prefers_pointer_locked(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+    if !PROBING_PREFERS.load(Ordering::Relaxed) {
+        PREFERS_CB_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    Bool::new(PREFERS_POINTER_LOCKED.load(Ordering::Relaxed))
+}
+
+unsafe extern "C" fn hvc_child_for_pointer_lock(_this: *mut AnyObject, _cmd: Sel) -> *mut AnyObject {
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn hvc_first_child(this: *mut AnyObject, _cmd: Sel) -> *mut AnyObject {
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let children: Option<Obj> = unsafe { msg_send![this, childViewControllers] };
+    children.map_or(std::ptr::null_mut(), |arr| unsafe {
+        msg_send![&*arr, firstObject]
+    })
+}
+
+unsafe extern "C" fn hvc_supported_orientations(_this: *mut AnyObject, _cmd: Sel) -> usize {
+    LANDSCAPE_ORIENTATION_MASK
+}
+
+unsafe extern "C" fn hvc_yes(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+    Bool::YES
+}
+
+unsafe extern "C" fn hvc_edges(_this: *mut AnyObject, _cmd: Sel) -> usize {
+    RECT_EDGE_ALL
+}
+
+/// Registers a genuine `UIViewController` subclass (`HorizonRootViewController`) before any window
+/// is created, matching `DELOSApp.swift`'s `OrientationLockedContainer`: it owns
+/// `prefersPointerLocked` and `prefersInterfaceOrientationLocked` directly on a real Obj-C
+/// subclass while forwarding status-bar / home-indicator / edge-gesture preferences to winit's
+/// child `WinitUIViewController`.
+unsafe fn register_horizon_root_vc_class() -> Option<&'static AnyClass> {
+    if let Some(&cls) = HORIZON_ROOT_VC_CLS.get() {
+        return Some(cls);
+    }
+    if let Some(existing) = AnyClass::get(c"HorizonRootViewController") {
+        let _ = HORIZON_ROOT_VC_CLS.set(existing);
+        return Some(existing);
+    }
+    let ui_vc_cls = AnyClass::get(c"UIViewController")?;
+    let mut builder = ClassBuilder::new(c"HorizonRootViewController", ui_vc_cls)?;
+    unsafe {
+        builder.add_method(
+            sel!(prefersPointerLocked),
+            hvc_prefers_pointer_locked as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+        );
+        builder.add_method(
+            sel!(childViewControllerForPointerLock),
+            hvc_child_for_pointer_lock
+                as unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+        );
+        builder.add_method(
+            sel!(childViewControllerForStatusBarHidden),
+            hvc_first_child as unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+        );
+        builder.add_method(
+            sel!(childViewControllerForHomeIndicatorAutoHidden),
+            hvc_first_child as unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+        );
+        builder.add_method(
+            sel!(childViewControllerForScreenEdgesDeferringSystemGestures),
+            hvc_first_child as unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+        );
+        builder.add_method(
+            sel!(supportedInterfaceOrientations),
+            hvc_supported_orientations as unsafe extern "C" fn(*mut AnyObject, Sel) -> usize,
+        );
+        builder.add_method(
+            sel!(prefersInterfaceOrientationLocked),
+            hvc_yes as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+        );
+        builder.add_method(
+            sel!(prefersStatusBarHidden),
+            hvc_yes as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+        );
+        builder.add_method(
+            sel!(prefersHomeIndicatorAutoHidden),
+            hvc_yes as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+        );
+        builder.add_method(
+            sel!(preferredScreenEdgesDeferringSystemGestures),
+            hvc_edges as unsafe extern "C" fn(*mut AnyObject, Sel) -> usize,
+        );
+    }
+    let cls = builder.register();
+    let _ = HORIZON_ROOT_VC_CLS.set(cls);
+    Some(cls)
+}
+
+/// Wraps a `WinitUIViewController` inside a native `HorizonRootViewController` container.
+unsafe fn wrap_in_horizon_root_vc(child_vc: &AnyObject) -> Option<Obj> {
+    if unsafe { is_horizon_root_vc_ptr(child_vc) } {
+        return unsafe { Retained::retain((child_vc as *const AnyObject).cast_mut()) };
+    }
+    if let Some(parent) = get!(child_vc, parentViewController)
+        && unsafe { is_horizon_root_vc_ptr(&*parent) }
+    {
+        return Some(parent);
+    }
+    let root_cls = unsafe { register_horizon_root_vc_class() }?;
+    let container: Option<Obj> = unsafe { msg_send![root_cls, new] };
+    let container = container?;
+    unsafe {
+        let _: () = msg_send![&*container, addChildViewController: child_vc];
+    }
+    let cview: Option<Obj> = get!(container, view);
+    let wview: Option<Obj> = get!(child_vc, view);
+    unsafe {
+        if let (Some(cview), Some(wview)) = (cview, wview) {
+            let bounds: Rect = msg_send![&*cview, bounds];
+            let _: () = msg_send![&*wview, setFrame: bounds];
+            let _: () = msg_send![&*wview, setAutoresizingMask: VIEW_AUTORESIZING_FLEXIBLE_WH];
+            let _: () = msg_send![&*cview, addSubview: &*wview];
+        }
+        let _: () = msg_send![child_vc, didMoveToParentViewController: &*container];
+        let lock_orient_sel = sel!(setNeedsUpdateOfPrefersInterfaceOrientationLocked);
+        let has_lock_orient: bool = msg_send![&*container, respondsToSelector: lock_orient_sel];
+        if has_lock_orient {
+            let _: () = msg_send![&*container, setNeedsUpdateOfPrefersInterfaceOrientationLocked];
+        }
+    }
+    Some(container)
+}
+
+fn make_scene_configuration(session: &AnyObject) -> Option<Retained<AnyObject>> {
+    let role: Option<Obj> = get!(session, role);
+    let cfg_cls = AnyClass::get(c"UISceneConfiguration")?;
+    let alloc: Allocated<AnyObject> = unsafe { msg_send![cfg_cls, alloc] };
+    let name = NSString::from_str("Default Configuration");
+    let role_ptr = role
+        .as_deref()
+        .map_or(std::ptr::null::<AnyObject>(), |r| r as *const AnyObject);
+    let cfg: Option<Obj> =
+        unsafe { msg_send![alloc, initWithName: &*name, sessionRole: role_ptr] };
+    if let Some(cfg) = cfg {
+        let is_app = role.as_deref().is_some_and(|r| {
+            let app_role = unsafe { UIWindowSceneSessionRoleApplication };
+            app_role.is_null() || unsafe { msg_send![r, isEqualToString: app_role] }
+        });
+        if is_app {
+            unsafe {
+                let _: () = msg_send![&*cfg, setDelegateClass: HorizonSceneDelegate::class()];
+            }
+        }
+        return Some(cfg);
+    }
+    None
+}
+
+define_class!(
+    // SAFETY: `NSObject` has no subclassing requirements and `HorizonAppDelegate` has no `Drop`.
+    #[unsafe(super(NSObject))]
+    #[name = "HorizonAppDelegate"]
+    struct HorizonAppDelegate;
+
+    impl HorizonAppDelegate {
+        #[unsafe(method_id(window))]
+        fn window(&self) -> Option<Retained<AnyObject>> {
+            SCENE_STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .window
+                .as_ref()
+                .map(|w| w.0.clone())
+        }
+
+        #[unsafe(method(setWindow:))]
+        fn set_window(&self, window: Option<&AnyObject>) {
+            let next = window.and_then(|w| {
+                unsafe { Retained::retain((w as *const AnyObject).cast_mut()) }.map(SendObj)
+            });
+            let prev = {
+                let mut st = SCENE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::replace(&mut st.window, next)
+            };
+            drop(prev);
+        }
+
+        #[unsafe(method(application:didFinishLaunchingWithOptions:))]
+        fn did_finish_launching(
+            &self,
+            _application: &AnyObject,
+            _options: Option<&AnyObject>,
+        ) -> Bool {
+            Bool::YES
+        }
+
+        #[unsafe(method(application:supportedInterfaceOrientationsForWindow:))]
+        fn supported_orientations(
+            &self,
+            _application: &AnyObject,
+            _window: Option<&AnyObject>,
+        ) -> usize {
+            LANDSCAPE_ORIENTATION_MASK
+        }
+
+        #[unsafe(method_id(application:configurationForConnectingSceneSession:options:))]
+        fn scene_configuration(
+            &self,
+            _application: &AnyObject,
+            session: &AnyObject,
+            _options: &AnyObject,
+        ) -> Option<Retained<AnyObject>> {
+            make_scene_configuration(session)
+        }
+    }
+);
+
+unsafe fn install_app_delegate_on(app: *const AnyObject) {
+    if app.is_null() {
+        return;
+    }
+    let existing: Option<Obj> = unsafe { msg_send![app, delegate] };
+    if existing.is_some() {
+        return;
+    }
+    let mut ptr = APP_DELEGATE_PTR.load(Ordering::Acquire);
+    if ptr == 0 {
+        let del: Retained<HorizonAppDelegate> =
+            unsafe { msg_send![HorizonAppDelegate::class(), new] };
+        let raw = Retained::into_raw(del) as usize;
+        match APP_DELEGATE_PTR.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => ptr = raw,
+            Err(existing_ptr) => {
+                // Another path initialized it first; release our duplicate.
+                let _ = unsafe { Retained::from_raw(raw as *mut HorizonAppDelegate) };
+                ptr = existing_ptr;
+            }
+        }
+    }
+    if ptr != 0 {
+        let del_obj = ptr as *const AnyObject;
+        unsafe {
+            let _: () = msg_send![app, setDelegate: del_obj];
+        }
+    }
+}
+
+unsafe fn ensure_app_delegate() {
+    let app: Option<Obj> = unsafe { msg_send![class!(UIApplication), sharedApplication] };
+    if let Some(app) = app {
+        unsafe { install_app_delegate_on(&*app) };
+    }
+}
+
+/// Gives `UIApplication` a genuine `UIApplicationDelegate` (`HorizonAppDelegate`) during
+/// `UIApplicationMain`, since `winit 0.30` intentionally passes `nil` for `delegateClassName`.
+unsafe extern "C-unwind" fn swizzled_ui_app_init(
+    this: *mut AnyObject,
+    cmd: Sel,
+) -> *mut AnyObject {
+    let res = if let Some(orig) = ORIG_APP_INIT.get() {
+        unsafe { orig(this, cmd) }
+    } else {
+        this
+    };
+    if !res.is_null() {
+        unsafe { install_app_delegate_on(res) };
+    }
+    res
+}
+
 /// Redirects `[[WinitUIWindow alloc] initWithFrame:]` to `initWithWindowScene:` when our
 /// `HorizonSceneDelegate` already connected an application `UIWindowScene` (matching SDL3),
 /// so winit's window is created natively on the scene from birth.
@@ -502,9 +847,9 @@ unsafe extern "C-unwind" fn swizzled_init_with_frame(
     }
 }
 
-/// Installs `prefersPointerLocked` on `WinitUIViewController` BEFORE `-[UIWindow setRootViewController:]`
-/// attaches the controller to the window and before UIKit loads its view or computes initial scene
-/// client settings.
+/// Wraps `WinitUIViewController` inside a genuine `HorizonRootViewController` subclass BEFORE
+/// `-[UIWindow setRootViewController:]` attaches it to `WinitUIWindow`, so iPadOS queries
+/// `prefersPointerLocked` on a native `UIViewController` subclass from the first frame.
 unsafe extern "C-unwind" fn swizzled_set_root_vc(
     this: *mut AnyObject,
     cmd: Sel,
@@ -512,7 +857,17 @@ unsafe extern "C-unwind" fn swizzled_set_root_vc(
 ) {
     if !vc.is_null() && unsafe { is_winit_window_ptr(this) } {
         unsafe {
-            let _ = ensure_pointer_lock_methods(&*vc);
+            if !is_horizon_root_vc_ptr(vc) && is_winit_vc_ptr(vc) {
+                let _ = ensure_pointer_lock_methods(&*vc);
+                if let Some(container) = wrap_in_horizon_root_vc(&*vc) {
+                    if let Some(orig) = ORIG_SET_ROOT_VC.get() {
+                        orig(this, cmd, Retained::as_ptr(&container).cast_mut());
+                    }
+                    return;
+                }
+            } else if !is_horizon_root_vc_ptr(vc) {
+                let _ = ensure_pointer_lock_methods(&*vc);
+            }
         }
     }
     if let Some(orig) = ORIG_SET_ROOT_VC.get() {
@@ -644,6 +999,10 @@ define_class!(
             if !unsafe { is_app_window_scene(scene) } {
                 return;
             }
+            unsafe {
+                ensure_app_delegate();
+                configure_scene_restrictions(scene);
+            }
             ensure_pointer_lock_observer();
             SCENE_CONNECTED_COUNT.fetch_add(1, Ordering::Relaxed);
             let scene_ret = unsafe { Retained::retain((scene as *const AnyObject).cast_mut()) };
@@ -676,6 +1035,7 @@ define_class!(
         #[unsafe(method(sceneDidBecomeActive:))]
         fn scene_did_become_active(&self, scene: &AnyObject) {
             if unsafe { is_app_window_scene(scene) } {
+                unsafe { ensure_app_delegate() };
                 let scene_ret =
                     unsafe { Retained::retain((scene as *const AnyObject).cast_mut()) };
                 let self_ret = unsafe {
@@ -734,10 +1094,18 @@ define_class!(
     }
 );
 
-/// Registers `HorizonSceneDelegate` and installs `UIScene` window adoption for `winit 0.30`
-/// before `UIApplicationMain` runs. Must be called on the main thread at process startup.
+/// Registers `HorizonAppDelegate`, `HorizonSceneDelegate`, and `HorizonRootViewController` and
+/// installs `UIScene` window adoption for `winit 0.30` before `UIApplicationMain` runs.
+/// Must be called on the main thread at process startup.
 pub fn install_scene_lifecycle() {
     SCENE_LIFECYCLE_INSTALLED.call_once(|| unsafe {
+        let app_del_cls = HorizonAppDelegate::class();
+        let app_del_ptr = (app_del_cls as *const AnyClass).cast_mut().cast();
+        let app_proto = objc2::ffi::objc_getProtocol(c"UIApplicationDelegate".as_ptr());
+        if !app_proto.is_null() {
+            let _ = objc2::ffi::class_addProtocol(app_del_ptr, app_proto);
+        }
+
         let cls = HorizonSceneDelegate::class();
         let cls_ptr = (cls as *const AnyClass).cast_mut().cast();
         for proto_name in [c"UISceneDelegate", c"UIWindowSceneDelegate"] {
@@ -746,10 +1114,20 @@ pub fn install_scene_lifecycle() {
                 let _ = objc2::ffi::class_addProtocol(cls_ptr, proto);
             }
         }
+        let _ = register_horizon_root_vc_class();
         ensure_pointer_lock_observer();
 
-        // Only swizzle `-[UIWindow makeKeyAndVisible]` when Info.plist declares a
-        // `UIApplicationSceneManifest`; otherwise UIKit runs without a scene delegate.
+        // Give `UIApplication` a genuine `UIApplicationDelegate` during `UIApplicationMain`.
+        if let Some(ui_app_cls) = AnyClass::get(c"UIApplication") {
+            let new_imp: Imp = std::mem::transmute::<AppInitFn, Imp>(swizzled_ui_app_init);
+            if let Some(orig_imp) = swizzle_instance_method(ui_app_cls, sel!(init), new_imp, c"@@:")
+            {
+                let orig_fn: AppInitFn = std::mem::transmute::<Imp, AppInitFn>(orig_imp);
+                let _ = ORIG_APP_INIT.set(orig_fn);
+            }
+        }
+
+        // Only swizzle `UIWindow` when Info.plist declares a `UIApplicationSceneManifest`.
         let bundle: Option<Obj> = msg_send![class!(NSBundle), mainBundle];
         let manifest_key = NSString::from_str("UIApplicationSceneManifest");
         let has_manifest = bundle
@@ -764,42 +1142,42 @@ pub fn install_scene_lifecycle() {
         let Some(ui_window_cls) = AnyClass::get(c"UIWindow") else {
             return;
         };
-        let win_cls_ptr = (ui_window_cls as *const AnyClass).cast_mut().cast();
         // 1. Redirect `[[WinitUIWindow alloc] initWithFrame:]` to `initWithWindowScene:` when
         //    our scene delegate already connected the app scene.
-        let init_method = objc2::ffi::class_getInstanceMethod(win_cls_ptr, sel!(initWithFrame:));
-        if !init_method.is_null()
-            && let Some(orig_imp) = objc2::ffi::method_getImplementation(init_method)
-        {
+        let init_imp: Imp = std::mem::transmute::<InitWithFrameFn, Imp>(swizzled_init_with_frame);
+        if let Some(orig_imp) = swizzle_instance_method(
+            ui_window_cls,
+            sel!(initWithFrame:),
+            init_imp,
+            c"@@:{CGRect={CGPoint=dd}{CGSize=dd}}",
+        ) {
             let orig_fn: InitWithFrameFn = std::mem::transmute::<Imp, InitWithFrameFn>(orig_imp);
             let _ = ORIG_INIT_WITH_FRAME.set(orig_fn);
-            let new_imp: Imp =
-                std::mem::transmute::<InitWithFrameFn, Imp>(swizzled_init_with_frame);
-            let _ = objc2::ffi::method_setImplementation(init_method.cast_mut(), new_imp);
         }
-        // 2. Install `prefersPointerLocked` on `WinitUIViewController` BEFORE `setRootViewController:`
-        //    attaches it to the window (so UIKit sees the override before viewDidLoad / scene setup).
-        let root_method =
-            objc2::ffi::class_getInstanceMethod(win_cls_ptr, sel!(setRootViewController:));
-        if !root_method.is_null()
-            && let Some(orig_imp) = objc2::ffi::method_getImplementation(root_method)
-        {
+        // 2. Wrap `WinitUIViewController` inside a genuine `HorizonRootViewController` subclass
+        //    BEFORE `setRootViewController:` attaches it to `WinitUIWindow`.
+        let root_imp: Imp = std::mem::transmute::<SetRootVcFn, Imp>(swizzled_set_root_vc);
+        if let Some(orig_imp) = swizzle_instance_method(
+            ui_window_cls,
+            sel!(setRootViewController:),
+            root_imp,
+            c"v@:@",
+        ) {
             let orig_fn: SetRootVcFn = std::mem::transmute::<Imp, SetRootVcFn>(orig_imp);
             let _ = ORIG_SET_ROOT_VC.set(orig_fn);
-            let new_imp: Imp = std::mem::transmute::<SetRootVcFn, Imp>(swizzled_set_root_vc);
-            let _ = objc2::ffi::method_setImplementation(root_method.cast_mut(), new_imp);
         }
         // 3. Fallback adoption if winit created its window before the scene connected.
-        let method = objc2::ffi::class_getInstanceMethod(win_cls_ptr, sel!(makeKeyAndVisible));
-        if !method.is_null()
-            && let Some(orig_imp) = objc2::ffi::method_getImplementation(method)
-        {
+        let key_imp: Imp =
+            std::mem::transmute::<MakeKeyAndVisibleFn, Imp>(swizzled_make_key_and_visible);
+        if let Some(orig_imp) = swizzle_instance_method(
+            ui_window_cls,
+            sel!(makeKeyAndVisible),
+            key_imp,
+            c"v@:",
+        ) {
             let orig_fn: MakeKeyAndVisibleFn =
                 std::mem::transmute::<Imp, MakeKeyAndVisibleFn>(orig_imp);
             let _ = ORIG_MAKE_KEY_AND_VISIBLE.set(orig_fn);
-            let new_imp: Imp =
-                std::mem::transmute::<MakeKeyAndVisibleFn, Imp>(swizzled_make_key_and_visible);
-            let _ = objc2::ffi::method_setImplementation(method.cast_mut(), new_imp);
         }
     });
 }
@@ -814,6 +1192,25 @@ define_class!(
         #[unsafe(method(hoverChanged:))]
         fn hover_changed(&self, recognizer: &AnyObject) {
             handle_hover(recognizer);
+        }
+
+        #[unsafe(method(gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:))]
+        fn should_recognize_simultaneously(
+            &self,
+            _gr: &AnyObject,
+            _other: &AnyObject,
+        ) -> Bool {
+            Bool::YES
+        }
+
+        #[unsafe(method(gestureRecognizer:shouldRequireFailureOfGestureRecognizer:))]
+        fn should_require_failure(&self, _gr: &AnyObject, _other: &AnyObject) -> Bool {
+            Bool::NO
+        }
+
+        #[unsafe(method(gestureRecognizer:shouldBeRequiredToFailByGestureRecognizer:))]
+        fn should_be_required_to_fail(&self, _gr: &AnyObject, _other: &AnyObject) -> Bool {
+            Bool::NO
         }
     }
 );
@@ -830,17 +1227,26 @@ define_class!(
         #[unsafe(method_id(pointerInteraction:regionForRequest:defaultRegion:))]
         fn region_for_request(
             &self,
-            _interaction: &AnyObject,
+            interaction: &AnyObject,
             _request: &AnyObject,
             default_region: &AnyObject,
         ) -> Option<Retained<AnyObject>> {
-            if WANT_POINTER_LOCK.load(Ordering::Relaxed)
-                && !SYS_POINTER_LOCKED.load(Ordering::Relaxed)
-            {
-                unsafe { Retained::retain((default_region as *const AnyObject).cast_mut()) }
-            } else {
-                None
-            }
+            // Match SDL3 / bcd-games: return a single continuous region spanning the whole view
+            // bounds so hidden pointer style never lapses between per-location default regions.
+            let full_region = get!(interaction, view).and_then(|view| {
+                let region_cls = AnyClass::get(c"UIPointerRegion")?;
+                let bounds: Rect = unsafe { msg_send![&*view, bounds] };
+                unsafe {
+                    msg_send![
+                        region_cls,
+                        regionWithRect: bounds,
+                        identifier: std::ptr::null::<AnyObject>()
+                    ]
+                }
+            });
+            full_region.or_else(|| unsafe {
+                Retained::retain((default_region as *const AnyObject).cast_mut())
+            })
         }
 
         #[unsafe(method_id(pointerInteraction:styleForRegion:))]
@@ -873,7 +1279,10 @@ fn handle_hover(recognizer: &AnyObject) {
         return;
     };
     let pt: Point = unsafe { msg_send![recognizer, locationInView: &*view] };
-    let scale: f64 = unsafe { msg_send![&*view, contentScaleFactor] };
+    let scale: f64 = get!(view, window)
+        .and_then(|w| get!(w, screen))
+        .map(|s| unsafe { msg_send![&*s, scale] })
+        .unwrap_or_else(|| unsafe { msg_send![&*view, contentScaleFactor] });
     let scale = if scale.is_finite() && scale > 0.0 {
         scale
     } else {
@@ -904,6 +1313,11 @@ unsafe fn ensure_view_interactions(vc: &AnyObject, locked: bool) {
     if HOVER_INSTALLED_VIEW.load(Ordering::Relaxed) != view_addr {
         if let Some(hover_cls) = AnyClass::get(c"UIHoverGestureRecognizer") {
             unsafe {
+                let gr_proto = objc2::ffi::objc_getProtocol(c"UIGestureRecognizerDelegate".as_ptr());
+                if !gr_proto.is_null() {
+                    let cls_ptr = (HoverWatch::class() as *const AnyClass).cast_mut().cast();
+                    let _ = objc2::ffi::class_addProtocol(cls_ptr, gr_proto);
+                }
                 let watch: Retained<HoverWatch> = msg_send![HoverWatch::class(), new];
                 let alloc: Allocated<AnyObject> = msg_send![hover_cls, alloc];
                 let rec: Option<Obj> = msg_send![
@@ -927,9 +1341,10 @@ unsafe fn ensure_view_interactions(vc: &AnyObject, locked: bool) {
                             }
                         }
                     }
-                    // WinitUIView already implements UIGestureRecognizerDelegate returning YES
-                    // for simultaneous recognition.
-                    let _: () = msg_send![&*rec, setDelegate: &*view];
+                    let _: () = msg_send![&*rec, setCancelsTouchesInView: Bool::NO];
+                    let _: () = msg_send![&*rec, setDelaysTouchesBegan: Bool::NO];
+                    let _: () = msg_send![&*rec, setDelaysTouchesEnded: Bool::NO];
+                    let _: () = msg_send![&*rec, setDelegate: &*watch];
                     let _: () = msg_send![&*view, addGestureRecognizer: &*rec];
                     // Keep both target (unretained by UIGestureRecognizer) and recognizer alive.
                     HOVER_RECOGNIZER.store(Retained::into_raw(rec) as usize, Ordering::Relaxed);
@@ -1183,6 +1598,32 @@ static POINTER_LOCK_INSTALLED_CLS: AtomicUsize = AtomicUsize::new(0);
 static PREFERS_CB_CALLS: AtomicU32 = AtomicU32::new(0);
 static PROBING_PREFERS: AtomicBool = AtomicBool::new(false);
 
+static OS_VERSION_CACHE: OnceLock<String> = OnceLock::new();
+
+unsafe fn ios_system_version() -> &'static str {
+    OS_VERSION_CACHE
+        .get_or_init(|| {
+            let dev: Option<Obj> = unsafe { msg_send![class!(UIDevice), currentDevice] };
+            dev.and_then(|d| string(&d, |o| get!(o, systemVersion)))
+                .unwrap_or_else(|| "?".to_owned())
+        })
+        .as_str()
+}
+
+unsafe fn obj_class_name(obj: &AnyObject) -> String {
+    let cls = unsafe { objc2::ffi::object_getClass((obj as *const AnyObject).cast_mut().cast()) };
+    if cls.is_null() {
+        return "nil".to_owned();
+    }
+    let cname = unsafe { objc2::ffi::class_getName(cls) };
+    if cname.is_null() {
+        return "?".to_owned();
+    }
+    unsafe { CStr::from_ptr(cname) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 struct PointerLockState {
     want_lock: bool,
     applied: Option<bool>,
@@ -1190,6 +1631,8 @@ struct PointerLockState {
     auto_retries: u8,
     last_probe_at: Option<Instant>,
     sys_locked: bool,
+    app_has_delegate: bool,
+    scene_key_matches: bool,
     win_scene_kind: u8,
     win_is_key: bool,
     has_pls: bool,
@@ -1204,6 +1647,7 @@ struct PointerLockState {
     activation_state: isize,
     vc_prefers: bool,
     vc_class: String,
+    windows_summary: String,
 }
 
 impl PointerLockState {
@@ -1215,6 +1659,8 @@ impl PointerLockState {
             auto_retries: 0,
             last_probe_at: None,
             sys_locked: false,
+            app_has_delegate: false,
+            scene_key_matches: false,
             win_scene_kind: 0,
             win_is_key: false,
             has_pls: false,
@@ -1229,6 +1675,7 @@ impl PointerLockState {
             activation_state: -99,
             vc_prefers: false,
             vc_class: String::new(),
+            windows_summary: String::new(),
         }
     }
 }
@@ -1261,24 +1708,27 @@ pub fn pointer_lock_debug_status() -> String {
     } else {
         st.vc_class.as_str()
     };
+    let os = unsafe { ios_system_version() };
     format!(
-        "Pointer: lock={} want={} pref={} cb={} sd={}/{}/{} ws={} key={} act={} pls={} full={} sa={}/{} rr={} fr={} at={} m={} n={} nw={} st={} vc={}",
+        "Pointer: lock={} want={} pref={} cb={} os={} ad={} sd={}/{}/{} ws={} key={} sk={} act={} pls={} full={} sa={}/{} rr={} at={} m={} n={} nw={} st={} vc={}",
         if st.sys_locked { "ON" } else { "OFF" },
         if st.want_lock { "ON" } else { "OFF" },
         u8::from(st.vc_prefers),
         PREFERS_CB_CALLS.load(Ordering::Relaxed),
+        os,
+        u8::from(st.app_has_delegate),
         SCENE_CONNECTED_COUNT.load(Ordering::Relaxed),
         SCENE_INIT_WS_COUNT.load(Ordering::Relaxed),
         SCENE_ADOPTED_COUNT.load(Ordering::Relaxed),
         st.win_scene_kind,
         u8::from(st.win_is_key),
+        u8::from(st.scene_key_matches),
         st.activation_state,
         u8::from(st.has_pls),
         u8::from(st.scene_fullscreen),
         st.sa_top,
         st.sa_bottom,
         st.resizing_restrictions,
-        u8::from(st.view_first_responder),
         u8::from(st.assistive_touch),
         st.mouse_count,
         POINTER_LOCK_NOTIFY_COUNT.load(Ordering::Relaxed),
@@ -1286,6 +1736,16 @@ pub fn pointer_lock_debug_status() -> String {
         POINTER_STYLE_CALLS.load(Ordering::Relaxed),
         vc,
     )
+}
+
+/// Second F3 debug line enumerating all windows attached to the foreground `UIWindowScene`.
+pub fn pointer_lock_windows_status() -> String {
+    let st = POINTER_LOCK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if st.windows_summary.is_empty() {
+        "SceneWin: none".to_owned()
+    } else {
+        format!("SceneWin: {}", st.windows_summary)
+    }
 }
 
 unsafe extern "C" fn prefers_pointer_locked(_this: *mut AnyObject, _cmd: Sel) -> Bool {
@@ -1302,10 +1762,12 @@ unsafe extern "C" fn child_vc_for_pointer_lock(
     std::ptr::null_mut()
 }
 
-/// Installs `prefersPointerLocked` and `childViewControllerForPointerLock` on `vc`'s Obj-C class
-/// once. Shared by `swizzled_set_root_vc` (before UIKit attaches the root VC to the window) and
-/// `set_pointer_locked` (fallback).
+/// Installs `prefersPointerLocked` and `childViewControllerForPointerLock` on non-native VC
+/// classes once (fallback when `HorizonRootViewController` is not the root VC).
 unsafe fn ensure_pointer_lock_methods(vc: &AnyObject) -> bool {
+    if unsafe { is_horizon_root_vc_ptr(vc) } {
+        return false;
+    }
     let cls = unsafe { objc2::ffi::object_getClass((vc as *const AnyObject).cast_mut().cast()) };
     if cls.is_null() {
         return false;
@@ -1347,28 +1809,33 @@ unsafe fn ensure_pointer_lock_methods(vc: &AnyObject) -> bool {
 unsafe fn root_view_controller() -> Option<Obj> {
     let app: Option<Obj> = unsafe { msg_send![class!(UIApplication), sharedApplication] };
     let app = app?;
+    let horizon_vc_cls = HORIZON_ROOT_VC_CLS.get().copied();
     let winit_vc_cls = AnyClass::get(c"WinitUIViewController");
-    let mut winit_vc: Option<Obj> = None;
+    let mut primary_vc: Option<Obj> = None;
     let mut key_vc: Option<Obj> = None;
     let mut any_vc: Option<Obj> = None;
 
     fn inspect_window(
         win: &AnyObject,
+        horizon_vc_cls: Option<&AnyClass>,
         winit_vc_cls: Option<&AnyClass>,
-        winit_vc: &mut Option<Obj>,
+        primary_vc: &mut Option<Obj>,
         key_vc: &mut Option<Obj>,
         any_vc: &mut Option<Obj>,
     ) -> Option<Obj> {
         let vc: Option<Obj> = unsafe { msg_send![win, rootViewController] };
         let vc = vc?;
         let is_key: bool = unsafe { msg_send![win, isKeyWindow] };
+        let is_horizon =
+            horizon_vc_cls.is_some_and(|cls| unsafe { msg_send![&*vc, isKindOfClass: cls] });
         let is_winit =
             winit_vc_cls.is_some_and(|cls| unsafe { msg_send![&*vc, isKindOfClass: cls] });
-        if is_winit && is_key {
+        let is_ours = is_horizon || is_winit;
+        if is_ours && is_key {
             return Some(vc);
         }
-        if is_winit && winit_vc.is_none() {
-            *winit_vc = Some(vc);
+        if is_ours && primary_vc.is_none() {
+            *primary_vc = Some(vc);
         } else if is_key && key_vc.is_none() {
             *key_vc = Some(vc);
         } else if any_vc.is_none() {
@@ -1398,8 +1865,9 @@ unsafe fn root_view_controller() -> Option<Obj> {
                     let Some(win) = win else { continue };
                     if let Some(found) = inspect_window(
                         &win,
+                        horizon_vc_cls,
                         winit_vc_cls,
-                        &mut winit_vc,
+                        &mut primary_vc,
                         &mut key_vc,
                         &mut any_vc,
                     ) {
@@ -1409,7 +1877,7 @@ unsafe fn root_view_controller() -> Option<Obj> {
             }
         }
     }
-    if let Some(vc) = winit_vc {
+    if let Some(vc) = primary_vc {
         return Some(vc);
     }
     let legacy_windows: Option<Obj> = unsafe { msg_send![&*app, windows] };
@@ -1420,8 +1888,9 @@ unsafe fn root_view_controller() -> Option<Obj> {
             let Some(win) = win else { continue };
             if let Some(found) = inspect_window(
                 &win,
+                horizon_vc_cls,
                 winit_vc_cls,
-                &mut winit_vc,
+                &mut primary_vc,
                 &mut key_vc,
                 &mut any_vc,
             ) {
@@ -1429,7 +1898,7 @@ unsafe fn root_view_controller() -> Option<Obj> {
             }
         }
     }
-    if let Some(vc) = winit_vc.or(key_vc).or(any_vc) {
+    if let Some(vc) = primary_vc.or(key_vc).or(any_vc) {
         return Some(vc);
     }
     let win: Option<Obj> = unsafe { msg_send![&*app, keyWindow] };
@@ -1439,6 +1908,8 @@ unsafe fn root_view_controller() -> Option<Obj> {
 struct SceneLockInfo {
     /// `0` = no `windowScene`, `1` = delegate-less fallback scene, `2` = delegated `UIWindowScene`.
     win_scene_kind: u8,
+    app_has_delegate: bool,
+    scene_key_matches: bool,
     win_is_key: bool,
     is_locked: bool,
     has_pls: bool,
@@ -1451,12 +1922,15 @@ struct SceneLockInfo {
     mouse_count: usize,
     scene_window_count: usize,
     activation_state: isize,
+    windows_summary: String,
 }
 
 /// Inspects live `UIWindowScene` / `UIPointerLockState` diagnostics, repairing a detached or
 /// delegate-less fallback `UIWindow.windowScene` or non-key active window if needed so
 /// `setNeedsUpdateOfPrefersPointerLocked` reaches the foreground `UIWindowScene`.
 unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
+    let app: Option<Obj> = unsafe { msg_send![class!(UIApplication), sharedApplication] };
+    let app_has_delegate = app.as_ref().is_some_and(|a| get!(a, delegate).is_some());
     let assistive_touch = unsafe { UIAccessibilityIsAssistiveTouchRunning() }.as_bool();
     let mice: Option<Obj> = unsafe { msg_send![class!(GCMouse), mice] };
     let mouse_count: usize = mice.map_or(0, |list| unsafe { msg_send![&*list, count] });
@@ -1493,8 +1967,7 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
             )
         };
         let target_scene = tracked_scene.or_else(|| {
-            let app: Option<Obj> = unsafe { msg_send![class!(UIApplication), sharedApplication] };
-            let app = app?;
+            let app = app.as_ref()?;
             let scenes = get!(app, connectedScenes)?;
             let all = get!(scenes, allObjects)?;
             let count: usize = unsafe { msg_send![&*all, count] };
@@ -1536,6 +2009,8 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
     let Some(scene) = scene else {
         return SceneLockInfo {
             win_scene_kind,
+            app_has_delegate,
+            scene_key_matches: false,
             win_is_key,
             is_locked: false,
             has_pls: false,
@@ -1548,6 +2023,7 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
             mouse_count,
             scene_window_count: 0,
             activation_state: -99,
+            windows_summary: String::new(),
         };
     };
 
@@ -1559,8 +2035,40 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
         win_is_key = unsafe { msg_send![&**w, isKeyWindow] };
     }
 
-    let scene_window_count: usize =
-        get!(scene, windows).map_or(0, |wins| unsafe { msg_send![&*wins, count] });
+    let scene_key_matches = {
+        let kw_sel = sel!(keyWindow);
+        let has_kw: bool = unsafe { msg_send![&*scene, respondsToSelector: kw_sel] };
+        if has_kw
+            && let (Some(skw), Some(w)) = (get!(scene, keyWindow), win.as_ref())
+        {
+            std::ptr::eq(&*skw as *const AnyObject, &**w as *const AnyObject)
+        } else {
+            false
+        }
+    };
+
+    let (scene_window_count, windows_summary) = if let Some(wins) = get!(scene, windows) {
+        let wcount: usize = unsafe { msg_send![&*wins, count] };
+        let mut parts = Vec::with_capacity(wcount.min(4));
+        for idx in 0..wcount.min(4) {
+            let w: Option<Obj> = unsafe { msg_send![&*wins, objectAtIndex: idx] };
+            let Some(w) = w else { continue };
+            let wcls = unsafe { obj_class_name(&w) };
+            let is_k: bool = unsafe { msg_send![&*w, isKeyWindow] };
+            let is_h: bool = unsafe { msg_send![&*w, isHidden] };
+            let rvc_name = get!(w, rootViewController)
+                .map(|r| unsafe { obj_class_name(&r) })
+                .unwrap_or_else(|| "nil".to_owned());
+            parts.push(format!(
+                "{wcls}({}{},vc={rvc_name})",
+                if is_k { "K" } else { "-" },
+                if is_h { "H" } else { "V" },
+            ));
+        }
+        (wcount, parts.join(" | "))
+    } else {
+        (0, String::new())
+    };
     let scene_fullscreen = if let (Some(space), Some(screen)) =
         (get!(scene, coordinateSpace), get!(scene, screen))
     {
@@ -1594,6 +2102,8 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
     if !responds {
         return SceneLockInfo {
             win_scene_kind,
+            app_has_delegate,
+            scene_key_matches,
             win_is_key,
             is_locked: false,
             has_pls: false,
@@ -1606,6 +2116,7 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
             mouse_count,
             scene_window_count,
             activation_state: act,
+            windows_summary,
         };
     }
     let state: Option<Obj> = get!(scene, pointerLockState);
@@ -1613,6 +2124,8 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
     let is_locked = state.is_some_and(|st| unsafe { msg_send![&*st, isLocked] });
     SceneLockInfo {
         win_scene_kind,
+        app_has_delegate,
+        scene_key_matches,
         win_is_key,
         is_locked,
         has_pls,
@@ -1625,6 +2138,7 @@ unsafe fn read_scene_lock_state(vc: &AnyObject) -> SceneLockInfo {
         mouse_count,
         scene_window_count,
         activation_state: act,
+        windows_summary,
     }
 }
 
@@ -1660,14 +2174,9 @@ pub fn set_pointer_locked(locked: bool) {
         };
         ensure_view_interactions(&vc, locked);
         let installed_now = ensure_pointer_lock_methods(&vc);
-        if st.vc_class.is_empty() {
-            let cls = objc2::ffi::object_getClass((&*vc as *const AnyObject).cast_mut().cast());
-            if !cls.is_null() {
-                let cname = objc2::ffi::class_getName(cls);
-                if !cname.is_null() {
-                    st.vc_class = CStr::from_ptr(cname).to_string_lossy().into_owned();
-                }
-            }
+        let cur_vc_name = obj_class_name(&vc);
+        if st.vc_class != cur_vc_name {
+            st.vc_class = cur_vc_name;
         }
 
         let need_probe = installed_now
@@ -1680,6 +2189,8 @@ pub fn set_pointer_locked(locked: bool) {
             let info = read_scene_lock_state(&vc);
             let was_sys_locked = st.sys_locked;
             st.win_scene_kind = info.win_scene_kind;
+            st.app_has_delegate = info.app_has_delegate;
+            st.scene_key_matches = info.scene_key_matches;
             st.win_is_key = info.win_is_key;
             st.sys_locked = info.is_locked;
             st.has_pls = info.has_pls;
@@ -1692,6 +2203,7 @@ pub fn set_pointer_locked(locked: bool) {
             st.mouse_count = info.mouse_count;
             st.scene_window_count = info.scene_window_count;
             st.activation_state = info.activation_state;
+            st.windows_summary = info.windows_summary;
             st.last_probe_at = Some(now);
             SYS_POINTER_LOCKED.store(info.is_locked, Ordering::Relaxed);
             if was_sys_locked != info.is_locked {
