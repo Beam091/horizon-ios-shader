@@ -24,6 +24,7 @@ pub(super) struct PackImage {
 }
 
 impl PackImage {
+    #[allow(dead_code)]
     pub(super) fn reset_history(&mut self) {
         self.view = None;
         self.copy = None;
@@ -327,6 +328,7 @@ impl StandIn {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn reset_stand_ins(device: &wgpu::Device, images: &mut Vec<StandIn>) {
     let wanted = images.iter().map(|i| (i.format, i.dimension)).collect();
     *images = stand_ins(device, wanted);
@@ -408,6 +410,7 @@ pub(super) struct Buffers {
 }
 
 impl Buffers {
+    #[allow(dead_code)]
     pub(super) fn reset_history(&mut self) {
         self.group = None;
         self.buffers.clear();
@@ -523,6 +526,7 @@ impl Buffers {
 
     /// A complete indirect argument range in the currently allocated buffer. Re-resolve
     /// after resize/reset rather than retaining a handle to an earlier allocation.
+    #[allow(dead_code)]
     pub(super) fn indirect_source(&self, binding: u32, offset: u64) -> Option<&wgpu::Buffer> {
         let index = self.objects.keys().position(|&b| b == binding)?;
         let buffer = self.buffers.get(index)?;

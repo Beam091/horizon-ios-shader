@@ -263,6 +263,10 @@ impl EntityOutline {
     }
 
     /// `LevelRenderer.executeOutline`, the post chain and `blitEntityOutline` onto `frame`.
+    pub(super) fn is_active(&self) -> bool {
+        self.targets.is_some() && (self.quads > 0 || self.posed.1 > 0)
+    }
+
     pub(super) fn draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,

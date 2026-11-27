@@ -11,6 +11,9 @@ use horizon_client::{
 impl Game<'_> {
     /// Whether a text box has focus right now (the fields `ime_commit` can fill).
     pub(super) fn text_field_focused(&mut self) -> bool {
+        if self.account_editing_offline() {
+            return true;
+        }
         if self.dialog_open() {
             return self.dialog_has_text_field();
         }
@@ -47,6 +50,28 @@ impl Game<'_> {
     pub(super) fn dismiss_ime(&mut self) {
         self.ime_dismissed = true;
         self.sync_ime();
+    }
+
+    /// Routes an Enter/Return from IME or soft keyboard to the active field (inserting newlines
+    /// in Signs and Books without folding the keyboard, submitting Chat or Offline Account, and
+    /// folding the keyboard for single-line search/rename fields).
+    pub(super) fn handle_ime_enter(&mut self) {
+        if self.account_editing_offline() {
+            let _ = self.account_key(winit::keyboard::KeyCode::Enter, None);
+            return;
+        }
+        if self.sign_edit.is_some() {
+            self.sign_input(Some(winit::keyboard::KeyCode::Enter), None);
+            return;
+        }
+        if matches!(self.book, Some(BookScreen::Edit { .. })) {
+            self.book_input(Some(winit::keyboard::KeyCode::Enter), None);
+            return;
+        }
+        if self.screen == Screen::Chat && self.title.is_none() {
+            self.chat_key_code(winit::keyboard::KeyCode::Enter, None);
+        }
+        self.dismiss_ime();
     }
 
     /// Allow the input method only while a text box has focus and has not been dismissed.
@@ -115,53 +140,67 @@ impl Game<'_> {
         preedit::set_preedit(None);
         let has_enter = text.contains('\n') || text.contains('\r');
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        if self.account_editing_offline() {
+            if !text.is_empty() {
+                self.account_type_text(&text);
+            }
+            if has_enter {
+                self.handle_ime_enter();
+            }
+            return;
+        }
         // ScreenEvent.CharacterTyped.Pre: the input method's committed text
         // reaches a text box by characters, as a key's own text does, so the
         // open screen hears of each of them first and a cancelled one never
         // reaches the box.
         let Some(text) = self.screen_text_typed(&text) else {
             if has_enter {
-                self.dismiss_ime();
+                self.handle_ime_enter();
             }
             return;
         };
-        if text.is_empty() || !self.text_field_focused() {
+        if !self.text_field_focused() {
             if has_enter {
-                if self.screen == Screen::Chat && self.title.is_none() {
-                    self.chat_key_code(winit::keyboard::KeyCode::Enter, None);
-                }
                 self.dismiss_ime();
             }
             return;
         }
-        if self.dialog_type(&text) {
-            return;
-        }
-        if self.title.is_some() {
-            self.title_edit(Some(&text), false);
-        } else if self.book.is_some() {
-            self.book_input(None, Some(&text));
-        } else if self.sign_edit.is_some() {
-            self.sign_input(None, Some(&text));
-        } else {
-            match self.screen {
-                Screen::Chat => self.chat_type(&text),
-                Screen::CommandBlock => self.command_block_type(&text),
-                Screen::Social => self.social_type(&text),
-                Screen::DebugOptions => self.debug_options_type(&text),
-                Screen::Options => self.ui.options.type_text(&self.gui.atlas, &text),
-                Screen::WorldOptions => self.world_options_text(Some(&text)),
-                Screen::Creative => self.creative_search_edit(Some(&text)),
-                Screen::BlockEditor => self.block_editor_type(&text),
-                Screen::Inventory if self.mod_browser_typing() => {
-                    self.mod_browser_text(Some(&text), false)
+        if !text.is_empty() {
+            if self.dialog_type(&text) {
+                if has_enter {
+                    self.handle_ime_enter();
                 }
-                Screen::Inventory if self.recipe_search_focused() => {
-                    self.recipe_text(Some(&text), false)
-                }
-                Screen::Inventory => self.station_text(Some(&text), false),
-                _ => {}
+                return;
             }
+            if self.title.is_some() {
+                self.title_edit(Some(&text), false);
+            } else if self.book.is_some() {
+                self.book_input(None, Some(&text));
+            } else if self.sign_edit.is_some() {
+                self.sign_input(None, Some(&text));
+            } else {
+                match self.screen {
+                    Screen::Chat => self.chat_type(&text),
+                    Screen::CommandBlock => self.command_block_type(&text),
+                    Screen::Social => self.social_type(&text),
+                    Screen::DebugOptions => self.debug_options_type(&text),
+                    Screen::Options => self.ui.options.type_text(&self.gui.atlas, &text),
+                    Screen::WorldOptions => self.world_options_text(Some(&text)),
+                    Screen::Creative => self.creative_search_edit(Some(&text)),
+                    Screen::BlockEditor => self.block_editor_type(&text),
+                    Screen::Inventory if self.mod_browser_typing() => {
+                        self.mod_browser_text(Some(&text), false)
+                    }
+                    Screen::Inventory if self.recipe_search_focused() => {
+                        self.recipe_text(Some(&text), false)
+                    }
+                    Screen::Inventory => self.station_text(Some(&text), false),
+                    _ => {}
+                }
+            }
+        }
+        if has_enter {
+            self.handle_ime_enter();
         }
     }
 
@@ -176,6 +215,10 @@ impl Game<'_> {
             self.clipboard.get()
         };
         if raw.is_empty() {
+            return;
+        }
+        if self.account_editing_offline() {
+            self.account_paste(&raw);
             return;
         }
         // Normalize line endings into spaces (preserving single spaces) and strip control chars

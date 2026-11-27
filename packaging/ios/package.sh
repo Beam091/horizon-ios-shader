@@ -16,6 +16,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 binary=$1
 version=$2
+[[ "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || { echo "Invalid version '$version' (expected X.Y or X.Y.Z)" >&2; exit 1; }
 out=$(mkdir -p "$3" && cd "$3" && pwd)
 if command -v lipo >/dev/null; then
   [[ "$(lipo -archs "$binary")" == "arm64" ]] || { echo "$binary is not an arm64 binary" >&2; exit 1; }
@@ -26,6 +27,7 @@ else
 fi
 
 stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
 app=$stage/Payload/Horizon.app
 mkdir -p "$app"
 cp "$binary" "$app/horizon-client"
@@ -46,7 +48,7 @@ if command -v xcrun >/dev/null && command -v plutil >/dev/null; then
   sdk_build=$(xcrun --sdk iphoneos --show-sdk-build-version 2>/dev/null || true)
   macos_build=$(sw_vers -buildVersion 2>/dev/null || true)
   xcode_ver_line=$(xcodebuild -version 2>/dev/null || true)
-  xcode_ver=$(printf '%s\n' "$xcode_ver_line" | sed -n 's/^Xcode \([0-9]*\)\.\([0-9]*\).*/\1\2/p')
+  xcode_raw=$(printf '%s\n' "$xcode_ver_line" | sed -n 's/^Xcode \([0-9][0-9.]*\).*/\1/p')
   xcode_build=$(printf '%s\n' "$xcode_ver_line" | sed -n 's/^Build version \(.*\)/\1/p')
   plutil -replace DTPlatformName -string iphoneos "$app/Info.plist"
   plutil -replace DTCompiler -string com.apple.compilers.llvm.clang.1_0 "$app/Info.plist"
@@ -58,9 +60,17 @@ if command -v xcrun >/dev/null && command -v plutil >/dev/null; then
     plutil -replace DTPlatformBuild -string "$sdk_build" "$app/Info.plist"
     plutil -replace DTSDKBuild -string "$sdk_build" "$app/Info.plist"
   fi
-  if [[ -n "$xcode_ver" ]]; then
-    # Format e.g. 27.2 -> 2720 (4-digit DTXcode convention).
-    dt_xcode=$(printf '%04d' "$((10#$xcode_ver * 10))")
+  dt_xcode=""
+  xcode_plist="$(xcode-select -p 2>/dev/null || true)/../Info.plist"
+  if [[ -f "$xcode_plist" ]]; then
+    dt_xcode=$(plutil -extract DTXcode raw -o - "$xcode_plist" 2>/dev/null || true)
+  fi
+  if [[ -z "$dt_xcode" && -n "$xcode_raw" ]]; then
+    IFS='.' read -r xm xn xp <<< "$xcode_raw"
+    xm=${xm:-0}; xn=${xn:-0}; xp=${xp:-0}
+    dt_xcode=$(printf '%02d%d%d' "$((10#$xm))" "$((10#$xn % 10))" "$((10#$xp % 10))")
+  fi
+  if [[ -n "$dt_xcode" ]]; then
     plutil -replace DTXcode -string "$dt_xcode" "$app/Info.plist"
   fi
   if [[ -n "$xcode_build" ]]; then
@@ -79,10 +89,18 @@ resize() { # SIZE OUT
 }
 resize 120 "$app/AppIcon60x60@2x.png"
 resize 180 "$app/AppIcon60x60@3x.png"
+resize 152 "$app/AppIcon76x76@2x.png"
+resize 167 "$app/AppIcon83.5x83.5@2x.png"
 
 if [[ -n "${IOS_SIGN_IDENTITY:-}" ]]; then
+  if [[ -z "${IOS_PROVISIONING_PROFILE:-}" || ! -f "$IOS_PROVISIONING_PROFILE" ]]; then
+    echo "IOS_PROVISIONING_PROFILE must point to a valid .mobileprovision file when IOS_SIGN_IDENTITY is set" >&2
+    exit 1
+  fi
   cp "$IOS_PROVISIONING_PROFILE" "$app/embedded.mobileprovision"
-  codesign --force --sign "$IOS_SIGN_IDENTITY" --timestamp=none "$app"
+  security cms -D -i "$IOS_PROVISIONING_PROFILE" \
+    | plutil -extract Entitlements xml1 -o "$stage/entitlements.plist" -
+  codesign --force --sign "$IOS_SIGN_IDENTITY" --entitlements "$stage/entitlements.plist" --timestamp=none "$app"
 fi
 
 rm -f "$out/Horizon.ipa"
@@ -91,5 +109,4 @@ if command -v ditto >/dev/null; then
 else
   (cd "$stage" && zip -qr -X "$out/Horizon.ipa" Payload)
 fi
-rm -rf "$stage"
 echo "$out/Horizon.ipa"

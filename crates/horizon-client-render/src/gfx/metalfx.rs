@@ -73,14 +73,9 @@ enum FgState {
     ReadyInterp,
 }
 
-/// Per-frame camera and timing inputs for iOS/Metal Frame Generation.
+/// Per-frame sizing inputs for iOS/Metal Frame Generation.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 pub struct FrameGenParams {
-    pub delta_time: f32,
-    pub near: f32,
-    pub far: f32,
-    pub fov_degrees: f32,
     pub render_size: [u32; 2],
 }
 
@@ -534,16 +529,24 @@ impl MetalFx {
         }
     }
 
-    /// Odd display tick: `interp_cache` holds Frame `N-0.5`, ready to present immediately while
-    /// skipping all 3D world and Shader Pack rendering.
-    pub fn fg_should_present_odd_tick(&self) -> bool {
-        self.fg_state == FgState::ReadyInterp && self.fg_targets.is_some()
+    /// Odd display tick: `interp_cache` holds Frame `N-0.5` for `window`, ready to present
+    /// immediately while skipping all 3D world and Shader Pack rendering.
+    pub fn fg_should_present_odd_tick(&self, window: [u32; 2]) -> bool {
+        self.fg_state == FgState::ReadyInterp
+            && self
+                .fg_targets
+                .as_ref()
+                .is_some_and(|fg| fg.window_size == window)
     }
 
-    /// Even display tick (steady state): `real_cache[prev_idx]` holds Frame `N-1`, ready to
-    /// present IMMEDIATELY (<0.5ms) BEFORE rendering Frame `N` + `interp(N-0.5)` offscreen.
-    pub fn fg_has_pipelined_real(&self) -> bool {
-        self.fg_state == FgState::ReadyReal && self.fg_targets.is_some()
+    /// Even display tick (steady state): `real_cache[prev_idx]` holds Frame `N-1` for `window`,
+    /// ready to present IMMEDIATELY (<0.5ms) BEFORE rendering Frame `N` + `interp(N-0.5)` offscreen.
+    pub fn fg_has_pipelined_real(&self, window: [u32; 2]) -> bool {
+        self.fg_state == FgState::ReadyReal
+            && self
+                .fg_targets
+                .as_ref()
+                .is_some_and(|fg| fg.window_size == window)
     }
 
     /// Whether Frame Generation targets exist for the current window size (safe fallback view for
@@ -552,18 +555,23 @@ impl MetalFx {
         self.fg_targets.as_ref().map(|fg| fg.interp_cache_view.clone())
     }
 
-    /// Returns `(real_display_or_cache_view, interp_cache_view)` for offscreen post-world overlays
-    /// such as `entity_outline` in Step B.
-    pub fn offscreen_world_targets(&self) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
-        let fg = self.fg_targets.as_ref()?;
-        let real = if fg.has_real_display
+    /// Returns `(real_display_view, interp_cache_view)` for offscreen post-world overlays such as
+    /// `entity_outline` in Step B, copying `real_cache[prev_idx]` into `real_display` first if
+    /// needed so history texture `real_cache[prev_idx]` is never polluted.
+    pub fn prepare_offscreen_display_targets(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
+        if let Some(fg) = self.fg_targets.as_ref()
+            && fg.has_real_display
             && let Some((_, view, _)) = &fg.real_display
         {
-            view.clone()
-        } else {
-            fg.real_cache_views[fg.prev_idx].clone()
-        };
-        Some((real, fg.interp_cache_view.clone()))
+            return Some((view.clone(), fg.interp_cache_view.clone()));
+        }
+        let (interp_view, real_display_view) =
+            self.prepare_vanilla_hand_targets(device, encoder)?;
+        Some((real_display_view, interp_view))
     }
 
     /// Lazily allocates `real_display`, copies `real_cache[prev_idx]` into it, and returns
@@ -652,6 +660,7 @@ impl MetalFx {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
+        window: [u32; 2],
         after: impl FnOnce(&mut wgpu::RenderPass<'_>),
     ) -> bool {
         if self.fg_state != FgState::ReadyInterp {
@@ -661,6 +670,10 @@ impl MetalFx {
             self.fg_state = FgState::Empty;
             return false;
         };
+        if fg.window_size != window {
+            self.fg_state = FgState::Empty;
+            return false;
+        }
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MetalFX FG odd present"),
@@ -692,6 +705,7 @@ impl MetalFx {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
+        window: [u32; 2],
         after: impl FnOnce(&mut wgpu::RenderPass<'_>),
     ) -> bool {
         if self.fg_state != FgState::ReadyReal {
@@ -701,6 +715,10 @@ impl MetalFx {
             self.fg_state = FgState::Empty;
             return false;
         };
+        if fg.window_size != window {
+            self.fg_state = FgState::Empty;
+            return false;
+        }
         let group = if fg.has_real_display
             && let Some((_, _, bg)) = &fg.real_display
         {
@@ -920,7 +938,9 @@ impl MetalFx {
 
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         let scaler = {
-            let linear = color_format == wgpu::TextureFormat::Rgba16Float;
+            let is_hdr = color_format == wgpu::TextureFormat::Rgba16Float;
+            // MTLFXSpatialScalerColorProcessingMode: 0 = Perceptual (SDR), 2 = HDR (Rgba16Float).
+            let spatial_mode: usize = if is_hdr { 2 } else { 0 };
             let built = unsafe {
                 device
                     .as_hal::<wgpu::hal::api::Metal>()
@@ -942,7 +962,7 @@ impl MetalFx {
                                     m_tex.raw_handle(),
                                     r_tex.as_ref().map(|t| t.raw_handle()),
                                     o_tex.raw_handle(),
-                                    linear,
+                                    is_hdr,
                                 )
                                 .map(NativeScaler::Temporal)
                             }
@@ -953,7 +973,7 @@ impl MetalFx {
                                     output_size,
                                     c_tex.raw_handle(),
                                     o_tex.raw_handle(),
-                                    linear,
+                                    spatial_mode,
                                 )
                                 .map(NativeScaler::Spatial)
                             }
@@ -1209,6 +1229,8 @@ impl MetalFx {
                             let r_tex = targets.reactive.as_hal::<wgpu::hal::api::Metal>();
                             // `fs_motion` always outputs reverse-Z depth (1 near, 0 far), so
                             // `depth_reversed` is always `true` for both Vanilla and Shader Packs.
+                            // Apple's `MTLFXTemporalScaler.jitterOffset` uses the sampling-offset
+                            // convention (opposite sign to our clip-space geometry shift).
                             ts.encode(
                                 cmd_buf,
                                 input_size,
@@ -1217,7 +1239,7 @@ impl MetalFx {
                                 m_tex.raw_handle(),
                                 r_tex.as_ref().map(|t| t.raw_handle()),
                                 o_tex.raw_handle(),
-                                jitter_px,
+                                [-jitter_px[0], -jitter_px[1]],
                                 true,
                                 reset,
                             );

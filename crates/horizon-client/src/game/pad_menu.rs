@@ -1983,7 +1983,12 @@ impl Game<'_> {
                 let (mx, my) = self.cursor;
                 mx >= ox + 78.0 && mx < ox + 172.0 && my >= oy + 2.0 && my < oy + 20.0
             });
-        let on_field = on_creative_search || field_at(&self.pad_targets(), self.cursor);
+        let on_sign_or_book = self.sign_edit.is_some()
+            || matches!(self.book, Some(super::books::BookScreen::Edit { .. }));
+        let on_field = on_creative_search
+            || on_sign_or_book
+            || self.account_editing_offline()
+            || field_at(&self.pad_targets(), self.cursor);
         if on_field {
             self.ime_dismissed = false;
             if self.pad.menu.osk.is_none() {
@@ -1993,7 +1998,6 @@ impl Game<'_> {
         } else if was_ime_allowed {
             self.dismiss_ime();
         } else {
-            self.ime_dismissed = false;
             self.sync_ime();
         }
     }

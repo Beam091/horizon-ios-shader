@@ -494,6 +494,25 @@ impl Game<'_> {
             s.search.insert_text(&allowed);
         }
     }
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    pub(super) fn debug_options_edit_key(&mut self, key: KeyCode, ctrl: bool, shift: bool) {
+        if let Some(s) = &mut self.debug_options
+            && s.search.focused
+        {
+            s.search.key(key, ctrl, shift);
+        }
+    }
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    pub(super) fn debug_options_shortcut(
+        &mut self,
+        shortcut: horizon_client::clipboard::EditShortcut,
+    ) {
+        if let Some(s) = &mut self.debug_options
+            && s.search.focused
+        {
+            s.search.shortcut(shortcut, &mut self.clipboard);
+        }
+    }
 }
 
 /// `Minecraft.canInterruptScreen` (Gui): whether F3+F6 opens the debug

@@ -40,6 +40,17 @@ pub fn load_or_create(dir: &Path) -> String {
     name
 }
 
+/// Validates and writes a chosen offline player name to `horizon-player.txt` in `dir`.
+pub fn save(dir: &Path, name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if !is_valid(trimmed) {
+        return Err("Name must be 1-16 letters, digits, or _".to_owned());
+    }
+    let path = dir.join(FILE);
+    fs::write(&path, format!("{KEY}{trimmed}\n"))
+        .map_err(|e| format!("Could not save {}: {e}", path.display()))
+}
+
 fn parse(text: &str) -> Option<String> {
     text.lines()
         .find_map(|line| line.trim_end_matches('\r').strip_prefix(KEY))

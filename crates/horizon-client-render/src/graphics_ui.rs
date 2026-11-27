@@ -385,22 +385,22 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         h(
                             H::MetalFxSpatial,
                             Saves,
-                            "Single-frame MetalFX up to native resolution (turns off Temporal).",
+                            "Single-frame MetalFX upscaling at chosen factor (turns off Temporal).",
                         ),
                         h(
                             H::MetalFxTemporal,
                             Saves,
-                            "Multi-frame MetalFX 2x upscaling with anti-aliasing (turns off Spatial).",
+                            "Multi-frame MetalFX temporal upscaling with anti-aliasing (turns off Spatial).",
                         ),
                         h(
                             H::MetalFxFactor,
                             High,
-                            "Upscale multiplier: 2x (all), 3x (360p-480p), 4x Spatial (360p).",
+                            "Upscale multiplier: 2x (all tiers) or 3x (360p-480p).",
                         ),
                         h(
                             H::MetalFxPreset,
                             High,
-                            "Render tier for MetalFX (Spatial scales to native; HUD stays sharp).",
+                            "Base render resolution tier for MetalFX (HUD always stays native).",
                         ),
                         h(
                             H::ScreenshotQuality,
@@ -833,7 +833,11 @@ impl H {
                 Some(i as f32 / (LOD_STEPS.len() - 1) as f32)
             }
             H::Workers => Some(g.workers as f32 / max_workers() as f32),
-            H::ResolutionScale => Some((g.resolution_scale.clamp(25, 100) as f32 - 25.0) / 75.0),
+            H::ResolutionScale => Some(if cfg!(target_os = "ios") {
+                (g.resolution_scale.clamp(25, 100) as f32 - 25.0) / 75.0
+            } else {
+                (g.resolution_scale.clamp(50, 200) as f32 - 50.0) / 150.0
+            }),
             H::OverlayScale => Some((g.overlay_scale.clamp(50, 200) as f32 - 50.0) / 150.0),
             // Auto, then 10..480 by 10.
             H::HdrPaperWhite => Some(g.hdr_paper_white as f32 / 480.0),
@@ -1043,7 +1047,13 @@ impl H {
                 g.lod_distance = LOD_STEPS[(v * (LOD_STEPS.len() - 1) as f32).round() as usize]
             }
             H::Workers => g.workers = (v * max_workers() as f32).round() as u32,
-            H::ResolutionScale => g.resolution_scale = (25.0 + (v * 15.0).round() * 5.0) as u32,
+            H::ResolutionScale => {
+                g.resolution_scale = if cfg!(target_os = "ios") {
+                    (25.0 + (v * 15.0).round() * 5.0) as u32
+                } else {
+                    50 + (v * 15.0).round() as u32 * 10
+                };
+            }
             H::OverlayScale => g.overlay_scale = 50 + (v * 15.0).round() as u32 * 10,
             H::HdrPaperWhite => g.hdr_paper_white = (v * 48.0).round() as u32 * 10,
             H::HdrPeak => {
@@ -1194,7 +1204,12 @@ impl H {
             H::Hdr => g.hdr = !g.hdr,
             H::HdrLighting => g.hdr_lighting = !g.hdr_lighting,
             H::BatteryMode => g.battery = !g.battery,
-            H::ShadowCache => g.shadow_cache = !g.shadow_cache,
+            H::ShadowCache => {
+                g.shadow_cache = !g.shadow_cache;
+                if !g.shadow_cache {
+                    g.shadow_update_rate = ShadowUpdateRate::EveryFrame;
+                }
+            }
             H::GraphicsApi => g.api = step(GraphicsApi::choices(), g.api, back),
             H::TranslucentBatching => g.translucent_batching = !g.translucent_batching,
             H::HdrSmoothGradients => g.hdr_smooth_gradients = !g.hdr_smooth_gradients,

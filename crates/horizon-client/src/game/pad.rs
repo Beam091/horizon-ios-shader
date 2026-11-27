@@ -67,7 +67,15 @@ pub(super) struct Pads {
     pub(super) ios_hw_mouse_connected: bool,
     pub(super) ios_hw_was_playing: bool,
     pub(super) ios_hw_keys: Vec<KeyCode>,
+    /// Keys whose press was actually dispatched to gameplay/debug handlers (prevents stray releases).
+    pub(super) ios_hw_dispatched_keys: Vec<KeyCode>,
     pub(super) ios_hw_mouse_buttons: [bool; 3],
+    /// Suppresses in-world Left click until the physical button is released after closing a menu.
+    pub(super) ios_hw_wait_left_release: bool,
+    /// Auto-repeat state `(key, next_fire_at)` for Backspace/Delete/Arrow keys while typing on iOS.
+    pub(super) ios_hw_repeat: Option<(KeyCode, Instant)>,
+    /// Last timestamp UIKit `deleteBackward` delivered a Backspace event (dedups hardware repeat).
+    pub(super) ios_uikit_backspace_at: Option<Instant>,
     pub(super) ios_hw_scroll_accum: f32,
     pub(super) ios_hw_last_scroll_step: Option<Instant>,
     pub(super) ios_hw_last_scroll_event: Option<Instant>,

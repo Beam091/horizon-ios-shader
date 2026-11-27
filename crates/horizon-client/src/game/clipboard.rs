@@ -28,6 +28,11 @@ impl Game<'_> {
         let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.keys.contains(k));
         if cfg!(target_os = "macos") {
             self.modifiers.super_key() || held([KeyCode::SuperLeft, KeyCode::SuperRight])
+        } else if cfg!(target_os = "ios") {
+            self.modifiers.super_key()
+                || self.modifiers.control_key()
+                || held([KeyCode::SuperLeft, KeyCode::SuperRight])
+                || held([KeyCode::ControlLeft, KeyCode::ControlRight])
         } else {
             self.modifiers.control_key() || held([KeyCode::ControlLeft, KeyCode::ControlRight])
         }
@@ -39,6 +44,9 @@ impl Game<'_> {
         let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.physical_keys.contains(k));
         let edit = if cfg!(target_os = "macos") {
             held([KeyCode::SuperLeft, KeyCode::SuperRight])
+        } else if cfg!(target_os = "ios") {
+            held([KeyCode::SuperLeft, KeyCode::SuperRight])
+                || held([KeyCode::ControlLeft, KeyCode::ControlRight])
         } else {
             held([KeyCode::ControlLeft, KeyCode::ControlRight])
         };

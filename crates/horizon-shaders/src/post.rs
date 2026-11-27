@@ -616,6 +616,35 @@ impl Post {
             .chain(&self.shadow_comp)
     }
 
+    /// Bitmask of `colortexN` buffers bound as storage images (`colorimgN`) by any program or compute stage.
+    pub fn colorimg_mask(&self) -> u16 {
+        let mut mask = 0u16;
+        for p in self.every_program() {
+            let interfaces = p
+                .program
+                .iter()
+                .map(|s| &s.interface)
+                .chain(p.compute.iter().map(|(_, c)| &c.interface));
+            for iface in interfaces {
+                for img in &iface.images {
+                    for name in [Some(img.name.as_str()), img.before.as_deref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(n) = name
+                            .strip_prefix("colorimg")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .filter(|&n| n < crate::BUFFERS)
+                        {
+                            mask |= 1 << n;
+                        }
+                    }
+                }
+            }
+        }
+        mask
+    }
+
     /// The fewest bytes each storage buffer (`bufferObject.<n>`, set 4) needs for every stage
     /// that binds it: its block's size as the stage lays it out (std430). OpenGL binds a smaller buffer and leaves what lies
     /// past its end undefined; wgpu refuses to draw or dispatch with one.

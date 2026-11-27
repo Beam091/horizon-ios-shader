@@ -60,17 +60,23 @@ jobs:
           name: Horizon-ios
           path: dist/Horizon.ipa
           if-no-files-found: error
-      # Each build of the ios-build branch is published as a pre-release with the .ipa, tagged
-      # ios-r<run number> on the commit it built; GitHub adds the source archives to every release.
+      # Each push to ios-build publishes a versioned release tagged `v<VERSION>-b<N>` (starting at
+      # Build 1 for each new Cargo.toml version) with the unsigned `.ipa`.
       - name: Publish the release
-        if: github.ref == 'refs/heads/ios-build'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/ios-build'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.package.outputs.version }}
         run: |
-          tag=ios-r$GITHUB_RUN_NUMBER
-          cp dist/Horizon.ipa "dist/Horizon-ios-$VERSION-r$GITHUB_RUN_NUMBER.ipa"
-          gh release create "$tag" "dist/Horizon-ios-$VERSION-r$GITHUB_RUN_NUMBER.ipa" \
+          last_build=$(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
+              --jq "[.[].tagName | select(startswith(\"v${VERSION}-b\")) | ltrimstr(\"v${VERSION}-b\") | tonumber] | max // 0"
+          )
+          next_build=$((last_build + 1))
+          tag="v${VERSION}-b${next_build}"
+          asset="dist/Horizon-ios-${VERSION}-b${next_build}.ipa"
+          cp dist/Horizon.ipa "$asset"
+          gh release create "$tag" "$asset" \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
-            --title "Horizon for iOS $VERSION (Build r$GITHUB_RUN_NUMBER)" \
+            --title "Horizon for iOS ${VERSION} (Build ${next_build})" \
             --notes-file packaging/ios/README.md

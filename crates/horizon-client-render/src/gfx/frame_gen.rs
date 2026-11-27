@@ -124,11 +124,6 @@ impl FrameGen {
         }
     }
 
-    /// Smoothed duration between real frames in seconds, for `MTLFXFrameInterpolator.deltaTime`.
-    pub fn interval_secs(&self) -> f32 {
-        self.interval.as_secs_f32().clamp(0.001, 0.25)
-    }
-
     /// Ends frame generation's frames and present thread: before the surface is
     /// reconfigured or the renderer acquires from it itself.
     pub fn stop(&mut self) {

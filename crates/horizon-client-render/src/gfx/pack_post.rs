@@ -700,7 +700,11 @@ pub(super) fn set_shadow_resolution_cap(cap: Option<u32>) -> bool {
 }
 
 /// The wgpu format of a pack format (6.7), the nearest one wgpu can render to.
-fn texture_format(f: Format, features: wgpu::Features) -> wgpu::TextureFormat {
+fn texture_format(
+    f: Format,
+    features: wgpu::Features,
+    allow_half: bool,
+) -> wgpu::TextureFormat {
     use wgpu::TextureFormat as T;
     let pick = |r, rg, rgba| match f.channels {
         1 => r,
@@ -720,7 +724,7 @@ fn texture_format(f: Format, features: wgpu::Features) -> wgpu::TextureFormat {
         }
         (Kind::Unorm, b) if b <= 8 => pick(T::R8Unorm, T::Rg8Unorm, T::Rgba8Unorm),
         (Kind::Float, 32) => {
-            if SHADER_HALF_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) {
+            if allow_half && SHADER_HALF_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) {
                 half
             } else {
                 pick(T::R32Float, T::Rg32Float, T::Rgba32Float)
@@ -771,8 +775,9 @@ fn target_format(
     f: Format,
     features: wgpu::Features,
     adapter: &wgpu::Adapter,
+    allow_half: bool,
 ) -> wgpu::TextureFormat {
-    renderable_float(texture_format(f, features), |format| {
+    renderable_float(texture_format(f, features, allow_half), |format| {
         (adapter.get_texture_format_features(format).allowed_usages)
             .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
     })
@@ -2052,10 +2057,12 @@ impl PackPost {
         // What the pack's shaders need of its storage buffers, before its parts move out.
         let minimums = post.buffer_minimums();
         let features = device.features();
+        let colorimg_mask = post.colorimg_mask();
         let formats: [wgpu::TextureFormat; BUFFERS] = std::array::from_fn(|i| {
             let f = post.config.buffers[i].format;
+            let allow_half = colorimg_mask & (1 << i) == 0;
             snorm_format(f, features, adapter)
-                .unwrap_or_else(|| target_format(f, features, adapter))
+                .unwrap_or_else(|| target_format(f, features, adapter, allow_half))
         });
         let sky_clear = Some(&post.config.buffers[0])
             .filter(|b| b.clear)
@@ -2118,7 +2125,7 @@ impl PackPost {
         let shadow_formats: Option<[wgpu::TextureFormat; SHADOW_COLORS]> =
             post.shadow_pass.then(|| {
                 std::array::from_fn(|n| {
-                    target_format(shadow_config.colors[n].format, features, adapter)
+                    target_format(shadow_config.colors[n].format, features, adapter, true)
                 })
             });
         let shadow_space: [wgpu::TextureFormat; BUFFERS] = std::array::from_fn(|i| {
@@ -4327,12 +4334,12 @@ impl PackPost {
         frame: &super::Frame,
     ) {
         let rate_div = frame.shadow_update_rate.tick_divisor();
-        let divisor = if rate_div > 0 {
-            rate_div
-        } else if frame.shadow_cache {
-            1
-        } else {
+        let divisor = if !frame.shadow_cache {
             0
+        } else if rate_div > 0 {
+            rate_div
+        } else {
+            1
         };
         // Opt-in only (`horizon-graphics.txt` shadowCache / shadowUpdateRate). Off: always redraw.
         if divisor == 0 {
@@ -4578,6 +4585,7 @@ impl PackPost {
 
     /// Runs the pack over the world drawn into `world` (colour) and `world_depth`, then draws
     /// the result onto `screen`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &mut self,
@@ -5723,7 +5731,7 @@ mod tests {
 
     #[test]
     fn pack_formats_map_to_renderable_ones() {
-        let f = |name| texture_format(Format::parse(name).unwrap(), wgpu::Features::empty());
+        let f = |name| texture_format(Format::parse(name).unwrap(), wgpu::Features::empty(), true);
         assert_eq!(f("RGBA"), T::Rgba8Unorm);
         assert_eq!(f("RGB8"), T::Rgba8Unorm, "no three-channel formats in wgpu");
         assert_eq!(f("RG16F"), T::Rg16Float);
@@ -5736,7 +5744,7 @@ mod tests {
         let all = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
             | wgpu::Features::RG11B10UFLOAT_RENDERABLE;
-        let g = |name| texture_format(Format::parse(name).unwrap(), all);
+        let g = |name| texture_format(Format::parse(name).unwrap(), all, true);
         assert_eq!(g("RGBA16"), T::Rgba16Unorm);
         assert_eq!(g("R11F_G11F_B10F"), T::Rg11b10Ufloat);
     }

@@ -294,9 +294,14 @@ impl Game<'_> {
             return Vec::new();
         }
         // A direct finger touch on the screen brings touch controls back if hardware input hid them.
+        // Don't trigger invisible virtual buttons on the same tap that wakes hidden touch controls.
         if touch.phase == TouchPhase::Started && !is_hw_mouse_touch {
+            let was_hidden = self.pad.ios_hw_active || self.pad.hw_pad_active;
             self.pad.ios_hw_active = false;
             self.pad.hw_pad_active = false;
+            if was_hidden && self.touch_playing() {
+                return Vec::new();
+            }
         }
         // The iOS Microsoft sign-in overlay and the mods screen.
         if self.account_touch(&touch) || self.mods_touch(&touch) {
@@ -359,7 +364,11 @@ impl Game<'_> {
                             self.drag_button = None;
                             self.physical_buttons
                                 .remove(&winit::event::MouseButton::Left);
-                            return Vec::new();
+                            return vec![WindowEvent::MouseInput {
+                                device_id: winit::event::DeviceId::dummy(),
+                                state: winit::event::ElementState::Released,
+                                button: winit::event::MouseButton::Left,
+                            }];
                         }
                     }
                     TouchPhase::Started => {}
@@ -937,8 +946,250 @@ fn draw_virtual_cursor(batch: &mut HudBatch, atlas: &HudAtlas, (cx, cy): (f32, f
     }
 }
 
+impl Game<'_> {
+    /// Releases all held iOS touch and hardware keyboard/mouse inputs and unlocks pointer lock
+    /// (called on focus loss and app background/suspend so no keys, clicks, or touches get stuck).
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    pub(super) fn release_ios_inputs(
+        &mut self,
+        event_loop: Option<&dyn super::event_loop::EventLoopCtl>,
+    ) {
+        #[cfg(target_os = "ios")]
+        {
+            horizon_client_input::ios_controllers::set_pointer_locked(false);
+            horizon_client_input::ios_controllers::flush_hardware_mouse_deltas();
+        }
+        let dispatched = std::mem::take(&mut self.pad.ios_hw_dispatched_keys);
+        for key in &dispatched {
+            let _ = self.debug_key(*key, horizon_client::debug_keys::KeyAction::Release);
+            let _ = self.mapped_key_event(*key, false, false);
+        }
+        let held_keys = std::mem::take(&mut self.pad.ios_hw_keys);
+        for key in held_keys {
+            self.press_modifier_key(key, false);
+            self.physical_keys.remove(&key);
+        }
+        self.pad.ios_hw_repeat = None;
+        self.pad.ios_hw_wait_left_release = false;
+        self.pad.ios_hw_hover_pos = None;
+        self.pad.ios_hw_scroll_accum = 0.0;
+        self.pad.ios_hw_last_scroll_step = None;
+
+        let buttons = [
+            winit::event::MouseButton::Left,
+            winit::event::MouseButton::Right,
+            winit::event::MouseButton::Middle,
+        ];
+        if let (Some(event_loop), Some(id)) = (event_loop, self.window.as_ref().map(|w| w.id())) {
+            for (i, &button) in buttons.iter().enumerate() {
+                if std::mem::replace(&mut self.pad.ios_hw_mouse_buttons[i], false) {
+                    self.handle_window_event(
+                        event_loop,
+                        id,
+                        WindowEvent::MouseInput {
+                            device_id: winit::event::DeviceId::dummy(),
+                            state: winit::event::ElementState::Released,
+                            button,
+                        },
+                        super::input_trace::InputOrigin::User,
+                    );
+                }
+            }
+        } else {
+            self.pad.ios_hw_mouse_buttons = [false; 3];
+        }
+
+        self.pad.touch.release_all();
+        self.pad.touch_mouse.reset_touches();
+        self.pad.touch_menu_shift_finger = None;
+        self.pad.touch_paste_hold = None;
+        self.pad.touch_paste_popup = None;
+        self.pad.touch_zoom = false;
+        self.pad.touch_debug = false;
+    }
+}
+
 #[cfg(target_os = "ios")]
 impl Game<'_> {
+    /// Dispatches a hardware keyboard edit shortcut (`Cmd`/`Ctrl` + A/C/V/X) into whichever text
+    /// field is currently focused on iOS/iPadOS.
+    fn dispatch_ios_edit_shortcut(
+        &mut self,
+        shortcut: horizon_client::clipboard::EditShortcut,
+    ) -> bool {
+        use horizon_client::clipboard::EditShortcut;
+        if self.account_editing_offline() {
+            if shortcut == EditShortcut::Paste {
+                self.paste_into_focused_field();
+            }
+            return true;
+        }
+        if self.dialog_open() {
+            let _ = self.dialog_key(KeyCode::KeyA, Some(shortcut), None);
+            return true;
+        }
+        if self.title.is_some() {
+            self.title_shortcut(shortcut);
+            return true;
+        }
+        if self.sign_edit.is_some() {
+            if shortcut == EditShortcut::Paste {
+                self.paste_into_focused_field();
+            }
+            return true;
+        }
+        if matches!(self.book, Some(super::books::BookScreen::Edit { .. })) {
+            if shortcut == EditShortcut::Paste {
+                self.paste_into_focused_field();
+            }
+            return true;
+        }
+        match self.screen {
+            Screen::Chat => {
+                if shortcut == EditShortcut::Paste {
+                    self.paste_into_focused_field();
+                } else {
+                    let key = match shortcut {
+                        EditShortcut::SelectAll => KeyCode::KeyA,
+                        EditShortcut::Copy => KeyCode::KeyC,
+                        EditShortcut::Cut => KeyCode::KeyX,
+                        EditShortcut::Paste => KeyCode::KeyV,
+                    };
+                    self.chat_key_code(key, None);
+                }
+                true
+            }
+            Screen::CommandBlock => {
+                self.command_block_key_code(KeyCode::KeyA, Some(shortcut), None);
+                true
+            }
+            Screen::BlockEditor => {
+                self.block_editor_key_code(KeyCode::KeyA, Some(shortcut), None);
+                true
+            }
+            Screen::DebugOptions => {
+                self.debug_options_shortcut(shortcut);
+                true
+            }
+            Screen::Creative if self.creative_screen.tab().search => {
+                self.creative_search_shortcut(shortcut);
+                true
+            }
+            Screen::Options if self.ui.options.typing() => {
+                let _ = self.options_shortcut(shortcut);
+                true
+            }
+            Screen::Inventory if self.station_typing() => {
+                self.station_shortcut(shortcut);
+                true
+            }
+            Screen::Social | Screen::WorldOptions | Screen::Inventory => {
+                if shortcut == EditShortcut::Paste {
+                    self.paste_into_focused_field();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatches a non-character editing/navigation key (`Backspace`, `Delete`, `Arrow*`,
+    /// `Home`, `End`, `Tab`) from an iPad hardware keyboard into the active text field.
+    fn dispatch_ios_text_key(&mut self, key: KeyCode) -> bool {
+        if self.account_editing_offline() {
+            return self.account_key(key, None);
+        }
+        if self.dialog_open() {
+            let _ = self.dialog_key(key, None, None);
+            return true;
+        }
+        let (ctrl, shift) = (self.has_control_down(), self.has_shift_down());
+        if let Some(title) = self.title.as_mut() {
+            if title.has_caret_field() {
+                title.field_key(key, ctrl, shift);
+                return true;
+            }
+            if title.focused_field().is_some() {
+                if key == KeyCode::Backspace {
+                    self.title_edit(None, true);
+                }
+                return true;
+            }
+        }
+        if self.sign_edit.is_some() {
+            self.sign_input(Some(key), None);
+            return true;
+        }
+        if matches!(self.book, Some(super::books::BookScreen::Edit { .. })) {
+            self.book_input(Some(key), None);
+            return true;
+        }
+        match self.screen {
+            Screen::Chat => {
+                self.chat_key_code(key, None);
+                true
+            }
+            Screen::CommandBlock => {
+                self.command_block_key_code(key, None, None);
+                true
+            }
+            Screen::BlockEditor => {
+                self.block_editor_key_code(key, None, None);
+                true
+            }
+            Screen::Social => {
+                let (ctrl, shift) = (self.has_control_down(), self.has_shift_down());
+                self.social_edit_key(key, ctrl, shift);
+                true
+            }
+            Screen::DebugOptions => {
+                let ctrl = self.has_control_down_with_quirk();
+                let shift = self.has_shift_down();
+                self.debug_options_edit_key(key, ctrl, shift);
+                true
+            }
+            Screen::Creative if self.creative_screen.tab().search => {
+                let before = self.creative_screen.search.value.clone();
+                let (ctrl, shift) = (self.has_control_down(), self.has_shift_down());
+                if self.creative_screen.search.key(key, ctrl, shift)
+                    && self.creative_screen.search.value != before
+                {
+                    self.creative_screen.scroll = 0.0;
+                }
+                true
+            }
+            Screen::Options if self.ui.options.typing() => {
+                let _ = self.options_key(key, None);
+                true
+            }
+            Screen::WorldOptions if self.world_options_typing() => {
+                if key == KeyCode::Backspace {
+                    self.world_options_text(None);
+                }
+                true
+            }
+            Screen::Inventory if self.mod_browser_typing() => {
+                if key == KeyCode::Backspace {
+                    self.mod_browser_text(None, true);
+                }
+                true
+            }
+            Screen::Inventory if self.recipe_search_focused() => {
+                if key == KeyCode::Backspace {
+                    self.recipe_text(None, true);
+                }
+                true
+            }
+            Screen::Inventory if self.station_typing() => {
+                if !self.station_key(key) && key == KeyCode::Backspace {
+                    self.station_text(None, true);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Polls `GCKeyboard`, `GCMouse`, and `UIHoverGestureRecognizer` on iOS/iPadOS:
     /// - In-world: locks & hides the iPadOS pointer (`prefersPointerLocked`), drives 360° camera
     ///   look with Hardware Mouse Sensitivity, buttons, and crisp 1-notch hotbar scrolling.
@@ -949,6 +1200,15 @@ impl Game<'_> {
         &mut self,
         event_loop: &dyn super::event_loop::EventLoopCtl,
     ) {
+        const REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
+        const REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        const UIKIT_BACKSPACE_DEDUP: std::time::Duration = std::time::Duration::from_millis(90);
+
+        if !self.focused || self.suspended {
+            horizon_client_input::ios_controllers::set_pointer_locked(false);
+            return;
+        }
+
         let playing = !self.pad_in_menu() && self.player.is_some();
         horizon_client_input::ios_controllers::set_pointer_locked(playing);
 
@@ -959,33 +1219,41 @@ impl Game<'_> {
             winit::event::MouseButton::Middle,
         ];
 
-        // Flush stale deltas and release any held in-world mouse buttons when crossing between
-        // gameplay and UI menus so the camera never jumps and buttons never get stuck.
+        // Flush stale deltas, reset TouchMouse, and release held mouse buttons when crossing
+        // between gameplay and UI menus so the camera never jumps, buttons never get stuck, and
+        // clicking "Play" / "Back to Game" never punches a block or wedges TouchMouse.
         if self.pad.ios_hw_was_playing != playing {
             let was_playing = self.pad.ios_hw_was_playing;
             self.pad.ios_hw_was_playing = playing;
             horizon_client_input::ios_controllers::flush_hardware_mouse_deltas();
+            self.pad.touch_mouse.reset_touches();
             self.pad.ios_hw_scroll_accum = 0.0;
             self.pad.ios_hw_last_scroll_step = None;
-            if was_playing && !playing {
-                if let Some(id) = id {
-                    for (i, &button) in buttons.iter().enumerate() {
-                        if std::mem::replace(&mut self.pad.ios_hw_mouse_buttons[i], false) {
-                            self.handle_window_event(
-                                event_loop,
-                                id,
-                                WindowEvent::MouseInput {
-                                    device_id: winit::event::DeviceId::dummy(),
-                                    state: winit::event::ElementState::Released,
-                                    button,
-                                },
-                                super::input_trace::InputOrigin::User,
-                            );
-                        }
+            if playing {
+                self.pad.ios_hw_hover_pos = None;
+                self.pad.ios_hw_wait_left_release =
+                    horizon_client_input::ios_controllers::is_hardware_mouse_button_down();
+            } else {
+                self.pad.ios_hw_wait_left_release = false;
+            }
+            if let Some(id) = id {
+                let start_idx = if was_playing { 0 } else { 1 };
+                for (i, &button) in buttons.iter().enumerate().skip(start_idx) {
+                    if std::mem::replace(&mut self.pad.ios_hw_mouse_buttons[i], false) {
+                        self.handle_window_event(
+                            event_loop,
+                            id,
+                            WindowEvent::MouseInput {
+                                device_id: winit::event::DeviceId::dummy(),
+                                state: winit::event::ElementState::Released,
+                                button,
+                            },
+                            super::input_trace::InputOrigin::User,
+                        );
                     }
-                } else {
-                    self.pad.ios_hw_mouse_buttons = [false; 3];
                 }
+            } else {
+                self.pad.ios_hw_mouse_buttons = [false; 3];
             }
         }
 
@@ -998,7 +1266,11 @@ impl Game<'_> {
             self.pad.ios_hw_hover_pos = None;
         }
         if let Some(pos) = hw.hover_pos {
-            self.pad.ios_hw_hover_pos = Some(pos);
+            if !playing {
+                self.pad.ios_hw_hover_pos = Some(pos);
+            }
+        } else if hw.hover_ended {
+            self.pad.ios_hw_hover_pos = None;
         }
 
         let any_activity = !hw.keys.is_empty()
@@ -1007,6 +1279,11 @@ impl Game<'_> {
             || hw.mouse_scroll != (0.0, 0.0)
             || hw.hover_pos.is_some();
         if any_activity {
+            if !self.pad.ios_hw_active {
+                self.pad.touch.release_all();
+                self.pad.touch_zoom = false;
+                self.pad.touch_debug = false;
+            }
             self.pad.ios_hw_active = true;
         } else if !hw.keyboard_connected && !hw.mouse_connected {
             self.pad.ios_hw_active = false;
@@ -1015,22 +1292,76 @@ impl Game<'_> {
             return;
         };
 
-        // 1. Hardware keyboard key edges (when not typing into an active IME field).
+        // 1. Hardware keyboard key edges, editing navigation/shortcuts, and Backspace/Delete/Arrow repeat.
+        let now = Instant::now();
         let old_keys = std::mem::replace(&mut self.pad.ios_hw_keys, hw.keys.clone());
+        let text_focused = self.text_field_focused();
         let ime_typing = self.ime_allowed;
+
         for &key in &old_keys {
             if !hw.keys.contains(&key) {
                 self.press_modifier_key(key, false);
                 self.physical_keys.remove(&key);
-                let _ = self.debug_key(key, horizon_client::debug_keys::KeyAction::Release);
-                let _ = self.mapped_key_event(key, false, false);
+                if self.pad.ios_hw_repeat.is_some_and(|(rk, _)| rk == key) {
+                    self.pad.ios_hw_repeat = None;
+                }
+                if let Some(pos) = self
+                    .pad
+                    .ios_hw_dispatched_keys
+                    .iter()
+                    .position(|&k| k == key)
+                {
+                    self.pad.ios_hw_dispatched_keys.swap_remove(pos);
+                    let _ = self.debug_key(key, horizon_client::debug_keys::KeyAction::Release);
+                    let _ = self.mapped_key_event(key, false, false);
+                }
             }
         }
+
+        let is_repeatable_edit_key = |k: KeyCode| {
+            matches!(
+                k,
+                KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::ArrowLeft
+                    | KeyCode::ArrowRight
+                    | KeyCode::ArrowUp
+                    | KeyCode::ArrowDown
+            )
+        };
+        let is_nav_edit_key = |k: KeyCode| {
+            matches!(
+                k,
+                KeyCode::Delete
+                    | KeyCode::ArrowLeft
+                    | KeyCode::ArrowRight
+                    | KeyCode::ArrowUp
+                    | KeyCode::ArrowDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Tab
+            )
+        };
+
         for &key in &hw.keys {
             if !old_keys.contains(&key) {
-                self.last_input = Instant::now();
+                self.last_input = now;
                 self.press_modifier_key(key, true);
                 self.physical_keys.insert(key);
+                if self.pad.account_panel.is_some()
+                    && (key == KeyCode::Escape
+                        || (self.account_editing_offline()
+                            && matches!(
+                                key,
+                                KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Delete
+                            )))
+                    && self.account_key(key, None)
+                {
+                    if key == KeyCode::Delete {
+                        self.pad.ios_hw_repeat = Some((key, now + REPEAT_DELAY));
+                    }
+                    continue;
+                }
                 if self.screen == Screen::Options
                     && (self.options_waiting_for_key()
                         || self.ui.options.selected_pad_action.is_some())
@@ -1043,16 +1374,76 @@ impl Game<'_> {
                     let _ = self.pad_back();
                     continue;
                 }
+                if text_focused {
+                    // Cmd/Ctrl + A/C/V/X editing shortcuts on physical iPad keyboards.
+                    let edit_mod = self.has_control_down_with_quirk();
+                    if edit_mod && !self.has_shift_down() {
+                        use horizon_client::clipboard::EditShortcut;
+                        let shortcut = match key {
+                            KeyCode::KeyA => Some(EditShortcut::SelectAll),
+                            KeyCode::KeyC => Some(EditShortcut::Copy),
+                            KeyCode::KeyV => Some(EditShortcut::Paste),
+                            KeyCode::KeyX => Some(EditShortcut::Cut),
+                            _ => None,
+                        };
+                        if let Some(sc) = shortcut {
+                            let _ = self.dispatch_ios_edit_shortcut(sc);
+                            continue;
+                        }
+                    }
+                    if key == KeyCode::Backspace {
+                        // When IME is active, UIKit `deleteBackward` handles the initial tap;
+                        // schedule hardware auto-repeat after 350ms so holding Backspace deletes
+                        // smoothly without ever double-deleting on a single tap.
+                        if !ime_typing {
+                            let _ = self.dispatch_ios_text_key(KeyCode::Backspace);
+                        }
+                        self.pad.ios_hw_repeat = Some((KeyCode::Backspace, now + REPEAT_DELAY));
+                        continue;
+                    }
+                    if is_nav_edit_key(key) {
+                        let _ = self.dispatch_ios_text_key(key);
+                        if is_repeatable_edit_key(key) {
+                            self.pad.ios_hw_repeat = Some((key, now + REPEAT_DELAY));
+                        }
+                        continue;
+                    }
+                }
                 if !ime_typing {
                     if self.screen == Screen::Options {
                         let _ = self.options_key(key, None);
                         continue;
+                    }
+                    if !self.pad.ios_hw_dispatched_keys.contains(&key) {
+                        self.pad.ios_hw_dispatched_keys.push(key);
                     }
                     if !self.debug_key(key, horizon_client::debug_keys::KeyAction::Press) {
                         let _ = self.mapped_key_event(key, true, false);
                     }
                 }
             }
+        }
+
+        // Fire held Backspace / Delete / Arrow auto-repeat while typing into any text field.
+        if text_focused {
+            if let Some((rkey, next_at)) = self.pad.ios_hw_repeat {
+                if !hw.keys.contains(&rkey) {
+                    self.pad.ios_hw_repeat = None;
+                } else if now >= next_at {
+                    let uikit_recently_deleted = rkey == KeyCode::Backspace
+                        && self
+                            .pad
+                            .ios_uikit_backspace_at
+                            .is_some_and(|t| now.duration_since(t) < UIKIT_BACKSPACE_DEDUP);
+                    if !uikit_recently_deleted {
+                        self.last_input = now;
+                        let _ = self.dispatch_ios_text_key(rkey);
+                    }
+                    self.pad.ios_hw_repeat = Some((rkey, now + REPEAT_INTERVAL));
+                }
+            }
+        } else {
+            self.pad.ios_hw_repeat = None;
         }
 
         // 2. Hardware mouse movement:
@@ -1118,6 +1509,11 @@ impl Game<'_> {
         // Right and Middle buttons are not delivered as touches by winit, so always emit them here.
         let mut effective_buttons = hw.mouse_buttons;
         if !playing {
+            effective_buttons[0] = false;
+        } else if self.pad.ios_hw_wait_left_release {
+            if !hw.mouse_buttons[0] {
+                self.pad.ios_hw_wait_left_release = false;
+            }
             effective_buttons[0] = false;
         }
         let old_btns = std::mem::replace(&mut self.pad.ios_hw_mouse_buttons, effective_buttons);

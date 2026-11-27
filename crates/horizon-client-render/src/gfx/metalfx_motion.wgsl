@@ -173,10 +173,6 @@ fn fs_blit(v: Full) -> @location(0) vec4<f32> {
     return textureSampleLevel(src_tex, src_sampler, v.uv, 0.0);
 }
 
-fn luma(c: vec3<f32>) -> f32 {
-    return dot(c, vec3<f32>(0.299, 0.587, 0.114));
-}
-
 // Lightweight Contrast Adaptive Sharpening upscale fallback for devices without MetalFX.
 @fragment
 fn fs_cas(v: Full) -> @location(0) vec4<f32> {
@@ -220,12 +216,19 @@ fn fs_fg_interp(v: Full) -> @location(0) vec4<f32> {
     // mv_uv = prev_uv - curr_uv.
     let inv_fg_size = fg_u.params.xy;
     let mv_px0 = textureSampleLevel(fg_motion_tex, fg_sampler, uv, 0.0).xy;
+    if max(abs(mv_px0.x), abs(mv_px0.y)) > 4000.0 {
+        return textureSampleLevel(fg_curr_tex, fg_sampler, uv, 0.0);
+    }
     let mv0 = clamp(mv_px0 * inv_fg_size, vec2<f32>(-0.35), vec2<f32>(0.35));
 
     // One-step backward refinement: look up motion at the Frame N location that lands on `uv` at t=0.5.
     let probe_uv = clamp(uv - 0.5 * mv0, vec2<f32>(0.001), vec2<f32>(0.999));
     let mv_px1 = textureSampleLevel(fg_motion_tex, fg_sampler, probe_uv, 0.0).xy;
-    let mv1 = clamp(mv_px1 * inv_fg_size, vec2<f32>(-0.35), vec2<f32>(0.35));
+    let mv1 = select(
+        clamp(mv_px1 * inv_fg_size, vec2<f32>(-0.35), vec2<f32>(0.35)),
+        mv0,
+        max(abs(mv_px1.x), abs(mv_px1.y)) > 4000.0,
+    );
 
     let mv_diff = length(mv1 - mv0);
     let mv = select(mv1, mv0, mv_diff > 0.08);

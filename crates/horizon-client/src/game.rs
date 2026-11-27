@@ -17749,6 +17749,7 @@ impl ApplicationHandler for Game<'_> {
     /// work, reset Frame Generation, and pause singleplayer so the integrated server autosaves.
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         self.suspended = true;
+        self.release_ios_inputs(None);
         if let Some(renderer) = &mut self.renderer {
             renderer.on_suspend();
         }
@@ -17887,19 +17888,33 @@ impl Game<'_> {
             event: key_event, ..
         } = &event
             && key_event.state == ElementState::Pressed
+            && key_event.physical_key == PhysicalKey::Code(KeyCode::Backspace)
+        {
+            self.pad.ios_uikit_backspace_at = Some(Instant::now());
+        }
+        if let WindowEvent::KeyboardInput {
+            event: key_event, ..
+        } = &event
+            && key_event.state == ElementState::Pressed
             && matches!(key_event.physical_key, PhysicalKey::Unidentified(_))
             && let Some(text) = key_event.text.as_deref()
         {
             let has_enter = text.contains('\n') || text.contains('\r');
             let text: String = text.chars().filter(|c| !c.is_control()).collect();
+            if self.account_editing_offline() {
+                if !text.is_empty() {
+                    self.account_type_text(&text);
+                }
+                if has_enter {
+                    self.handle_ime_enter();
+                }
+                return;
+            }
             if !text.is_empty() && self.text_field_focused() && self.types_text() {
                 let _ = self.type_chars_into_screen(&text);
             }
             if has_enter {
-                if self.screen == Screen::Chat && self.title.is_none() {
-                    self.chat_key_code(KeyCode::Enter, None);
-                }
-                self.dismiss_ime();
+                self.handle_ime_enter();
             }
             return;
         }
@@ -18260,6 +18275,8 @@ impl Game<'_> {
                             self.sync_toggle(1);
                             self.left = false;
                             self.right = false;
+                            self.modifiers = winit::keyboard::ModifiersState::empty();
+                            self.release_ios_inputs(Some(event_loop));
                             self.capture(false);
                         }
                         self.regrab_on_refocus = held;
@@ -18376,9 +18393,10 @@ impl Game<'_> {
                     // MouseHandler.onScroll: the hotbar (or the spectator
                     // menu) takes the wheel only when no screen is open; a
                     // book, lectern, sign or prompt drawn over gameplay is one.
+                    // On iOS, `touch.rs` already applies `hotbar_scroll_sensitivity` to the
+                    // wheel step cadence, so pass 1.0 here to avoid double-scaling/skipping slots.
                     #[cfg(target_os = "ios")]
-                    let hotbar_wheel_sensitivity =
-                        f64::from(self.settings.controller.hotbar_scroll_sensitivity);
+                    let hotbar_wheel_sensitivity = 1.0;
                     #[cfg(not(target_os = "ios"))]
                     let hotbar_wheel_sensitivity = wheel_sensitivity;
                     if self.screen == Screen::Playing
@@ -18787,6 +18805,13 @@ impl Game<'_> {
                     }
                 }
                 // CodeOfConductScreen.shouldCloseOnEsc is false: no key leaves the screen.
+                WindowEvent::KeyboardInput { event, .. } if self.pad.account_panel.is_some() => {
+                    if event.state == ElementState::Pressed
+                        && let PhysicalKey::Code(key) = event.physical_key
+                    {
+                        let _ = self.account_key(key, event.text.as_deref());
+                    }
+                }
                 WindowEvent::KeyboardInput { .. } if self.code_of_conduct.is_some() => {}
                 WindowEvent::KeyboardInput { event, .. } if self.server_packs.prompt.is_some() => {
                     if event.state == ElementState::Pressed

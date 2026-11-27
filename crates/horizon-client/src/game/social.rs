@@ -236,6 +236,11 @@ impl Game<'_> {
         self.social.search.key(KeyCode::Backspace, false, false);
         self.social.scroll = 0.0;
     }
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    pub(super) fn social_edit_key(&mut self, key: KeyCode, ctrl: bool, shift: bool) {
+        self.social.search.key(key, ctrl, shift);
+        self.social.scroll = 0.0;
+    }
     /// Characters into the search box (`searchBox.setMaxLength(16)`).
     pub(super) fn social_type(&mut self, text: &str) {
         let text: String = text.chars().filter(|c| !c.is_control()).collect();

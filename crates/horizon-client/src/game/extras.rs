@@ -264,7 +264,12 @@ impl Game<'_> {
             (factor, e.zoom_smooth, turn)
         } else if self.pad.touch_zoom {
             let factor = f32::from(e.zoom_level.clamp(2, 10));
-            (factor, e.zoom_smooth, (1.0 / f64::from(factor)).clamp(0.1, 1.0))
+            let turn = if e.zoom_sensitivity {
+                (1.0 / f64::from(factor)).clamp(0.08, 1.0)
+            } else {
+                1.0
+            };
+            (factor, e.zoom_smooth, turn)
         } else {
             (1.0, true, 1.0)
         }

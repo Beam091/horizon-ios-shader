@@ -1414,7 +1414,13 @@ impl Graphics {
                     }
                 }
                 "workers" => g.workers = number(g.workers).min(64),
-                "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(25, 100),
+                "resolutionScale" => {
+                    g.resolution_scale = if cfg!(target_os = "ios") {
+                        number(g.resolution_scale).clamp(25, 100)
+                    } else {
+                        number(g.resolution_scale).clamp(50, 200)
+                    };
+                }
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
                 "upscaling" => g.upscaling = Upscaling::parse(value),

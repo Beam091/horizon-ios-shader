@@ -4998,6 +4998,8 @@ impl Renderer {
             self.offscreen = Some(Self::offscreen_target(&self.device, &self.config));
         }
         self.depth = Self::depth(&self.device, &self.config);
+        self.metalfx.reset_frame_gen();
+        self.frame_gen.reset_object_motion();
     }
     /// Whether sections are drawn as one index list per frame (`flat`).
     pub fn flat_draws(&self) -> bool {
@@ -6382,7 +6384,9 @@ impl Renderer {
             && self.screenshot.is_none()
             && self.surface.is_some()
             && !self.surface_unconfigured
-            && self.metalfx.fg_should_present_odd_tick()
+            && self
+                .metalfx
+                .fg_should_present_odd_tick([self.config.width, self.config.height])
     }
 
     /// Drains pending GPU work and resets Frame Generation caches when the app enters iOS
@@ -6402,7 +6406,7 @@ impl Renderer {
         self.metalfx.release_unused(self.ios_frame_gen_active());
         self.frame_gen.release_motion();
     }
-    /// Frame generation mode (FSR 3.1 on desktop, MetalFX Frame Interpolation on iOS 26+).
+    /// Frame generation mode (FSR 3.1 on desktop, MetalFX WGSL Frame Interpolation on iOS/macOS).
     pub fn set_frame_generation(&mut self, mode: crate::graphics::FrameGeneration) {
         let (on, metalfx) = match mode {
             crate::graphics::FrameGeneration::Off => (false, false),
@@ -6411,12 +6415,18 @@ impl Renderer {
                 (cfg!(any(target_os = "ios", target_os = "macos")), true)
             }
         };
-        if self.frame_gen.on != on || self.frame_gen.metalfx != metalfx {
-            self.frame_gen.stop();
-            self.metalfx.reset_frame_gen();
-        }
+        let changed = self.frame_gen.on != on || self.frame_gen.metalfx != metalfx;
         self.frame_gen.on = on;
         self.frame_gen.metalfx = metalfx;
+        if changed {
+            self.frame_gen.stop();
+            self.metalfx.reset_frame_gen();
+            let fg_active = self.ios_frame_gen_active();
+            self.metalfx.release_unused(fg_active);
+            if !fg_active && self.metalfx.mode != crate::graphics::MetalFxMode::Temporal {
+                self.frame_gen.release_motion();
+            }
+        }
     }
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     pub fn set_world_post(&mut self, scale: f32, antialias: bool, taa: bool, upscale: f32) {
@@ -6426,16 +6436,24 @@ impl Renderer {
         self.world_post.taa = taa;
         self.world_post.upscale = if taa { upscale.clamp(1.0, 4.0) } else { 1.0 };
     }
-    /// Apple MetalFX hardware upscaling (Temporal / Spatial), scale factor (2x/3x/4x), and tier.
+    /// Apple MetalFX hardware upscaling (Temporal / Spatial), scale factor (2x/3x), and tier.
     pub fn set_metalfx(
         &mut self,
         mode: crate::graphics::MetalFxMode,
         preset: crate::graphics::MetalFxPreset,
         factor: crate::graphics::MetalFxFactor,
     ) {
+        let prev_mode = self.metalfx.mode;
         self.metalfx.mode = mode;
         self.metalfx.preset = preset;
         self.metalfx.factor = factor;
+        if prev_mode != mode {
+            let fg_active = self.ios_frame_gen_active();
+            self.metalfx.release_unused(fg_active);
+            if !fg_active && mode != crate::graphics::MetalFxMode::Temporal {
+                self.frame_gen.release_motion();
+            }
+        }
     }
     /// Downcast 32-bit float shader pack buffers (`RGBA32F`) to 16-bit (`RGBA16F`).
     /// Reloads the active shader pack immediately when toggled.
@@ -7190,6 +7208,8 @@ impl Renderer {
             && self.frame_format == self.config.format.remove_srgb_suffix()
             && !frame.title
             && frame.menu_blur.is_none()
+            && self.screenshot.is_none()
+            && frame.post_effects.effects.is_empty()
             && self.native.as_ref().is_none_or(|n| n.post.is_none());
         if !mfx_fg_active {
             self.metalfx.reset_frame_gen();
@@ -7310,7 +7330,7 @@ impl Renderer {
         // Present the interpolated halfway frame `N-0.5` with fresh 60/120Hz screen effects,
         // 3D debug crosshair, and HUD on the main thread, skipping 100% of 3D world rendering.
         if mfx_fg_active
-            && self.metalfx.fg_should_present_odd_tick()
+            && self.metalfx.fg_should_present_odd_tick(size)
             && self.screenshot.is_none()
             && surface_frame.is_some()
         {
@@ -7326,7 +7346,7 @@ impl Renderer {
                 let screen_buffer = &self.screen_buffer;
                 let screen_pipelines = &self.screen_pipelines;
                 self.metalfx
-                    .blit_pipelined_interp(&mut encoder, &view_target, |pass| {
+                    .blit_pipelined_interp(&mut encoder, &view_target, size, |pass| {
                         draw_screen_effects_in_pass(
                             pass,
                             entity_group,
@@ -7356,9 +7376,7 @@ impl Renderer {
                 self.last_encode = started.elapsed().saturating_sub(self.last_wait);
                 return Ok(true);
             }
-            self.uploads.finish(&encoder);
-            self.queue.present(sf);
-            return Ok(false);
+            surface_frame = Some(sf);
         }
         // Pipelined GPU Frame Generation — Even Display Tick Step A:
         // Present the cached real world frame `N-1` + fresh overlays/HUD IMMEDIATELY (<0.5 ms GPU)
@@ -7369,7 +7387,7 @@ impl Renderer {
         // `nextDrawable()`.
         let mut pipelined_offscreen = false;
         if mfx_fg_active
-            && self.metalfx.fg_has_pipelined_real()
+            && self.metalfx.fg_has_pipelined_real(size)
             && self.screenshot.is_none()
             && surface_frame.is_some()
         {
@@ -7390,7 +7408,7 @@ impl Renderer {
                 let screen_buffer = &self.screen_buffer;
                 let screen_pipelines = &self.screen_pipelines;
                 self.metalfx
-                    .blit_pipelined_real(&mut present_enc, &present_view, |pass| {
+                    .blit_pipelined_real(&mut present_enc, &present_view, size, |pass| {
                         draw_screen_effects_in_pass(
                             pass,
                             entity_group,
@@ -7409,10 +7427,14 @@ impl Renderer {
                     self.window.pre_present_notify();
                 }
                 self.queue.present(sf);
+                if reconfigure {
+                    self.configure_surface();
+                }
                 pipelined_offscreen = true;
             } else {
-                // Rare resize race: put drawable back and run synchronously.
+                // Rare race: submit empty encoder to recall staged overlay uploads and run synchronously.
                 self.uploads.finish(&present_enc);
+                let _ = self.queue.submit([present_enc.finish()]);
                 surface_frame = Some(sf);
             }
         }
@@ -9084,7 +9106,7 @@ impl Renderer {
                 ..Default::default()
             })
         };
-        if let Some(timer) = &mut self.gpu_timer {
+        if !pipelined_offscreen && let Some(timer) = &mut self.gpu_timer {
             timer.begin(&mut encoder);
         }
         // The frame's statistics (`show_stats`): a CPU frame's at once; a GPU frame's when the
@@ -10688,11 +10710,7 @@ impl Renderer {
                         )
                     })
                     .flatten();
-                let fg_params = mfx_fg_active.then(|| metalfx::FrameGenParams {
-                    delta_time: self.frame_gen.interval_secs(),
-                    near: NEAR_PLANE,
-                    far: frame.depth_far,
-                    fov_degrees: frame.fov_degrees,
+                let fg_params = mfx_fg_active.then_some(metalfx::FrameGenParams {
                     render_size: size,
                 });
                 fg_made = self.metalfx.finish_with_frame_gen(
@@ -10798,11 +10816,7 @@ impl Renderer {
                         )
                     })
                     .flatten();
-                let fg_params = mfx_fg_active.then(|| metalfx::FrameGenParams {
-                    delta_time: self.frame_gen.interval_secs(),
-                    near: NEAR_PLANE,
-                    far: frame.depth_far,
-                    fov_degrees: frame.fov_degrees,
+                let fg_params = mfx_fg_active.then_some(metalfx::FrameGenParams {
                     render_size,
                 });
                 // When Frame Gen is ON without MetalFX Upscaling in Vanilla, run `world_post.finish`
@@ -10944,9 +10958,13 @@ impl Renderer {
             }
         }
         let readback = if pipelined_offscreen {
-            // Blit glowing entity outlines onto both cached offscreen targets so Spectral outlines
-            // stay visible under pipelined Frame Generation (A3).
-            if let Some((real_view, interp_view)) = self.metalfx.offscreen_world_targets() {
+            // Blit glowing entity outlines onto real_display (never mutating real_cache history)
+            // and interp_cache so Spectral outlines stay visible under pipelined Frame Generation.
+            if self.entity_outline.is_active()
+                && let Some((real_view, interp_view)) = self
+                    .metalfx
+                    .prepare_offscreen_display_targets(&self.device, &mut encoder)
+            {
                 self.entity_outline.draw(
                     &mut encoder,
                     &real_view,
