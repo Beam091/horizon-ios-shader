@@ -1109,6 +1109,38 @@ impl PostEffects {
         (texture, view)
     }
 
+    /// Whether `req` names at least one post-effect chain that exists under `req.root` or is
+    /// already loaded/preloading. Vanilla always requests `"minecraft:end_of_frame"` as an
+    /// optional resource-pack hook, which is absent in standard assets and cached as `None`
+    /// after the first check so subsequent frames do zero filesystem I/O.
+    pub fn has_any_chain(&mut self, req: &Request) -> bool {
+        if req.effects.is_empty() {
+            return false;
+        }
+        self.use_root(req.root);
+        self.collect_preloaded();
+        for effect in req.effects {
+            let id = normalise(effect);
+            if self.failed.contains(&id) {
+                continue;
+            }
+            if let Some(loaded) = self.chains.get(&id) {
+                if loaded.is_some() {
+                    return true;
+                }
+                continue;
+            }
+            if self.pending.contains(&id) {
+                return true;
+            }
+            if resource_path(&self.root, &id).is_file() {
+                return true;
+            }
+            self.chains.insert(id, None);
+        }
+        false
+    }
+
     /// Runs the chains `req` names over `frame` (the frame's texture, copied from)
     /// and puts the result on `target` (its view): `GameRenderer.preparePostEffects`
     /// then `applyPostEffects`. `frame` must allow `COPY_SRC`. `depth` is the frame's
@@ -2197,5 +2229,20 @@ mod tests {
         }
         // entity_outline needs targets and shaders the world pass has of its own.
         assert!(PostEffects::load(&root, &device, &queue, "minecraft:entity_outline").is_err());
+    }
+
+    #[test]
+    fn resource_path_detects_only_present_chains() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon_post_chain_test_{}",
+            std::process::id()
+        ));
+        let post_dir = dir.join("assets/minecraft/post_effect");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&post_dir).unwrap();
+        std::fs::write(post_dir.join("creeper.json"), "{}").unwrap();
+        assert!(!resource_path(&dir, "minecraft:end_of_frame").is_file());
+        assert!(resource_path(&dir, "minecraft:creeper").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

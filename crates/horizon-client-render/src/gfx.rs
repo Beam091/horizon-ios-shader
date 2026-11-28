@@ -6371,6 +6371,22 @@ impl Renderer {
             && self.frame_gen.metalfx
             && self.metalfx.frame_gen_supported(&self.device)
             && self.hdr.is_none()
+            && self.frame_format == self.config.format.remove_srgb_suffix()
+            && self.native.as_ref().is_none_or(|n| n.post.is_none())
+    }
+
+    /// Whether `req` names a post-effect chain that actually exists on disk or is loaded
+    /// (Vanilla always appends `"minecraft:end_of_frame"` as an optional resource-pack hook,
+    /// which is absent in standard assets and must not disable iOS Frame Generation).
+    fn has_active_post_effects(&mut self, req: &crate::post_chain::Request<'_>) -> bool {
+        if req.effects.is_empty() {
+            return false;
+        }
+        let device = &self.device;
+        let post = self
+            .post_effects
+            .get_or_insert_with(|| crate::post_chain::PostEffects::new(device));
+        post.has_any_chain(req)
     }
 
     /// True when the next `render()` call will take the Odd Frame Generation fast path (blitting
@@ -6379,8 +6395,6 @@ impl Renderer {
         !title
             && !menu_blur
             && self.ios_frame_gen_active()
-            && self.frame_format == self.config.format.remove_srgb_suffix()
-            && self.native.as_ref().is_none_or(|n| n.post.is_none())
             && self.screenshot.is_none()
             && self.surface.is_some()
             && !self.surface_unconfigured
@@ -7201,16 +7215,11 @@ impl Renderer {
         laps.lap("r_prepare");
         // Apple MetalFX Frame Interpolation uses main-thread alternating presentation (no
         // background Presenter thread), avoiding iOS CAMetalLayer nextDrawable() deadlocks.
-        let mfx_fg_active = self.frame_gen.on
-            && self.frame_gen.metalfx
-            && self.metalfx.frame_gen_supported(&self.device)
-            && self.hdr.is_none()
-            && self.frame_format == self.config.format.remove_srgb_suffix()
+        let mfx_fg_active = self.ios_frame_gen_active()
             && !frame.title
             && frame.menu_blur.is_none()
             && self.screenshot.is_none()
-            && frame.post_effects.effects.is_empty()
-            && self.native.as_ref().is_none_or(|n| n.post.is_none());
+            && !self.has_active_post_effects(&frame.post_effects);
         if !mfx_fg_active {
             self.metalfx.reset_frame_gen();
         }

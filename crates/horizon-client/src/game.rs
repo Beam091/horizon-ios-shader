@@ -16441,10 +16441,13 @@ impl Game<'_> {
         self.locator_camera =
             (!title).then_some((camera.to_array(), view_yaw, view_pitch, fov_degrees));
         let menu_blur = self.menu_blur();
-        let odd_fg_tick = self
-            .renderer
-            .as_ref()
-            .is_some_and(|r| r.will_present_odd_frame_gen_tick(title, menu_blur.is_some()));
+        let has_extra_post_effect =
+            !self.post_effects.is_empty() || self.spectated_post_effect.is_some();
+        let odd_fg_tick = !has_extra_post_effect
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| r.will_present_odd_frame_gen_tick(title, menu_blur.is_some()));
         let skip_3d = title || odd_fg_tick;
         let requested_post_effects = if odd_fg_tick {
             Vec::new()

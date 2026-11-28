@@ -685,6 +685,8 @@ impl Game<'_> {
             && limit < 260
             && self.title.is_none()
             && self.screen == super::Screen::Playing
+            && self.post_effects.is_empty()
+            && self.spectated_post_effect.is_none()
             && self
                 .renderer
                 .as_ref()
